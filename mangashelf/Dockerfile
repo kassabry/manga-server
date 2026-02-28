@@ -14,7 +14,7 @@ COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV DATABASE_URL="file:../data/mangashelf.db"
 
-RUN npx prisma generate
+RUN chmod +x node_modules/.bin/prisma node_modules/.bin/next 2>/dev/null; npx prisma generate
 RUN npm run build
 
 # Stage 3: Production runner
