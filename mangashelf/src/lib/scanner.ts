@@ -108,30 +108,53 @@ async function scanSeries(
   const coverPath = await extractCover(seriesSlug, seriesDirPath, firstCbzPath);
 
   if (!series) {
-    // Create new series
-    series = await prisma.series.create({
-      data: {
-        title: comicInfo?.Series || seriesTitle,
-        slug: seriesSlug,
-        description: comicInfo?.Summary || null,
-        author: comicInfo?.Writer || null,
-        artist: comicInfo?.Penciller || null,
-        status: parseStatus(comicInfo?.Notes),
-        type,
-        genres: comicInfo?.Genre || null,
-        rating: comicInfo?.CommunityRating
-          ? parseFloat(comicInfo.CommunityRating)
-          : null,
-        coverPath,
-        libraryPath: seriesDirPath,
-        publisher: comicInfo?.Publisher || null,
-        ageRating: comicInfo?.AgeRating || null,
-        chapterCount: cbzFiles.length,
-        lastChapterAt: new Date(),
-      },
+    // Create or update series (upsert by slug to handle library path changes)
+    const existingBySlug = await prisma.series.findUnique({
+      where: { slug: seriesSlug },
       include: { chapters: true },
     });
-    result.seriesAdded++;
+
+    if (existingBySlug) {
+      // Series exists with different libraryPath (e.g. migrated to new machine)
+      await prisma.series.update({
+        where: { id: existingBySlug.id },
+        data: {
+          libraryPath: seriesDirPath,
+          chapterCount: cbzFiles.length,
+          coverPath: coverPath || existingBySlug.coverPath,
+          description: comicInfo?.Summary || existingBySlug.description,
+          author: comicInfo?.Writer || existingBySlug.author,
+          artist: comicInfo?.Penciller || existingBySlug.artist,
+          genres: comicInfo?.Genre || existingBySlug.genres,
+        },
+      });
+      series = { ...existingBySlug, libraryPath: seriesDirPath };
+      result.seriesUpdated++;
+    } else {
+      series = await prisma.series.create({
+        data: {
+          title: comicInfo?.Series || seriesTitle,
+          slug: seriesSlug,
+          description: comicInfo?.Summary || null,
+          author: comicInfo?.Writer || null,
+          artist: comicInfo?.Penciller || null,
+          status: parseStatus(comicInfo?.Notes),
+          type,
+          genres: comicInfo?.Genre || null,
+          rating: comicInfo?.CommunityRating
+            ? parseFloat(comicInfo.CommunityRating)
+            : null,
+          coverPath,
+          libraryPath: seriesDirPath,
+          publisher: comicInfo?.Publisher || null,
+          ageRating: comicInfo?.AgeRating || null,
+          chapterCount: cbzFiles.length,
+          lastChapterAt: new Date(),
+        },
+        include: { chapters: true },
+      });
+      result.seriesAdded++;
+    }
   } else {
     // Backfill lastChapterAt for series that existed before this field was added
     let backfillLastChapter = undefined;
@@ -159,16 +182,32 @@ async function scanSeries(
     result.seriesUpdated++;
   }
 
-  // Scan chapters
+  // Scan chapters — match by number to handle library path migrations
+  const existingByNumber = new Map(
+    series.chapters.map((c) => [c.number, c])
+  );
   const existingPaths = new Set(series.chapters.map((c) => c.filePath));
   let seriesChaptersAdded = 0;
 
   for (const cbzFile of cbzFiles) {
     const cbzPath = join(seriesDirPath, cbzFile);
+    const chapterNumber = parseChapterNumber(cbzFile);
 
+    // Skip if already exists with correct path
     if (existingPaths.has(cbzPath)) continue;
 
-    const chapterNumber = parseChapterNumber(cbzFile);
+    // If chapter exists with old path (e.g. Windows -> Linux migration), update path
+    const existingChapter = existingByNumber.get(chapterNumber);
+    if (existingChapter) {
+      if (existingChapter.filePath !== cbzPath) {
+        await prisma.chapter.update({
+          where: { id: existingChapter.id },
+          data: { filePath: cbzPath },
+        });
+      }
+      continue;
+    }
+
     const chapterComicInfo = await extractComicInfo(cbzPath);
     const pageCount = await getPageCount(cbzPath);
     const fileStat = await stat(cbzPath);
@@ -179,7 +218,6 @@ async function scanSeries(
       sourceUrl = chapterComicInfo.Web;
       try {
         const url = new URL(chapterComicInfo.Web);
-        // Derive source name from domain
         const domain = url.hostname.replace(/^www\./, "");
         const domainMap: Record<string, string> = {
           "manhuato.com": "ManhuaTo",
