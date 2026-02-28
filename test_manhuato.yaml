@@ -1,0 +1,57 @@
+generated: '2026-02-23T18:27:04.233062'
+total_series: 4
+total_chapters: 0
+series_with_chapter_info: 0
+series_with_ratings: 0
+average_rating: 0
+status_breakdown:
+  Unknown: 4
+series:
+- title: Ranker Who Lives A Second Time
+  url: https://manhuato.com/manhua/ranker-who-lives-a-second-time
+  source: manhuato
+  status: Unknown
+  rating: 0.0
+  chapters: 0
+  genres:
+  - Manhwa
+  author: ''
+  artist: ''
+  description: ''
+  enabled: true
+- title: The Eternal Supreme
+  url: https://manhuato.com/manhua/the-eternal-supreme
+  source: manhuato
+  status: Unknown
+  rating: 0.0
+  chapters: 0
+  genres:
+  - Manhua
+  author: ''
+  artist: ''
+  description: ''
+  enabled: true
+- title: Dandadan
+  url: https://manhuato.com/manhua/dandadan
+  source: manhuato
+  status: Unknown
+  rating: 0.0
+  chapters: 0
+  genres:
+  - Manga
+  author: ''
+  artist: ''
+  description: ''
+  enabled: true
+- title: My Simulated Path to Immortality
+  url: https://manhuato.com/manhua/my-simulated-path-to-immortality
+  source: manhuato
+  status: Unknown
+  rating: 0.0
+  chapters: 0
+  genres:
+  - Comics
+  author: ''
+  artist: ''
+  description: ''
+  enabled: true

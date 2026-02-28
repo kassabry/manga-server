@@ -1,0 +1,47 @@
+Manga Site notes:
+- Change the name from MangaShelf to ORVault
+- Design a graphic to display next to MangaShelf. I am thinking a magic book. The graphic should be small. 
+- Add a section on main page that is a carousel of recently updated of all series on the site that got an update and a timestamp of when they were updated (i.e. 1 hour ago, 2 days ago, etc.).
+- The recently added section should be a navigation wrapper. 
+- The new from followed section should also be a navigation wrapper. 
+- Both navigation wrappers and the recently added carousel should have a default display amount of 5 series/thumbnails. 
+- Modify the login so that the username is not CAPS sensitive. 
+- Add the auto-library scan interval time to admin panel so I can change from the site. 
+- Have the site keep track of progress of reading a chapter and make it snap back to that progress point if chapter is returned. 
+- Make the "reading" section of My List not be manually declared, but automatically instantiated based on if there is progress in reading a chapter from that series, with the reference to that chapter being what is being pointed to in the list. Include the ability to manually remove something from that list and reset the progress of a series. 
+- Fix the overlapping issue on mobile where the search bar is over the account information if you click on your account icon. 
+- There should be an easier way to go to the home screen or return to the main series page while reading each chapter that does not ruin the cleanliness and simplicity the reader has now.
+- Also add a way to traverse chapters easier. Kavita had a way of scrolling up at the top of the chapter to go to the previous chapter, and scrolling down at the end of the chapter that would go to the next chapter. This functionality was extremely nice. 
+- Make the amount of comics visible per-row in the "recently added"/"recently updated" sections to be customizable. For instance, if I want to see 5 comics per line it can scale the size of thumbnails and links to match the size of the screen to fit 5 comics per line. 
+- Also add the ability to change the source for series/chapters that were obtained from multiple sites. Run the manhwa scraper on a different site and grab a series that is already in the library to test this functionality. 
+- The recently updated tag in the browse section should sort series by when they were last updated, from most recent at the top to oldest at the bottom. 
+- There should be more settings available to access than just the theme. Kavita had a good amount of settings that I would also like to somewhat emulate here. 
+- The node.js routing widget is blocking the home button on the PWA.
+- Additionally the theme and reading settings don't persist across devices on the same account which is should. 
+
+Updated Manga Site Notes:
+- The scaling for the carousel amount does not work. It is always 4 while viewing on a computer. 
+- Provide a way to sort in the browsing feature with both directions. For example the sorting by recently updated defaults to the oldest first, when it should be the newest first, but it would be good to provide the option to do either. 
+- The "persistent" settings are not persisent. I updated the reading settings in the settings on the main page, but it did not carry over to the settings while reading.
+- There was an issue where I changed to long strip and the because I was at the top of the screen, it glitched out and kept going to previous chapters. Maybe introduce some friction for needing to scroll to next chapter. 
+- The previous issue happened because going to the previous chapter started at top of the chapter, the site then thought it was supposed to go back a chapter leading to a loop until chapter 1 was reached. The behavior also happens when loading a new chapter, if it doesn't load fast enough it immediately jumps to the next chapter. 
+- Also introduce a way to pick which chapter to go from while reading a chapter, so you can go from chapter 1 to 40 with one button if you want.
+- The auto-scan panel allows for changing of the interval time, but still shows the auto-scan being disabled
+- There was a next.js error: A tree hydrated but some attributes of the server rendered HTML didn't match the client properties. This won't be patched up. This can happen if a SSR-ed Client Component used
+- The site is updated to have ORVault instead of MangaShelf, but the ports still route through mangashelf.
+- Make the continue reading a navigation wrapper.
+- The time stamp on the comics in recently updated is based on the last library scan, not when new chapters were added. This will cause an issue where everytime the library is re-scanned, the entire catalog will be in the recently updated. Make it so the timestamp corresponds to the time the newest chapter in the series was added. 
+- Is there a way to reset individual series in continue reading? I want the functionality of being able to remove a series from that list and reset the reading progress. 
+- The PWA support also still shows mangashelf as the main site and image. 
+- Remove the recently added from the main page, change the recently updated from the navigation wrapper to a flex-grow page that just shows the series that were updated from most recent updates to oldest with the amount shown per row based on the scalar in the settings. 
+
+
+New Manga Site Notes:
+- The auto-scanner still shows disabled even when the interval is set. Have a way to turn that on and off through the panel. 
+- Scale down the display of the continue reading thumbnails to match the thumbnails on the rest of the page. 
+- The items per row in carousel still doesn't do anything.
+- Introduce the same delay when going to the next chapter as there is when going to the previous chapter. This ensures that you can't accidentally miss the end of the chapter as right now it moves to the next chapter too quickly.   
+- The "X" icon to remove a series from the series in continue reading does not appear on the PWA app on iOS.
+- Make the series in "Continue Reading" also appear as a list in My List as "In Progress". If there are a lot of series it becomes harder to see each one with the navigation panel, but I like the navigation wrapper, don't remove it. 
+- In the recently updated section, I want the newest chapter from each series to be displayed in addition the time since current it was updated. I want to know the amount of chapters out for each series when looking through that section.
+- Switch new from followed and continue reading. The new from followed should be on top. 

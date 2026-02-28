@@ -1,0 +1,106 @@
+# ===========================================
+# Manhwa/Manhua Sources Configuration
+# ===========================================
+# Add your favorite series here for automatic downloading
+#
+# Usage:
+#   python scripts/manhwa_downloader.py --config sources.yaml --output /path/to/library
+#
+# Or run as a cron job for automatic updates
+
+# Output settings
+output_directory: /mnt/manga-storage/manga-server/library/Manhwa
+
+# Download settings
+settings:
+  headless: true           # Run browser without GUI
+  max_concurrent: 2        # Max simultaneous downloads
+  delay_between: 5         # Seconds between chapter downloads
+  retry_failed: 3          # Retry failed downloads this many times
+
+# Series to track and download
+# Supported sources:
+#   - asuracomic.net
+#   - flamecomics.xyz
+#   - drakecomic.org
+#   - manhuato.com
+#   - webtoons.com (ORIGINALS & CANVAS)
+series:
+  # Example entries - replace with your actual series
+  
+  # Asura Scans series
+  - title: "Example Manhwa"
+    url: "https://asuracomic.net/series/example-manhwa"
+    source: asura
+    category: Manhwa
+    enabled: true
+    
+  # Flame Comics series  
+  - title: "Example Series"
+    url: "https://flamecomics.xyz/series/example-series/"
+    source: flame
+    category: Manhwa
+    enabled: true
+    
+  # Drake Comics series
+  - title: "Example Title"
+    url: "https://drakecomic.org/manga/example-title/"
+    source: drake
+    category: Manhua
+    enabled: true
+
+  # ManhuaTo series
+  - title: "The Beginning After The End"
+    url: "https://manhuato.com/manhua/the-beginning-after-the-end"
+    source: manhuato
+    category: Manhwa
+    enabled: true
+
+  # Webtoon ORIGINALS (free chapters only)
+  - title: "Tower of God"
+    url: "https://www.webtoons.com/en/fantasy/tower-of-god/list?title_no=95"
+    source: webtoon
+    category: Manhwa
+    enabled: true
+    
+  - title: "Solo Leveling"  
+    url: "https://www.webtoons.com/en/action/solo-leveling/list?title_no=3162"
+    source: webtoon
+    category: Manhwa
+    enabled: true
+
+  # ============================================
+  # MULTI-SOURCE COMPARISON EXAMPLE
+  # ============================================
+  # Same series from different sources - compare quality!
+  # Use [Source] prefix to keep them separate in your library
+  
+  # - title: "[Asura] Solo Leveling"
+  #   url: "https://asuracomic.net/series/solo-leveling"
+  #   source: asura
+  #   enabled: false  # Set to true to download
+  #
+  # - title: "[Webtoon] Solo Leveling"
+  #   url: "https://www.webtoons.com/en/action/solo-leveling/list?title_no=3162"
+  #   source: webtoon
+  #   enabled: false
+  #
+  # - title: "[ManhuaTo] Solo Leveling"
+  #   url: "https://manhuato.com/manhua/solo-leveling"
+  #   source: manhuato
+  #   enabled: false
+
+# ===========================================
+# How to add a new series:
+# ===========================================
+# 1. Find the series page URL (not a chapter URL)
+# 2. Add an entry like this:
+#
+#   - title: "Your Series Name"
+#     url: "https://site.com/series/your-series"
+#     source: asura  # or flame, drake, webtoon
+#     category: Manhwa
+#     enabled: true
+#
+# 3. Run the downloader or wait for scheduled run
+# ===========================================

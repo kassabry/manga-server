@@ -1,0 +1,56 @@
+# Dockerfile for Manhwa Downloader
+# Custom Python scraper for manhwa sites
+
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    chromium \
+    chromium-driver \
+    xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up working directory
+WORKDIR /app
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    requests \
+    beautifulsoup4 \
+    selenium \
+    webdriver-manager \
+    pyyaml \
+    schedule
+
+# Set Chrome path for Selenium
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+
+# Create entrypoint script
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "Manhwa Downloader starting..."\n\
+echo "Check interval: ${CHECK_INTERVAL:-21600} seconds"\n\
+\n\
+while true; do\n\
+    echo "$(date): Checking for new chapters..."\n\
+    \n\
+    if [ -f /app/config/sources.yaml ]; then\n\
+        python /app/scripts/manhwa_downloader.py \\\n\
+            --config /app/config/sources.yaml \\\n\
+            --output /app/library/Manhwa \\\n\
+            2>&1 | tee -a /app/logs/downloader.log\n\
+    else\n\
+        echo "No sources.yaml found. Create one at config/sources.yaml"\n\
+    fi\n\
+    \n\
+    echo "$(date): Sleeping for ${CHECK_INTERVAL:-21600} seconds..."\n\
+    sleep ${CHECK_INTERVAL:-21600}\n\
+done\n\
+' > /entrypoint.sh && chmod +x /entrypoint.sh
+
+# Create logs directory
+RUN mkdir -p /app/logs
+
+ENTRYPOINT ["/entrypoint.sh"]

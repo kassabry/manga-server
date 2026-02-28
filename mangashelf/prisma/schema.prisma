@@ -1,0 +1,131 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String           @id @default(cuid())
+  username     String           @unique
+  email        String?          @unique
+  passwordHash String
+  role         String           @default("user")
+  createdAt    DateTime         @default(now())
+  follows      Follow[]
+  listEntries  ListEntry[]
+  readProgress ReadProgress[]
+  preferences  UserPreferences?
+}
+
+model UserPreferences {
+  id               String  @id @default(cuid())
+  userId           String  @unique
+  theme            String  @default("midnight")
+  customColors     String? // JSON string of ThemeColors
+  readerLayout     String  @default("single")
+  readerFit        String  @default("width")
+  readerDirection  String  @default("ltr")
+  readerBgColor    String  @default("black")
+  readerBrightness Int     @default(100)
+  autoHideToolbar  Boolean @default(false)
+  swipeEnabled     Boolean @default(true)
+  carouselColumns  Int     @default(5)
+  user             User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model SiteConfig {
+  key   String @id
+  value String
+}
+
+model InviteCode {
+  id        String    @id @default(cuid())
+  code      String    @unique
+  createdBy String
+  usedBy    String?
+  usedAt    DateTime?
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model Series {
+  id             String      @id @default(cuid())
+  title          String
+  slug           String      @unique
+  description    String?
+  author         String?
+  artist         String?
+  status         String?
+  type           String
+  genres         String?
+  rating         Float?
+  coverPath      String?
+  libraryPath    String      @unique
+  publisher      String?
+  ageRating      String?
+  chapterCount   Int         @default(0)
+  lastChapterAt  DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  chapters       Chapter[]
+  follows        Follow[]
+  listEntries    ListEntry[]
+}
+
+model Chapter {
+  id           String         @id @default(cuid())
+  seriesId     String
+  number       Float
+  title        String?
+  pageCount    Int            @default(0)
+  filePath     String         @unique
+  fileSize     Int            @default(0)
+  source       String?
+  sourceUrl    String?
+  createdAt    DateTime       @default(now())
+  series       Series         @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  readProgress ReadProgress[]
+
+  @@index([seriesId, number])
+}
+
+model Follow {
+  id        String   @id @default(cuid())
+  userId    String
+  seriesId  String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  series    Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, seriesId])
+}
+
+model ListEntry {
+  id        String   @id @default(cuid())
+  userId    String
+  seriesId  String
+  status    String
+  rating    Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  series    Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, seriesId])
+}
+
+model ReadProgress {
+  id        String   @id @default(cuid())
+  userId    String
+  chapterId String
+  page      Int      @default(0)
+  completed Boolean  @default(false)
+  readAt    DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chapter   Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, chapterId])
+}

@@ -1,0 +1,246 @@
+version: '3.9'
+
+# ===========================================
+# MANGA SERVER WITH CUSTOM MANHWA SOURCES
+# ===========================================
+# Includes:
+# - ORVault: Custom reading front-end (Next.js)
+# - VPN (Gluetun): Routes scraper traffic through a VPN
+# - Manhwa-Downloader: Custom Python scraper (routed through VPN)
+# - FlareSolverr: Cloudflare bypass (routed through VPN)
+# - Cloudflared: Remote access
+#
+# Optional (legacy, commented out by default):
+# - Kavita, Komf, Kaizoku
+
+services:
+  # ===========================================
+  # VPN - Routes scraper traffic through a VPN
+  # ===========================================
+  # All outbound scraping traffic goes through this container.
+  # manhwa-downloader and flaresolverr share this network stack
+  # via network_mode, so their traffic is never exposed on your IP.
+  #
+  # Supported providers: https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers
+  # Popular options: mullvad, protonvpn, surfshark, nordvpn, pia, windscribe
+  #
+  # To configure, pick your provider and fill in the env vars below.
+  # See: https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers/<provider>
+  vpn:
+    image: qmcgaw/gluetun
+    container_name: vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TZ=America/Chicago
+      # ---- PICK YOUR VPN PROVIDER AND FILL IN BELOW ----
+      #
+      # === OPTION A: Mullvad (recommended, no email/account needed) ===
+      # - VPN_SERVICE_PROVIDER=mullvad
+      # - VPN_TYPE=wireguard
+      # - WIREGUARD_PRIVATE_KEY=your_mullvad_wireguard_private_key
+      # - WIREGUARD_ADDRESSES=10.x.x.x/32
+      # - SERVER_COUNTRIES=Netherlands
+      #
+      # === OPTION B: ProtonVPN (free tier available) ===
+      # - VPN_SERVICE_PROVIDER=protonvpn
+      # - VPN_TYPE=wireguard
+      # - WIREGUARD_PRIVATE_KEY=your_proton_wireguard_private_key
+      # - SERVER_COUNTRIES=Netherlands
+      #
+      # === OPTION C: Surfshark ===
+      # - VPN_SERVICE_PROVIDER=surfshark
+      # - VPN_TYPE=openvpn
+      # - OPENVPN_USER=your_surfshark_username
+      # - OPENVPN_PASSWORD=your_surfshark_password
+      # - SERVER_COUNTRIES=Netherlands
+      #
+      # === OPTION D: NordVPN ===
+      # - VPN_SERVICE_PROVIDER=nordvpn
+      # - VPN_TYPE=wireguard
+      # - WIREGUARD_PRIVATE_KEY=your_nord_wireguard_private_key
+      # - SERVER_COUNTRIES=Netherlands
+      #
+      # Uncomment ONE provider block above and fill in your credentials.
+      # Until configured, the VPN container will fail to start.
+      # ---- END VPN CONFIG ----
+      # - VPN_SERVICE_PROVIDER=mullvad
+      # - VPN_TYPE=wireguard
+      # - WIREGUARD_PRIVATE_KEY=your_mullvad_wireguard_private_key
+      # - WIREGUARD_ADDRESSES=10.x.x.x/32
+      # - SERVER_COUNTRIES=Netherlands
+    # Ports for services routed through VPN (they can't declare their own ports)
+    ports:
+      - "8191:8191"   # FlareSolverr (accessible from host for debugging)
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  # ===========================================
+  # MANHWA DOWNLOADER - Custom Python Scraper
+  # ===========================================
+  # Downloads from: asuracomic.net, flamecomics.xyz, drakecomic.org
+  # Edit config/sources.yaml to add your series
+  # ALL traffic routed through VPN — your real IP is never exposed to scraping targets
+  manhwa-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile.downloader
+    container_name: manhwa-downloader
+    network_mode: "service:vpn"
+    depends_on:
+      - vpn
+    volumes:
+      - ./scripts:/app/scripts
+      - ./config:/app/config
+      - ./library:/app/library
+      - ./logs:/app/logs
+    environment:
+      - TZ=America/Chicago
+      - DISPLAY=:99
+      # Check for new chapters every 6 hours (21600 seconds)
+      - CHECK_INTERVAL=21600
+      # FlareSolverr is on the same VPN network stack, so use localhost
+      - FLARESOLVERR_URL=http://localhost:8191
+    restart: unless-stopped
+
+  # ===========================================
+  # FLARESOLVERR - Cloudflare Bypass
+  # ===========================================
+  # Routed through VPN so Cloudflare bypass requests also use the VPN IP
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: "service:vpn"
+    depends_on:
+      - vpn
+    environment:
+      - LOG_LEVEL=info
+      - TZ=America/Chicago
+    restart: unless-stopped
+
+  # ===========================================
+  # ORVAULT - Custom Front-End Reader
+  # ===========================================
+  orvault:
+    build:
+      context: ./mangashelf
+      dockerfile: Dockerfile
+    container_name: orvault
+    volumes:
+      - ./library:/library:ro
+      - ./mangashelf/data:/app/data
+      - ./mangashelf/public/covers:/app/public/covers
+    environment:
+      - TZ=America/Chicago
+      - DATABASE_URL=file:../data/mangashelf.db
+      - NEXTAUTH_SECRET=change-me-to-a-random-secret-in-production
+      # Change NEXTAUTH_URL to your public Cloudflare tunnel domain (e.g. https://manga.yourdomain.com)
+      - NEXTAUTH_URL=http://manga.dirtyhousereading.com
+      - LIBRARY_PATH=/library
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  # ===========================================
+  # CLOUDFLARE TUNNEL - Remote Access
+  # ===========================================
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=your_cloudflare_tunnel_token_here
+    depends_on:
+      - orvault
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  # ===========================================
+  # OPTIONAL LEGACY SERVICES
+  # ===========================================
+  # Uncomment any of these if you still want Kavita, Komf, or Kaizoku.
+  # ORVault replaces Kavita as the primary reader.
+
+  # kavita:
+  #   image: jvmilazz0/kavita:latest
+  #   container_name: kavita
+  #   volumes:
+  #     - ./config/kavita:/kavita/config
+  #     - ./library:/library
+  #   environment:
+  #     - TZ=America/Chicago
+  #   ports:
+  #     - "5000:5000"
+  #   restart: unless-stopped
+  #   networks:
+  #     - manga-network
+
+  # komf:
+  #   image: sndxr/komf:latest
+  #   container_name: komf
+  #   volumes:
+  #     - ./config/komf:/config
+  #   environment:
+  #     - TZ=America/Chicago
+  #   depends_on:
+  #     - kavita
+  #   restart: unless-stopped
+  #   networks:
+  #     - manga-network
+
+  # kaizoku:
+  #   image: ghcr.io/oae/kaizoku:latest
+  #   container_name: kaizoku
+  #   environment:
+  #     - DATABASE_URL=postgresql://kaizoku:kaizoku@kaizoku-db:5432/kaizoku
+  #     - KAIZOKU_PORT=3000
+  #     - REDIS_HOST=kaizoku-redis
+  #     - REDIS_PORT=6379
+  #     - PUID=1000
+  #     - PGID=1000
+  #     - TZ=America/Chicago
+  #   volumes:
+  #     - ./library:/data
+  #     - ./config/kaizoku:/config
+  #     - ./config/kaizoku/logs:/logs
+  #     - ./config/scrapers:/config/.config/mangal/sources
+  #   depends_on:
+  #     - kaizoku-db
+  #     - kaizoku-redis
+  #   ports:
+  #     - "3000:3000"
+  #   restart: unless-stopped
+  #   networks:
+  #     - manga-network
+
+  # kaizoku-db:
+  #   image: postgres:15-alpine
+  #   container_name: kaizoku-db
+  #   environment:
+  #     - POSTGRES_USER=kaizoku
+  #     - POSTGRES_PASSWORD=kaizoku
+  #     - POSTGRES_DB=kaizoku
+  #   volumes:
+  #     - ./config/kaizoku/db:/var/lib/postgresql/data
+  #   restart: unless-stopped
+  #   networks:
+  #     - manga-network
+
+  # kaizoku-redis:
+  #   image: redis:7-alpine
+  #   container_name: kaizoku-redis
+  #   volumes:
+  #     - ./config/kaizoku/redis:/data
+  #   restart: unless-stopped
+  #   networks:
+  #     - manga-network
+
+networks:
+  manga-network:
+    driver: bridge

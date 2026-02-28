@@ -1,0 +1,136 @@
+version: '3.9'
+
+# ===========================================
+# MANGA SERVER WITH DOWNLOAD AUTOMATION
+# ===========================================
+# This setup includes:
+# - Kavita: Reading server
+# - Komf: Metadata fetcher
+# - Kaizoku: Manga download manager (uses mangal)
+# - FlareSolverr: Bypasses Cloudflare protection
+# - Cloudflared: Secure remote access
+
+services:
+  # ===========================================
+  # KAVITA - Manga/Comic Server
+  # ===========================================
+  kavita:
+    image: jvmilazz0/kavita:latest
+    container_name: kavita
+    volumes:
+      - /mnt/manga-storage/manga-server/config/kavita:/kavita/config
+      - /mnt/manga-storage/manga-server/library:/library
+    environment:
+      - TZ=America/Chicago
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  # ===========================================
+  # KOMF - Metadata Fetcher
+  # ===========================================
+  komf:
+    image: sndxr/komf:latest
+    container_name: komf
+    volumes:
+      - /mnt/manga-storage/manga-server/config/komf:/config
+    environment:
+      - TZ=America/Chicago
+    depends_on:
+      - kavita
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  # ===========================================
+  # KAIZOKU - Manga Download Manager
+  # ===========================================
+  # Web UI for managing manga downloads
+  # Uses mangal under the hood with multiple source support
+  # Access at: http://localhost:3000
+  kaizoku:
+    image: ghcr.io/oae/kaizoku:latest
+    container_name: kaizoku
+    environment:
+      - DATABASE_URL=postgresql://kaizoku:kaizoku@kaizoku-db:5432/kaizoku
+      - KAIZOKU_PORT=3000
+      - REDIS_HOST=kaizoku-redis
+      - REDIS_PORT=6379
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Chicago
+    volumes:
+      - /mnt/manga-storage/manga-server/library:/data
+      - /mnt/manga-storage/manga-server/config/kaizoku:/config
+      - /mnt/manga-storage/manga-server/config/kaizoku/logs:/logs
+    depends_on:
+      - kaizoku-db
+      - kaizoku-redis
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  kaizoku-db:
+    image: postgres:15-alpine
+    container_name: kaizoku-db
+    environment:
+      - POSTGRES_USER=kaizoku
+      - POSTGRES_PASSWORD=kaizoku
+      - POSTGRES_DB=kaizoku
+    volumes:
+      # On Windows use named volume: kaizoku-db-data:/var/lib/postgresql/data
+      # On Raspberry Pi with external drive:
+      - /mnt/manga-storage/manga-server/config/kaizoku/db:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  kaizoku-redis:
+    image: redis:7-alpine
+    container_name: kaizoku-redis
+    volumes:
+      - /mnt/manga-storage/manga-server/config/kaizoku/redis:/data
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  # ===========================================
+  # FLARESOLVERR - Cloudflare Bypass
+  # ===========================================
+  # Some sites use Cloudflare protection
+  # This helps bypass it for automated downloads
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=America/Chicago
+    ports:
+      - "8191:8191"
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+  # ===========================================
+  # CLOUDFLARE TUNNEL - Remote Access
+  # ===========================================
+  # Uncomment and add your tunnel token for remote access
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=your_cloudflare_tunnel_token_here
+    depends_on:
+      - kavita
+    restart: unless-stopped
+    networks:
+      - manga-network
+
+networks:
+  manga-network:
+    driver: bridge

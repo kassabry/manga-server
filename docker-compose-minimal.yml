@@ -1,0 +1,39 @@
+version: '3.9'
+
+# ===========================================
+# MINIMAL SETUP - Just Kavita + Komf
+# ===========================================
+# Use this if you want to manage downloads separately
+# (e.g., using HakuNeko on desktop, or manual downloads)
+
+services:
+  kavita:
+    image: jvmilazz0/kavita:latest
+    container_name: kavita
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./config/kavita:/kavita/config
+      - ./library:/library
+    environment:
+      - TZ=America/Chicago
+    restart: unless-stopped
+
+  komf:
+    image: sndxr/komf:latest
+    container_name: komf
+    volumes:
+      - ./config/komf:/config
+    environment:
+      - TZ=America/Chicago
+    restart: unless-stopped
+
+# To add Cloudflare Tunnel for remote access:
+# Uncomment below and add your tunnel token
+#
+#   cloudflared:
+#     image: cloudflare/cloudflared:latest
+#     command: tunnel --no-autoupdate run
+#     environment:
+#       - TUNNEL_TOKEN=your_token_here
+#     restart: unless-stopped

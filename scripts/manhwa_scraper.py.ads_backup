@@ -1,0 +1,2951 @@
+#!/usr/bin/env python3
+"""
+manhwa_scraper.py - Full site scraper for manhwa/manhua sites
+
+Features:
+- Scrape ALL series from a site
+- Export series list to YAML for selective downloading
+- Download all or filtered series
+- Resume interrupted downloads
+- Rate limiting to avoid bans
+
+Supports:
+- asuracomic.net
+- flamecomics.xyz
+- drakecomic.org
+
+Usage:
+    # List all series from a site (creates series list file)
+    python manhwa_scraper.py --site asura --list-all --output series_list.yaml
+    
+    # Download ALL series from a site (careful - lots of data!)
+    python manhwa_scraper.py --site asura --download-all --output /path/to/library
+    
+    # Download only series matching a filter
+    python manhwa_scraper.py --site asura --download-all --filter "cultivation,martial" --output /path/to/library
+    
+    # Download from a curated list
+    python manhwa_scraper.py --config my_series.yaml --output /path/to/library
+"""
+
+import argparse
+import copy
+import os
+import re
+import sys
+import time
+import json
+import random
+import zipfile
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional, Set
+from dataclasses import dataclass, field
+from datetime import datetime
+import pickle
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    import yaml
+except ImportError as e:
+    print(f"Missing dependency: {e}")
+    print("Install with: pip install requests beautifulsoup4 pyyaml")
+    sys.exit(1)
+
+# Optional Selenium for JS-heavy sites
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    SELENIUM_AVAILABLE = True
+    
+    # Try to import undetected-chromedriver for better bot detection bypass
+    try:
+        import undetected_chromedriver as uc
+        UC_AVAILABLE = True
+    except ImportError:
+        UC_AVAILABLE = False
+        
+except ImportError:
+    SELENIUM_AVAILABLE = False
+    UC_AVAILABLE = False
+    print("Warning: Selenium not available. Some sites may not work.")
+    print("Install with: pip install selenium webdriver-manager")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Chapter:
+    """Represents a manga chapter"""
+    number: str
+    title: str
+    url: str
+    downloaded: bool = False
+
+
+@dataclass 
+class Series:
+    """Represents a manga series"""
+    title: str
+    url: str
+    source: str
+    genres: List[str] = field(default_factory=list)
+    status: str = ""
+    chapters_count: int = 0
+    last_updated: str = ""
+    rating: float = 0.0  # Rating out of 5.0 or 10.0 (normalized to 5.0)
+    description: str = ""
+    author: str = ""
+    artist: str = ""
+    enabled: bool = True
+
+
+class ProgressTracker:
+    """Track download progress to allow resuming"""
+    
+    def __init__(self, cache_file: Path):
+        self.cache_file = cache_file
+        self.downloaded: Set[str] = set()
+        self.load()
+    
+    def load(self):
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    self.downloaded = pickle.load(f)
+                logger.info(f"Loaded progress: {len(self.downloaded)} chapters already downloaded")
+            except Exception as e:
+                logger.warning(f"Could not load progress cache: {e}")
+                self.downloaded = set()
+    
+    def save(self):
+        try:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(self.downloaded, f)
+        except Exception as e:
+            logger.warning(f"Could not save progress cache: {e}")
+    
+    def is_downloaded(self, chapter_url: str) -> bool:
+        return chapter_url in self.downloaded
+    
+    def mark_downloaded(self, chapter_url: str):
+        self.downloaded.add(chapter_url)
+        self.save()
+
+
+class BaseSiteScraper:
+    """Base class for site-wide scraping"""
+    
+    BASE_URL = ""
+    SITE_NAME = ""
+    
+    # Rate limiting
+    MIN_DELAY = 2  # Minimum seconds between requests
+    MAX_DELAY = 5  # Maximum seconds between requests
+    
+    def __init__(self, headless: bool = True, limit: int = None):
+        self.headless = headless
+        self.driver = None
+        self.limit = limit  # Stop after finding this many series
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        })
+    
+    def _delay(self):
+        """Random delay between requests to avoid rate limiting"""
+        delay = random.uniform(self.MIN_DELAY, self.MAX_DELAY)
+        time.sleep(delay)
+    
+    def _detect_chrome_version(self):
+        """Detect installed Chrome version for undetected-chromedriver compatibility"""
+        import subprocess
+        import re as regex
+        try:
+            # Windows - read from registry
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
+            version, _ = winreg.QueryValueEx(key, "version")
+            winreg.CloseKey(key)
+            return int(version.split('.')[0])
+        except:
+            pass
+        try:
+            # Linux/Mac - run chrome --version
+            result = subprocess.run(['google-chrome', '--version'], capture_output=True, text=True)
+            match = regex.search(r'(\d+)\.', result.stdout)
+            if match:
+                return int(match.group(1))
+        except:
+            pass
+        return None
+
+    def _inject_ad_blocker(self):
+        """Inject JavaScript to block ads and popups"""
+        try:
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': "window.open = function() { return null; }; if (Notification) { Notification.requestPermission = function() { return Promise.resolve('denied'); }; }"
+            })
+        except:
+            pass
+
+    def _init_driver(self):
+        """Initialize WebDriver with undetected-chromedriver if available"""
+        if not SELENIUM_AVAILABLE:
+            raise RuntimeError("Selenium not available - install with: pip install selenium")
+        if self.driver:
+            return
+        
+        # Use undetected-chromedriver if available (much better at avoiding detection)
+        if UC_AVAILABLE:
+            logger.info("Using undetected-chromedriver")
+            options = uc.ChromeOptions()
+            
+            if self.headless:
+                options.add_argument('--headless=new')
+            
+            options.add_argument('--no-sandbox')
+            options.add_argument('--disable-dev-shm-usage')
+            options.add_argument('--disable-gpu')
+            options.add_argument('--window-size=1920,1080')
+            
+            # Block notifications and popups (anti-ad measures)
+            options.add_argument('--disable-notifications')
+            prefs = {
+                "profile.default_content_setting_values.notifications": 2,
+                "profile.default_content_setting_values.popups": 2,
+            }
+            options.add_experimental_option("prefs", prefs)
+            
+            # Block known ad domains
+            ad_domains = ["deshystria.com", "uncingle.com", "tragicuncy.com", "pushnow.net", "raposablie.com", "retileupfis.com", "popsmartblocker.pro"]
+            block_rules = ",".join([f"MAP *.{d} 127.0.0.1, MAP {d} 127.0.0.1" for d in ad_domains])
+            options.add_argument(f'--host-rules={block_rules}')
+            
+            try:
+                # Detect Chrome version to avoid version mismatch errors
+                chrome_version = self._detect_chrome_version()
+                if chrome_version:
+                    logger.info(f"Detected Chrome version: {chrome_version}")
+                    self.driver = uc.Chrome(options=options, use_subprocess=True, version_main=chrome_version)
+                else:
+                    self.driver = uc.Chrome(options=options, use_subprocess=True)
+                
+                # Inject ad-blocking script
+                self._inject_ad_blocker()
+                self.driver.implicitly_wait(10)
+                return
+                
+            except Exception as e:
+                logger.warning(f"undetected-chromedriver failed: {e}, falling back to regular selenium")
+        
+        # Fallback to regular selenium
+        logger.info("Using regular selenium (undetected-chromedriver not available or failed)")
+        options = Options()
+        
+        if self.headless:
+            options.add_argument('--headless=new')
+        
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument('--disable-notifications')
+        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=options)
+        except Exception:
+            self.driver = webdriver.Chrome(options=options)
+        
+        # Try to mask automation
+        try:
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            })
+        except:
+            pass
+        
+        self.driver.implicitly_wait(10)
+
+
+    def _close_driver(self):
+        if self.driver:
+            self.driver.quit()
+            self.driver = None
+    
+    def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
+        """Get BeautifulSoup object from URL"""
+        self._delay()
+        
+        if use_selenium:
+            self._init_driver()
+            self.driver.get(url)
+            
+            # Wait for page to load
+            wait_time = 5
+            time.sleep(wait_time)
+            
+            # Try to wait for specific content to appear (grid of series)
+            try:
+                from selenium.webdriver.support.ui import WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+                from selenium.webdriver.common.by import By
+                
+                # Wait for any links to series pages
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="series/"]'))
+                )
+                time.sleep(1)  # Extra time for all content to render
+            except:
+                pass  # Continue even if wait fails
+            
+            html = self.driver.page_source
+        else:
+            response = self.session.get(url, timeout=30)
+            response.raise_for_status()
+            html = response.text
+        
+        return BeautifulSoup(html, 'html.parser')
+    
+    def get_all_series(self) -> List[Series]:
+        """Get ALL series from the site - override in subclass"""
+        raise NotImplementedError
+    
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Get chapters for a series - override in subclass"""
+        raise NotImplementedError
+    
+    def get_chapter_count(self, series: Series) -> int:
+        """Get chapter count for a series (calls get_chapters)"""
+        try:
+            chapters = self.get_chapters(series)
+            return len(chapters)
+        except Exception as e:
+            logger.debug(f"Error getting chapter count for {series.title}: {e}")
+            return 0
+    
+    def get_series_status(self, series: Series) -> str:
+        """Get status for a series (Ongoing, Completed, etc.) - override in subclass for better performance"""
+        try:
+            soup = self._get_soup(series.url, use_selenium=True)
+            
+            # Common status patterns across sites
+            status_selectors = [
+                '.status', '[class*="status"]', '.info-status',
+                'span:contains("Status")', 'div:contains("Status")',
+                '.imptdt', '.tsinfo', '.spe', '.seriestustat'
+            ]
+            
+            for selector in status_selectors:
+                try:
+                    elem = soup.select_one(selector)
+                    if elem:
+                        text = elem.get_text(strip=True).lower()
+                        if 'completed' in text or 'finished' in text or 'complete' in text:
+                            return 'Completed'
+                        elif 'ongoing' in text or 'updating' in text:
+                            return 'Ongoing'
+                        elif 'hiatus' in text:
+                            return 'Hiatus'
+                        elif 'dropped' in text or 'cancelled' in text or 'canceled' in text:
+                            return 'Dropped'
+                except:
+                    continue
+            
+            # Try searching all text for status keywords
+            page_text = soup.get_text().lower()
+            if 'status: completed' in page_text or 'status:completed' in page_text:
+                return 'Completed'
+            elif 'status: ongoing' in page_text or 'status:ongoing' in page_text:
+                return 'Ongoing'
+            elif 'status: hiatus' in page_text:
+                return 'Hiatus'
+            
+            return 'Unknown'
+            
+        except Exception as e:
+            logger.debug(f"Error getting status for {series.title}: {e}")
+            return 'Unknown'
+    
+    def get_series_details(self, series: Series) -> Series:
+        """Fetch full details for a series: title, status, rating, description, author, artist"""
+        try:
+            soup = self._get_soup(series.url, use_selenium=True)
+            
+            # Get title if not set or is "Unknown"
+            if not series.title or series.title == "Unknown":
+                series.title = self._extract_title_from_soup(soup) or series.title
+            
+            # Get status
+            if not series.status or series.status in ['', 'Unknown']:
+                series.status = self._extract_status_from_soup(soup)
+            
+            # Get rating
+            if series.rating == 0.0:
+                series.rating = self._extract_rating_from_soup(soup)
+            
+            # Get description
+            if not series.description:
+                series.description = self._extract_description_from_soup(soup)
+            
+            # Get author/artist
+            if not series.author:
+                series.author = self._extract_author_from_soup(soup)
+            if not series.artist:
+                series.artist = self._extract_artist_from_soup(soup)
+            
+            # Get chapter count if not set
+            if series.chapters_count == 0:
+                try:
+                    chapters = self.get_chapters(series)
+                    series.chapters_count = len(chapters)
+                except:
+                    pass
+            
+            return series
+            
+        except Exception as e:
+            logger.debug(f"Error getting details for {series.title}: {e}")
+            return series
+    
+    def _extract_title_from_soup(self, soup) -> str:
+        """Extract title from parsed soup"""
+        title_selectors = [
+            'h1', '.entry-title', '.post-title', '.series-title', '.manga-title',
+            '[class*="title"] h1', 'h1[class*="title"]', '.seriestuheader h1',
+            'meta[property="og:title"]'
+        ]
+        
+        for selector in title_selectors:
+            try:
+                if 'meta' in selector:
+                    elem = soup.select_one(selector)
+                    if elem:
+                        return elem.get('content', '').strip()
+                else:
+                    elem = soup.select_one(selector)
+                    if elem:
+                        text = elem.get_text(strip=True)
+                        if text and len(text) > 2:
+                            return text
+            except:
+                continue
+        return ""
+    
+    def _extract_status_from_soup(self, soup) -> str:
+        """Extract status from parsed soup"""
+        status_selectors = [
+            '.status', '[class*="status"]', '.info-status',
+            '.imptdt', '.tsinfo', '.spe', '.seriestustat'
+        ]
+        
+        for selector in status_selectors:
+            try:
+                elem = soup.select_one(selector)
+                if elem:
+                    text = elem.get_text(strip=True).lower()
+                    if 'completed' in text or 'finished' in text:
+                        return 'Completed'
+                    elif 'ongoing' in text or 'updating' in text:
+                        return 'Ongoing'
+                    elif 'hiatus' in text:
+                        return 'Hiatus'
+                    elif 'dropped' in text:
+                        return 'Dropped'
+            except:
+                continue
+        return 'Unknown'
+    
+    def _extract_rating_from_soup(self, soup) -> float:
+        """Extract rating from parsed soup - override in subclass for site-specific parsing"""
+        # Common rating selectors
+        rating_selectors = [
+            '.rating-num', '.score', '.rate', '[class*="rating"]',
+            '.num', '.vote', 'span[itemprop="ratingValue"]'
+        ]
+        
+        for selector in rating_selectors:
+            try:
+                elem = soup.select_one(selector)
+                if elem:
+                    text = elem.get_text(strip=True)
+                    # Try to extract a number
+                    match = re.search(r'(\d+\.?\d*)', text)
+                    if match:
+                        rating = float(match.group(1))
+                        # Normalize to 5.0 scale if needed
+                        if rating > 5.0:
+                            rating = rating / 2.0  # Assume 10-point scale
+                        return round(min(rating, 5.0), 2)
+            except:
+                continue
+        return 0.0
+    
+    def _extract_description_from_soup(self, soup) -> str:
+        """Extract description/summary from parsed soup"""
+        desc_selectors = [
+            '.summary', '.synopsis', '.description', '.desc',
+            '[class*="summary"]', '[class*="synopsis"]', '[class*="description"]',
+            '.entry-content', '.comic-description', 'div[itemprop="description"]'
+        ]
+        
+        for selector in desc_selectors:
+            try:
+                elem = soup.select_one(selector)
+                if elem:
+                    text = elem.get_text(strip=True)
+                    if len(text) > 50:  # Reasonable description length
+                        # Clean up the text
+                        text = re.sub(r'\s+', ' ', text)
+                        return text[:2000]  # Limit length
+            except:
+                continue
+        return ""
+    
+    def _extract_author_from_soup(self, soup) -> str:
+        """Extract author from parsed soup"""
+        author_selectors = [
+            '.author', '[class*="author"]', 'span:contains("Author")',
+            '.writer', '[class*="writer"]'
+        ]
+        
+        for selector in author_selectors:
+            try:
+                elem = soup.select_one(selector)
+                if elem:
+                    text = elem.get_text(strip=True)
+                    # Clean up common prefixes
+                    text = re.sub(r'^(Author|Writer|By)[:\s]*', '', text, flags=re.I)
+                    if text and len(text) < 100:
+                        return text
+            except:
+                continue
+        return ""
+    
+    def _extract_artist_from_soup(self, soup) -> str:
+        """Extract artist from parsed soup"""
+        artist_selectors = [
+            '.artist', '[class*="artist"]', 'span:contains("Artist")',
+            '.illustrator', '[class*="illustrator"]'
+        ]
+        
+        for selector in artist_selectors:
+            try:
+                elem = soup.select_one(selector)
+                if elem:
+                    text = elem.get_text(strip=True)
+                    text = re.sub(r'^(Artist|Illustrator)[:\s]*', '', text, flags=re.I)
+                    if text and len(text) < 100:
+                        return text
+            except:
+                continue
+        return ""
+    
+    def enrich_series_details(self, series: Series) -> Series:
+        """Fetch both chapter count and status for a series"""
+        series.chapters_count = self.get_chapter_count(series)
+        if not series.status or series.status == 'Unknown':
+            series.status = self.get_series_status(series)
+        return series
+    
+    def enrich_with_full_details(self, series_list: List[Series], show_progress: bool = True) -> List[Series]:
+        """Fetch full details (status, rating, description, etc.) for all series"""
+        total = len(series_list)
+        for i, series in enumerate(series_list, 1):
+            if show_progress:
+                logger.info(f"[{i}/{total}] Getting details for: {series.title}")
+            
+            series = self.get_series_details(series)
+            
+            if show_progress:
+                status_str = f" ({series.status})" if series.status else ""
+                rating_str = f" ★{series.rating}" if series.rating > 0 else ""
+                logger.info(f"    → {series.chapters_count} chapters{status_str}{rating_str}")
+            
+            # Small delay to avoid rate limiting
+            time.sleep(random.uniform(0.5, 1.5))
+        return series_list
+    
+    def enrich_with_chapter_counts(self, series_list: List[Series], show_progress: bool = True, fetch_status: bool = True) -> List[Series]:
+        """Fetch chapter counts and optionally status for all series in list"""
+        # Use full details enrichment which includes everything
+        return self.enrich_with_full_details(series_list, show_progress)
+    
+    def _create_comic_info_xml(self, series: Series, chapter: Chapter) -> str:
+        """Create ComicInfo.xml content for CBZ metadata"""
+        # Escape XML special characters
+        def escape_xml(text: str) -> str:
+            if not text:
+                return ""
+            return (text
+                .replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;')
+                .replace('"', '&quot;')
+                .replace("'", '&apos;'))
+        
+        genres = ', '.join(series.genres) if series.genres else ''
+        
+        # Build XML
+        xml_parts = [
+            '<?xml version="1.0" encoding="utf-8"?>',
+            '<ComicInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">',
+            f'  <Series>{escape_xml(series.title)}</Series>',
+            f'  <Number>{escape_xml(str(chapter.number))}</Number>',
+            f'  <Title>{escape_xml(chapter.title)}</Title>',
+        ]
+        
+        if genres:
+            xml_parts.append(f'  <Genre>{escape_xml(genres)}</Genre>')
+        
+        if series.description:
+            xml_parts.append(f'  <Summary>{escape_xml(series.description)}</Summary>')
+        
+        if series.rating > 0:
+            # CommunityRating in ComicInfo.xml is on a 5-point scale
+            xml_parts.append(f'  <CommunityRating>{series.rating:.1f}</CommunityRating>')
+        
+        if series.author:
+            xml_parts.append(f'  <Writer>{escape_xml(series.author)}</Writer>')
+        
+        if series.artist:
+            xml_parts.append(f'  <Penciller>{escape_xml(series.artist)}</Penciller>')
+        
+        if series.url:
+            xml_parts.append(f'  <Web>{escape_xml(series.url)}</Web>')
+        
+        # Manga reading direction (right to left for most manhwa/manga)
+        xml_parts.append('  <Manga>YesAndRightToLeft</Manga>')
+        
+        # Add source as a tag
+        if series.source:
+            xml_parts.append(f'  <Notes>Source: {escape_xml(series.source)}</Notes>')
+        
+        xml_parts.append('</ComicInfo>')
+        
+        return '\n'.join(xml_parts)
+    
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        """Get image URLs for a chapter - override in subclass"""
+        raise NotImplementedError
+    
+    def download_chapter(self, chapter: Chapter, series_title: str, 
+                        output_dir: Path, tracker: ProgressTracker,
+                        series: Series = None) -> bool:
+        """Download a chapter and create CBZ with metadata"""
+        
+        # Check if already downloaded
+        if tracker.is_downloaded(chapter.url):
+            logger.debug(f"Skipping (already downloaded): {series_title} Ch.{chapter.number}")
+            return True
+        
+        safe_title = self._sanitize_filename(series_title)
+        safe_chapter = self._sanitize_filename(chapter.number)
+        
+        series_dir = output_dir / safe_title
+        series_dir.mkdir(parents=True, exist_ok=True)
+        
+        cbz_name = f"{safe_title} - Chapter {safe_chapter}.cbz"
+        cbz_path = series_dir / cbz_name
+        
+        if cbz_path.exists():
+            tracker.mark_downloaded(chapter.url)
+            logger.info(f"Already exists: {cbz_name}")
+            return True
+        
+        logger.info(f"Downloading: {series_title} - Chapter {chapter.number}")
+        
+        try:
+            pages = self.get_pages(chapter)
+            if not pages:
+                logger.error(f"No pages found for chapter {chapter.number}")
+                return False
+            
+            # Create temp directory for images
+            temp_dir = series_dir / f".temp_{safe_chapter}"
+            temp_dir.mkdir(exist_ok=True)
+            
+            # Download images
+            success_count = 0
+            for i, page_url in enumerate(pages, 1):
+                ext = self._get_extension(page_url)
+                img_path = temp_dir / f"{i:03d}{ext}"
+                
+                if self._download_image(page_url, img_path, chapter.url):
+                    success_count += 1
+                else:
+                    logger.warning(f"Failed to download page {i}")
+                
+                # Small delay between images
+                time.sleep(0.5)
+            
+            if success_count == 0:
+                logger.error(f"No images downloaded for chapter {chapter.number}")
+                return False
+            
+            # Create CBZ with metadata
+            self._create_cbz(temp_dir, cbz_path, series, chapter)
+            
+            # Cleanup
+            for f in temp_dir.iterdir():
+                f.unlink()
+            temp_dir.rmdir()
+            
+            # Mark as downloaded
+            tracker.mark_downloaded(chapter.url)
+            
+            logger.info(f"Created: {cbz_name} ({success_count} pages)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error downloading chapter: {e}")
+            return False
+    
+    def _download_image(self, url: str, path: Path, referer: str) -> bool:
+        """Download an image file"""
+        try:
+            headers = {
+                'Referer': referer,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = self.session.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            if len(response.content) < 1000:  # Likely an error page
+                return False
+            
+            path.write_bytes(response.content)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to download {url}: {e}")
+            return False
+    
+    def _create_cbz(self, source_dir: Path, output_path: Path, series: Series = None, chapter: Chapter = None):
+        """Create CBZ archive from images with optional ComicInfo.xml metadata"""
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Add images
+            for img_file in sorted(source_dir.iterdir()):
+                if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                    zf.write(img_file, img_file.name)
+            
+            # Add ComicInfo.xml if we have metadata
+            if series and chapter:
+                comic_info = self._create_comic_info_xml(series, chapter)
+                zf.writestr('ComicInfo.xml', comic_info.encode('utf-8'))
+    
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        """Sanitize filename for filesystem"""
+        name = re.sub(r'[<>:"/\\|?*]', '', name)
+        name = re.sub(r'\s+', ' ', name)
+        name = name.strip()
+        return name[:200]
+    
+    @staticmethod
+    def _get_extension(url: str) -> str:
+        """Get file extension from URL"""
+        url_lower = url.lower()
+        if '.png' in url_lower:
+            return '.png'
+        elif '.webp' in url_lower:
+            return '.webp'
+        elif '.gif' in url_lower:
+            return '.gif'
+        return '.jpg'
+
+
+class AsuraFullScraper(BaseSiteScraper):
+    """Full site scraper for asuracomic.net"""
+    
+    BASE_URL = "https://asuracomic.net"
+    SITE_NAME = "asura"
+    
+    def get_series_status(self, series: Series) -> str:
+        """Get status for a series from Asura Scans"""
+        try:
+            soup = self._get_soup(series.url, use_selenium=True)
+            
+            # Look for status span with bg-blue or bg-green etc
+            status_elem = soup.select_one('span.status, span[class*="status"], span[class*="bg-blue"], span[class*="bg-green"]')
+            if status_elem:
+                text = status_elem.get_text(strip=True).lower()
+                if 'completed' in text or 'finished' in text:
+                    return 'Completed'
+                elif 'ongoing' in text:
+                    return 'Ongoing'
+                elif 'hiatus' in text:
+                    return 'Hiatus'
+                elif 'dropped' in text:
+                    return 'Dropped'
+            
+            # Fallback: search page text
+            page_text = soup.get_text().lower()
+            if 'completed' in page_text:
+                return 'Completed'
+            elif 'ongoing' in page_text:
+                return 'Ongoing'
+            
+            return 'Unknown'
+        except Exception as e:
+            logger.debug(f"Error getting status: {e}")
+            return 'Unknown'
+    
+    def get_all_series(self) -> List[Series]:
+        """Get all series from Asura Scans"""
+        logger.info("Fetching all series from Asura Scans...")
+        
+        all_series = []
+        seen_urls = set()  # Track across ALL pages
+        page = 1
+        
+        while True:
+            url = f"{self.BASE_URL}/series?page={page}"
+            logger.info(f"Fetching page {page}...")
+            
+            try:
+                # Use Selenium with extra wait time for dynamic content
+                self._init_driver()
+                self.driver.get(url)
+                
+                # Wait for grid to load - the series are in a grid container
+                time.sleep(4)  # Initial wait for JS to execute
+                
+                # Scroll down to trigger any lazy loading
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
+                time.sleep(1)
+                self.driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
+                
+                # Get page source after JS has loaded
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                
+                # Debug: log page title to confirm we're on the right page
+                page_title = soup.select_one('title')
+                logger.debug(f"Page title: {page_title.get_text() if page_title else 'No title'}")
+                
+                # Find the grid container first - specifically the main content grid, not sidebar
+                # The main grid has specific classes that distinguish it from the Popular sidebar
+                grid = soup.select_one('div.grid.grid-cols-2.sm\\:grid-cols-2.md\\:grid-cols-5')
+                if not grid:
+                    grid = soup.select_one('div[class*="grid-cols-5"]')
+                if not grid:
+                    grid = soup.select_one('div.grid[class*="grid-cols"]')
+                
+                items = []
+                if grid:
+                    # Find all series links within the grid only
+                    items = grid.select('a[href*="series/"]')
+                    logger.debug(f"Found {len(items)} items in grid")
+                
+                # Fallback: find all series links but be more selective
+                if not items:
+                    # Only get links that have the series slug pattern
+                    all_links = soup.select('a[href*="series/"]')
+                    items = [a for a in all_links if re.search(r'series/[\w-]+-[a-f0-9]+$', a.get('href', ''))]
+                    logger.debug(f"Fallback: found {len(items)} series links")
+                
+                if not items:
+                    logger.info(f"No more series found on page {page}")
+                    break
+                
+                found_count = 0
+                
+                for item in items:
+                    href = item.get('href', '')
+                    
+                    # Skip if not a valid series link
+                    if not href or 'series/' not in href:
+                        continue
+                    
+                    # Normalize URL for deduplication
+                    # Remove trailing slashes and query params
+                    normalized_href = href.rstrip('/').split('?')[0]
+                    
+                    # Skip duplicates (check normalized version)
+                    if normalized_href in seen_urls:
+                        continue
+                    seen_urls.add(normalized_href)
+                    
+                    # Build full URL
+                    if href.startswith('http'):
+                        full_url = href
+                    elif href.startswith('/'):
+                        full_url = self.BASE_URL + href
+                    else:
+                        full_url = self.BASE_URL + '/' + href
+                    
+                    # Get title - need to find the actual title, not badges like "MANHWA"
+                    title = None
+                    
+                    # Method 1: img alt attribute (most reliable)
+                    img = item.select_one('img')
+                    if img:
+                        alt = img.get('alt', '').strip()
+                        # Skip if alt is just a type badge
+                        if alt and len(alt) > 3 and alt.upper() not in ['MANHWA', 'MANHUA', 'MANGA', 'WEBTOON']:
+                            title = alt
+                    
+                    # Method 2: Look for span with font-bold that has actual title text
+                    if not title:
+                        for span in item.select('span[class*="font-bold"], span.font-bold'):
+                            text = span.get_text(strip=True)
+                            # Skip badges and short text
+                            if (text and len(text) > 3 and 
+                                text.upper() not in ['MANHWA', 'MANHUA', 'MANGA', 'WEBTOON', 'ONGOING', 'COMPLETED', 'HIATUS', 'DROPPED', 'NEW', 'HOT'] and
+                                not text.replace('.', '').replace(',', '').isdigit() and
+                                'chapter' not in text.lower()):
+                                title = text
+                                break
+                    
+                    # Method 3: Look for any text in nested link
+                    if not title:
+                        nested_link = item.select_one('a[href*="series/"]')
+                        if nested_link:
+                            # Get text that's not in a badge span
+                            for child in nested_link.children:
+                                if hasattr(child, 'name') and child.name == 'span':
+                                    text = child.get_text(strip=True)
+                                    if (text and len(text) > 3 and 
+                                        text.upper() not in ['MANHWA', 'MANHUA', 'MANGA', 'WEBTOON', 'ONGOING', 'COMPLETED', 'HIATUS']):
+                                        title = text
+                                        break
+                    
+                    if not title or len(title) < 2:
+                        continue
+                    
+                    # Clean title
+                    title = title.strip()
+                    
+                    # Get status if visible on card
+                    status = ''
+                    status_elem = item.select_one('span.status, span[class*="status"], span[class*="bg-blue"], span[class*="bg-green"], span[class*="bg-red"]')
+                    if status_elem:
+                        status_text = status_elem.get_text(strip=True).lower()
+                        if 'ongoing' in status_text:
+                            status = 'Ongoing'
+                        elif 'completed' in status_text or 'complete' in status_text:
+                            status = 'Completed'
+                        elif 'hiatus' in status_text:
+                            status = 'Hiatus'
+                    
+                    # Get rating if visible
+                    rating = 0.0
+                    rating_elem = item.select_one('span.text-xs, span[class*="ml-1"]')
+                    if rating_elem:
+                        try:
+                            rating_text = rating_elem.get_text(strip=True)
+                            rating_match = re.search(r'(\d+\.?\d*)', rating_text)
+                            if rating_match:
+                                rating = float(rating_match.group(1))
+                                if rating > 5:
+                                    rating = rating / 2  # Normalize 10-point to 5-point
+                        except:
+                            pass
+                    
+                    series = Series(
+                        title=title,
+                        url=full_url,
+                        source=self.SITE_NAME,
+                        status=status,
+                        rating=round(rating, 2)
+                    )
+                    all_series.append(series)
+                    found_count += 1
+                    logger.debug(f"Found: {title}")
+                    
+                    # Check limit
+                    if self.limit and len(all_series) >= self.limit:
+                        logger.info(f"Reached limit of {self.limit} series")
+                        break
+                
+                # Check limit after page
+                if self.limit and len(all_series) >= self.limit:
+                    break
+                
+                logger.info(f"Found {found_count} series on page {page}")
+                
+                if found_count == 0:
+                    break
+                
+                page += 1
+                
+                # Safety limit
+                if page > 200:
+                    logger.warning("Reached page limit (200)")
+                    break
+                
+                time.sleep(1)  # Be nice to the server
+                    
+            except Exception as e:
+                logger.error(f"Error on page {page}: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                break
+        
+        logger.info(f"Total series found: {len(all_series)}")
+        return all_series
+    
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Get all chapters for a series"""
+        soup = self._get_soup(series.url, use_selenium=True)
+        
+        chapters = []
+        seen_urls = set()
+        
+        # Look for chapter links - on Asura they're typically in a list
+        for link in soup.select('a[href*="chapter"]'):
+            href = link.get('href', '')
+            text = link.get_text(strip=True)
+            
+            if not href:
+                continue
+            
+            # Build full URL
+            if href.startswith('http'):
+                full_url = href
+            elif href.startswith('/'):
+                full_url = self.BASE_URL + href
+            else:
+                full_url = self.BASE_URL + '/' + href
+            
+            # Skip duplicates
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            
+            # Extract chapter number
+            match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+            if not match:
+                match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', text, re.I)
+            
+            if match:
+                num = match.group(1)
+                chapters.append(Chapter(
+                    number=num,
+                    title=text or f"Chapter {num}",
+                    url=full_url
+                ))
+        
+        # Sort by chapter number (ascending)
+        chapters.sort(key=lambda x: float(x.number) if x.number.replace('.', '').isdigit() else 0)
+        return chapters
+    
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        """Get image URLs for a chapter"""
+        soup = self._get_soup(chapter.url, use_selenium=True)
+        
+        pages = []
+        seen = set()
+        
+        for img in soup.select('img'):
+            src = img.get('src', '') or img.get('data-src', '')
+            # Filter for actual manga pages - look for storage/content URLs
+            if src and ('storage' in src.lower() or 'chapter' in src.lower() or 
+                       'uploads' in src.lower() or 'content' in src.lower()):
+                # Skip thumbnails, logos, avatars
+                if 'logo' not in src.lower() and 'avatar' not in src.lower() and 'thumb' not in src.lower():
+                    if src not in seen:
+                        seen.add(src)
+                        pages.append(src)
+        
+        return pages
+
+
+class FlameFullScraper(BaseSiteScraper):
+    """Full site scraper for flamecomics.xyz"""
+    
+    BASE_URL = "https://flamecomics.xyz"
+    SITE_NAME = "flame"
+    
+    def get_all_series(self) -> List[Series]:
+        """Get all series from Flame Comics"""
+        logger.info("Fetching all series from Flame Comics...")
+        
+        all_series = []
+        
+        # Flame uses a single browse page with infinite scroll or pagination
+        url = f"{self.BASE_URL}/browse"
+        logger.info(f"Fetching browse page...")
+        
+        try:
+            self._init_driver()
+            self.driver.get(url)
+            time.sleep(3)
+            
+            # Scroll to load more content
+            last_height = 0
+            scroll_attempts = 0
+            max_scrolls = 20
+            
+            while scroll_attempts < max_scrolls:
+                # Scroll down
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                
+                new_height = self.driver.execute_script("return document.body.scrollHeight")
+                if new_height == last_height:
+                    scroll_attempts += 1
+                    if scroll_attempts >= 3:  # No new content after 3 attempts
+                        break
+                else:
+                    scroll_attempts = 0
+                last_height = new_height
+                
+                logger.info(f"Scrolling... found more content")
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            # Find series cards - they have links to /series/
+            seen_urls = set()
+            
+            # Method 1: Links containing /series/
+            for link in soup.select('a[href*="/series/"]'):
+                href = link.get('href', '')
+                if not href or href in seen_urls:
+                    continue
+                
+                # Skip chapter links
+                if '/chapter' in href.lower():
+                    continue
+                    
+                seen_urls.add(href)
+                
+                # Get title - try multiple methods
+                title = None
+                
+                # Method 1: Look for title link with DescSeriesCard_title class (from screenshot)
+                title_link = None
+                parent_card = link.find_parent('div', recursive=True)
+                if parent_card:
+                    title_link = parent_card.select_one('a[class*="title"], a[class*="Title"]')
+                    if title_link:
+                        title = title_link.get_text(strip=True)
+                
+                # Method 2: Look for title in nearby heading or strong elements
+                if not title and parent_card:
+                    title_elem = parent_card.select_one('h3, h4, strong, [class*="title"]')
+                    if title_elem:
+                        text = title_elem.get_text(strip=True)
+                        # Skip country codes and badges
+                        if text and len(text) > 2 and text.upper() not in ['CN', 'KR', 'JP', 'EN', 'MANHWA', 'MANHUA', 'MANGA']:
+                            title = text
+                
+                # Method 3: Try img alt
+                if not title:
+                    img = link.select_one('img')
+                    if img:
+                        alt = img.get('alt', '').strip()
+                        if alt and len(alt) > 2 and alt.upper() not in ['CN', 'KR', 'JP', 'EN']:
+                            title = alt
+                
+                # Method 4: Try link text but filter out badges
+                if not title:
+                    text = link.get_text(strip=True)
+                    if text and len(text) > 2 and text.upper() not in ['CN', 'KR', 'JP', 'EN', 'MANHWA', 'MANHUA', 'MANGA', 'NEW', 'HOT']:
+                        title = text
+                
+                if not title or len(title) < 3:
+                    continue
+                
+                # Skip if title is just a country code or badge
+                if title.upper() in ['CN', 'KR', 'JP', 'EN', 'MANHWA', 'MANHUA', 'MANGA', 'NEW', 'HOT', 'ONGOING', 'COMPLETED']:
+                    continue
+                
+                # Clean title - remove chapter info
+                if 'chapter' in title.lower():
+                    continue
+                
+                full_url = href if href.startswith('http') else self.BASE_URL + href
+                
+                # Get genres if available
+                genres = []
+                genre_container = link.find_parent('div', recursive=True)
+                if genre_container:
+                    for span in genre_container.select('span'):
+                        text = span.get_text(strip=True).upper()
+                        if text in ['ACTION', 'FANTASY', 'COMEDY', 'ADVENTURE', 'ROMANCE', 'DRAMA', 'SHOUNEN', 'SHOUJO', 'CULTIVATION']:
+                            genres.append(text.title())
+                
+                # Get status
+                status = ''
+                status_elem = link.find_parent('div')
+                if status_elem:
+                    status_badge = status_elem.select_one('[class*="badge"], [class*="status"]')
+                    if status_badge:
+                        status_text = status_badge.get_text(strip=True).lower()
+                        if 'dropped' in status_text:
+                            status = 'Dropped'
+                        elif 'hiatus' in status_text:
+                            status = 'Hiatus'
+                        elif 'completed' in status_text or 'complete' in status_text:
+                            status = 'Completed'
+                        elif 'ongoing' in status_text:
+                            status = 'Ongoing'
+                
+                series = Series(
+                    title=title,
+                    url=full_url,
+                    source=self.SITE_NAME,
+                    genres=genres,
+                    status=status
+                )
+                all_series.append(series)
+                logger.debug(f"Found: {title}")
+                
+                # Check limit
+                if self.limit and len(all_series) >= self.limit:
+                    logger.info(f"Reached limit of {self.limit} series")
+                    break
+                
+        except Exception as e:
+            logger.error(f"Error fetching Flame Comics: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        
+        # Deduplicate by URL
+        seen = set()
+        unique_series = []
+        for s in all_series:
+            if s.url not in seen:
+                seen.add(s.url)
+                unique_series.append(s)
+        
+        logger.info(f"Total series found: {len(unique_series)}")
+        return unique_series
+    
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        soup = self._get_soup(series.url, use_selenium=True)
+        
+        chapters = []
+        seen_urls = set()
+        
+        # Try multiple selectors for chapter links
+        # Flame chapters might be in various formats
+        chapter_links = soup.select('a[href*="/chapter"], a[href*="chapter-"], a[href*="ch-"]')
+        
+        # If no chapter links found, look for any links within chapter list containers
+        if not chapter_links:
+            chapter_links = soup.select('[class*="chapter"] a, [class*="Chapter"] a, [class*="episode"] a')
+        
+        # If still nothing, try all links and filter by pattern
+        if not chapter_links:
+            for link in soup.select('a[href]'):
+                href = link.get('href', '').lower()
+                text = link.get_text(strip=True).lower()
+                if 'chapter' in href or 'chapter' in text or 'ch.' in text or re.search(r'ch\s*\d', text):
+                    chapter_links.append(link)
+        
+        for link in chapter_links:
+            href = link.get('href', '')
+            text = link.get_text(strip=True)
+            
+            if not href:
+                continue
+            
+            # Build full URL
+            if href.startswith('http'):
+                full_url = href
+            elif href.startswith('/'):
+                full_url = self.BASE_URL + href
+            else:
+                full_url = self.BASE_URL + '/' + href
+            
+            # Skip if already seen
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            
+            # Extract chapter number
+            match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+            if not match:
+                match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', text, re.I)
+            if not match:
+                match = re.search(r'ch[- .]?(\d+(?:\.\d+)?)', text, re.I)
+            if not match:
+                # Try to find any number in the text
+                match = re.search(r'\b(\d+(?:\.\d+)?)\b', text)
+            
+            if match:
+                num = match.group(1)
+                chapters.append(Chapter(number=num, title=text or f"Chapter {num}", url=full_url))
+        
+        # Sort by chapter number (ascending)
+        chapters.sort(key=lambda x: float(x.number) if x.number.replace('.', '').isdigit() else 0)
+        return chapters
+    
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        soup = self._get_soup(chapter.url, use_selenium=True)
+        
+        pages = []
+        # Try multiple selectors for images
+        for img in soup.select('img[src*="storage"], img[src*="chapter"], .reading-content img, [class*="chapter"] img'):
+            src = img.get('data-src') or img.get('src', '')
+            src = src.strip()
+            if src and 'logo' not in src.lower() and 'avatar' not in src.lower():
+                if src not in pages:
+                    pages.append(src)
+        
+        return pages
+
+
+class WebtoonScraper(BaseSiteScraper):
+    """Full site scraper for webtoons.com (official platform)"""
+    
+    BASE_URL = "https://www.webtoons.com"
+    SITE_NAME = "webtoon"
+    
+    # Webtoon genres for ORIGINALS
+    GENRES = [
+        'drama', 'fantasy', 'comedy', 'action', 'slice-of-life', 'romance',
+        'superhero', 'sci-fi', 'thriller', 'supernatural', 'mystery', 
+        'sports', 'historical', 'heartwarming', 'horror', 'informative'
+    ]
+    
+    def __init__(self, headless: bool = True, canvas: bool = False, limit: int = None):
+        super().__init__(headless, limit=limit)
+        self.canvas = canvas  # If True, scrape CANVAS instead of ORIGINALS
+        # Webtoon requires specific headers
+        self.session.headers.update({
+            'Referer': 'https://www.webtoons.com/',
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        })
+    
+    def get_all_series(self) -> List[Series]:
+        """Get all series from Webtoons (ORIGINALS or CANVAS)"""
+        if self.canvas:
+            return self._get_canvas_series()
+        return self._get_originals_series()
+    
+    def _get_originals_series(self) -> List[Series]:
+        """Get all ORIGINALS series by genre"""
+        logger.info("Fetching all ORIGINALS series from Webtoons...")
+        
+        all_series = []
+        seen_urls = set()
+        
+        for genre in self.GENRES:
+            logger.info(f"Fetching genre: {genre}")
+            url = f"{self.BASE_URL}/en/genres/{genre}"
+            
+            try:
+                self._init_driver()
+                self.driver.get(url)
+                time.sleep(3)
+                
+                # Scroll to load all content
+                last_height = 0
+                for _ in range(5):
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+                    new_height = self.driver.execute_script("return document.body.scrollHeight")
+                    if new_height == last_height:
+                        break
+                    last_height = new_height
+                
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                
+                # Method 1: Find series in webtoon_list
+                for item in soup.select('ul.webtoon_list li'):
+                    try:
+                        # Get the main link
+                        link = item.select_one('a.link_genre_title_a, a[href*="title_no"]')
+                        if not link:
+                            continue
+                        
+                        href = link.get('href', '')
+                        if not href or href in seen_urls:
+                            continue
+                        
+                        # Extract title from strong.title or data attribute
+                        title = None
+                        title_elem = item.select_one('strong.title')
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                        
+                        if not title:
+                            # Try getting from link text
+                            title = link.get_text(strip=True)
+                        
+                        if not title or len(title) < 2:
+                            continue
+                        
+                        # Build full URL
+                        full_url = href if href.startswith('http') else self.BASE_URL + href
+                        
+                        # Extract title_no from URL
+                        title_no_match = re.search(r'title_no=(\d+)', full_url)
+                        if not title_no_match:
+                            continue
+                        
+                        seen_urls.add(full_url)
+                        
+                        # Get author if available
+                        author = ''
+                        author_elem = item.select_one('div.author, .author')
+                        if author_elem:
+                            author = author_elem.get_text(strip=True)
+                        
+                        series = Series(
+                            title=title,
+                            url=full_url,
+                            source=self.SITE_NAME,
+                            genres=[genre.replace('-', ' ').title()],
+                            author=author
+                        )
+                        all_series.append(series)
+                        logger.debug(f"Found: {title}")
+                        
+                        # Check limit
+                        if self.limit and len(all_series) >= self.limit:
+                            logger.info(f"Reached limit of {self.limit} series")
+                            break
+                    except Exception as e:
+                        logger.debug(f"Error parsing series: {e}")
+                        continue
+                
+                # Check limit after genre
+                if self.limit and len(all_series) >= self.limit:
+                    break
+                
+                # Method 2: Fallback to card items (older structure)
+                if not all_series:
+                    for card in soup.select('a.card_item, a[href*="title_no"]'):
+                        href = card.get('href', '')
+                        if not href or href in seen_urls:
+                            continue
+                        
+                        title_elem = card.select_one('.info .subj, strong.title, .subj')
+                        if not title_elem:
+                            continue
+                        
+                        title = title_elem.get_text(strip=True)
+                        full_url = href if href.startswith('http') else self.BASE_URL + href
+                        
+                        title_no_match = re.search(r'title_no=(\d+)', full_url)
+                        if not title_no_match:
+                            continue
+                        
+                        seen_urls.add(full_url)
+                        
+                        series = Series(
+                            title=title,
+                            url=full_url,
+                            source=self.SITE_NAME,
+                            genres=[genre.replace('-', ' ').title()]
+                        )
+                        all_series.append(series)
+                        logger.debug(f"Found: {title}")
+                        
+                        # Check limit
+                        if self.limit and len(all_series) >= self.limit:
+                            break
+                
+                logger.info(f"Found {len([s for s in all_series if genre.replace('-', ' ').title() in s.genres])} series in {genre}")
+                
+                # Check limit after genre
+                if self.limit and len(all_series) >= self.limit:
+                    logger.info(f"Reached limit of {self.limit} series")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error fetching genre {genre}: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                continue
+            
+            # Check limit in outer loop
+            if self.limit and len(all_series) >= self.limit:
+                break
+        
+        logger.info(f"Total ORIGINALS series found: {len(all_series)}")
+        return all_series
+    
+    def _get_canvas_series(self) -> List[Series]:
+        """Get CANVAS series (user-created content)"""
+        logger.info("Fetching CANVAS series from Webtoons...")
+        
+        all_series = []
+        seen_urls = set()
+        
+        # CANVAS genres
+        canvas_genres = ['romance', 'comedy', 'drama', 'slice-of-life', 'fantasy', 
+                        'supernatural', 'heartwarming', 'sci-fi', 'horror', 
+                        'thriller', 'action', 'others']
+        
+        for genre in canvas_genres:
+            logger.info(f"Fetching CANVAS genre: {genre}")
+            page = 1
+            
+            while page <= 5:  # Limit pages per genre
+                url = f"{self.BASE_URL}/en/canvas/genre?genre={genre}&page={page}"
+                
+                try:
+                    soup = self._get_soup(url, use_selenium=True)
+                    
+                    cards = soup.select('a.challenge_item, ul.challenge_lst li a')
+                    if not cards:
+                        break
+                    
+                    found_new = False
+                    for card in cards:
+                        href = card.get('href', '')
+                        if not href or href in seen_urls:
+                            continue
+                        
+                        title_elem = card.select_one('.subj, .info .subj')
+                        if not title_elem:
+                            continue
+                        
+                        title = title_elem.get_text(strip=True)
+                        full_url = href if href.startswith('http') else self.BASE_URL + href
+                        
+                        if full_url not in seen_urls:
+                            seen_urls.add(full_url)
+                            series = Series(
+                                title=title,
+                                url=full_url,
+                                source='webtoon-canvas',
+                                genres=[genre.replace('-', ' ').title()]
+                            )
+                            all_series.append(series)
+                            found_new = True
+                            
+                            # Check limit
+                            if self.limit and len(all_series) >= self.limit:
+                                logger.info(f"Reached limit of {self.limit} series")
+                                break
+                    
+                    # Check limit after page
+                    if self.limit and len(all_series) >= self.limit:
+                        break
+                    
+                    if not found_new:
+                        break
+                    page += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error on CANVAS page: {e}")
+                    break
+            
+            # Check limit in outer loop
+            if self.limit and len(all_series) >= self.limit:
+                break
+        
+        logger.info(f"Total CANVAS series found: {len(all_series)}")
+        return all_series
+    
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Get all FREE chapters for a series"""
+        chapters = []
+        page = 1
+        
+        # Extract title_no from URL
+        title_no_match = re.search(r'title_no=(\d+)', series.url)
+        if not title_no_match:
+            logger.error(f"Could not extract title_no from URL: {series.url}")
+            return chapters
+        
+        title_no = title_no_match.group(1)
+        
+        # Build base URL properly - remove /list if present to avoid duplication
+        base_url = re.sub(r'/list\?.*$', '', series.url)  # Remove /list?... 
+        base_url = re.sub(r'\?.*$', '', base_url)  # Remove any remaining query params
+        
+        while True:
+            # Webtoon chapter list URL
+            list_url = f"{base_url}/list?title_no={title_no}&page={page}"
+            
+            try:
+                soup = self._get_soup(list_url, use_selenium=False)
+                
+                # Find episode list
+                episode_items = soup.select('#_listUl li a, ul#_listUl li a')
+                
+                if not episode_items:
+                    break
+                
+                found_new = False
+                for item in episode_items:
+                    href = item.get('href', '')
+                    
+                    # Skip locked/paid episodes
+                    if item.select_one('.ico_lock, .locked'):
+                        continue
+                    
+                    # Get episode number and title
+                    num_elem = item.select_one('.tx, .subj .num, .episode_num')
+                    title_elem = item.select_one('.subj span, .sub_title')
+                    
+                    ep_num = ""
+                    if num_elem:
+                        ep_text = num_elem.get_text(strip=True)
+                        match = re.search(r'#?(\d+)', ep_text)
+                        ep_num = match.group(1) if match else ep_text
+                    
+                    ep_title = title_elem.get_text(strip=True) if title_elem else f"Episode {ep_num}"
+                    
+                    if href and ep_num:
+                        full_url = href if href.startswith('http') else self.BASE_URL + href
+                        
+                        # Check if we already have this chapter
+                        if not any(c.url == full_url for c in chapters):
+                            chapters.append(Chapter(
+                                number=ep_num,
+                                title=ep_title,
+                                url=full_url
+                            ))
+                            found_new = True
+                
+                if not found_new:
+                    break
+                    
+                page += 1
+                
+                # Safety limit
+                if page > 200:
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error fetching chapter list page {page}: {e}")
+                break
+        
+        # Sort by episode number
+        chapters.sort(key=lambda x: int(x.number) if x.number.isdigit() else 0)
+        
+        logger.info(f"Found {len(chapters)} free chapters for {series.title}")
+        return chapters
+    
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        """Get image URLs for a chapter"""
+        try:
+            soup = self._get_soup(chapter.url, use_selenium=True)
+            
+            pages = []
+            
+            # Webtoon stores images in the reader container
+            for img in soup.select('#_imageList img, .viewer_img img, #content img._images'):
+                src = img.get('data-url') or img.get('data-src') or img.get('src', '')
+                
+                if src and 'webtoon' in src.lower() and 'blank' not in src.lower():
+                    # Clean up URL
+                    src = src.split('?')[0] if '?' in src else src
+                    if src not in pages:
+                        pages.append(src)
+            
+            return pages
+            
+        except Exception as e:
+            logger.error(f"Error getting pages for {chapter.url}: {e}")
+            return []
+    
+    def _download_image(self, url: str, path: Path, referer: str) -> bool:
+        """Download image with Webtoon-specific headers"""
+        try:
+            headers = {
+                'Referer': referer,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            }
+            response = self.session.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            if len(response.content) < 1000:
+                return False
+            
+            path.write_bytes(response.content)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to download {url}: {e}")
+            return False
+
+
+class ManhuaToScraper(BaseSiteScraper):
+    """Full site scraper for manhuato.com"""
+    
+    BASE_URL = "https://manhuato.com"
+    SITE_NAME = "manhuato"
+    
+    # Available genres
+    GENRES = [
+        'action', 'adventure', 'comedy', 'drama', 'fantasy', 'historical',
+        'horror', 'martial-arts', 'mature', 'mystery', 'romance', 'sci-fi',
+        'shoujo', 'shounen', 'slice-of-life', 'supernatural', 'tragedy'
+    ]
+    
+    # Content types
+    TYPES = ['manhwa', 'manhua', 'manga', 'comics']
+    
+    def get_all_series(self, content_type: str = None) -> List[Series]:
+        """Get all series from ManhuaTo"""
+        logger.info("Fetching all series from ManhuaTo...")
+        
+        all_series = []
+        seen_urls = set()
+        
+        # If specific type requested, only scrape that
+        types_to_scrape = [content_type] if content_type else self.TYPES
+        
+        for ctype in types_to_scrape:
+            logger.info(f"Fetching type: {ctype}")
+            page = 1
+            consecutive_failures = 0
+            
+            # Initialize driver for this content type
+            self._close_driver()
+            
+            while True:
+                # Use the correct URL structure: /type/{type}?page=N
+                if page > 1:
+                    url = f"{self.BASE_URL}/type/{ctype}?page={page}"
+                else:
+                    url = f"{self.BASE_URL}/type/{ctype}"
+                logger.info(f"Fetching page {page} for {ctype}...")
+                
+                try:
+                    # Initialize driver if needed
+                    self._init_driver()
+                    
+                    self.driver.get(url)
+                    time.sleep(3)  # Wait for page to load
+                    
+                    # Wait for content to appear
+                    try:
+                        WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, 'div.visual, div.manga-cover, div.list_wrap'))
+                        )
+                        time.sleep(1)
+                    except:
+                        pass
+                    
+                    soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                    
+                    # Find series containers - they're in div.visual
+                    visual_items = soup.select('div.visual')
+                    logger.debug(f"Found {len(visual_items)} visual containers")
+                    
+                    if not visual_items:
+                        logger.info(f"No more series found on page {page}")
+                        consecutive_failures += 1
+                        if consecutive_failures >= 2:
+                            break
+                        page += 1
+                        continue
+                    
+                    consecutive_failures = 0
+                    found_count = 0
+                    
+                    for item in visual_items:
+                        try:
+                            # Get the correct URL from manga-cover link
+                            cover_link = item.select_one('div.manga-cover a, a[href*="/manhua/"], a[href*="/manhwa/"], a[href*="/manga/"]')
+                            if not cover_link:
+                                continue
+                            
+                            href = cover_link.get('href', '')
+                            if not href or href in seen_urls:
+                                continue
+                            
+                            # Skip chapter links
+                            if '-chapter-' in href:
+                                continue
+                            
+                            # Get title from img alt or h3.title text
+                            title = None
+                            img = item.select_one('img')
+                            if img:
+                                title = img.get('alt', '')
+                            
+                            if not title:
+                                title_elem = item.select_one('h3.title a, h3.title, h3 a')
+                                if title_elem:
+                                    title = title_elem.get_text(strip=True)
+                            
+                            if not title or len(title) < 2:
+                                continue
+                            
+                            full_url = href if href.startswith('http') else self.BASE_URL + href
+                            
+                            if full_url not in seen_urls:
+                                seen_urls.add(full_url)
+                                series = Series(
+                                    title=title,
+                                    url=full_url,
+                                    source=self.SITE_NAME,
+                                    genres=[ctype.title()]
+                                )
+                                all_series.append(series)
+                                found_count += 1
+                                logger.debug(f"Found: {title}")
+                                
+                                # Check limit
+                                if self.limit and len(all_series) >= self.limit:
+                                    logger.info(f"Reached limit of {self.limit} series")
+                                    break
+                        except Exception as e:
+                            logger.debug(f"Error parsing item: {e}")
+                            continue
+                    
+                    # Check limit after processing page
+                    if self.limit and len(all_series) >= self.limit:
+                        break
+                    
+                    logger.info(f"Found {found_count} series on page {page}")
+                    
+                    if found_count == 0:
+                        break
+                    
+                    page += 1
+                    
+                    # Safety limit per type
+                    if page > 200:
+                        logger.warning(f"Reached page limit for {ctype}")
+                        break
+                    
+                    time.sleep(0.5)  # Be nice to server
+                        
+                except Exception as e:
+                    logger.error(f"Error on page {page}: {e}")
+                    # Reinitialize driver on error
+                    self._close_driver()
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        logger.error(f"Too many failures for {ctype}, moving to next type")
+                        break
+                    continue
+            
+            # Close driver between content types
+            self._close_driver()
+        
+        logger.info(f"Total series found: {len(all_series)}")
+        return all_series
+    
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Get all chapters for a series"""
+        try:
+            soup = self._get_soup(series.url, use_selenium=False)
+            
+            chapters = []
+            
+            # Find chapter links
+            for link in soup.select('a[href*="-chapter-"]'):
+                href = link.get('href', '')
+                text = link.get_text(strip=True)
+                
+                if not href:
+                    continue
+                
+                # Extract chapter number
+                match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', text, re.I)
+                if not match:
+                    match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+                
+                num = match.group(1) if match else text
+                
+                # Build full URL properly
+                if href.startswith('http'):
+                    full_url = href
+                elif href.startswith('/'):
+                    full_url = self.BASE_URL + href
+                else:
+                    full_url = self.BASE_URL + '/' + href
+                
+                # Avoid duplicates
+                if not any(c.url == full_url for c in chapters):
+                    chapters.append(Chapter(
+                        number=num,
+                        title=text,
+                        url=full_url
+                    ))
+            
+            # Sort by chapter number (oldest first)
+            chapters.sort(key=lambda x: float(x.number) if x.number.replace('.', '').isdigit() else 0)
+            
+            return chapters
+            
+        except Exception as e:
+            logger.error(f"Error getting chapters: {e}")
+            return []
+    
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        """Get image URLs for a chapter with ad blocking and URL enumeration"""
+        try:
+            logger.info(f"Loading chapter page: {chapter.url}")
+            
+            # Use selenium to load the page
+            self._init_driver()
+            
+            # Try to load the page (may redirect to ads)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.driver.get(chapter.url)
+                    time.sleep(2)
+                    
+                    if 'manhuato.com' in self.driver.current_url.lower():
+                        break
+                    else:
+                        logger.warning(f"Redirected to {self.driver.current_url[:50]}..., retrying...")
+                        time.sleep(1)
+                except Exception as e:
+                    logger.warning(f"Navigation attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+            
+            # Remove ad overlays
+            try:
+                self.driver.execute_script("""
+                    document.querySelectorAll('[onclick]').forEach(el => el.removeAttribute('onclick'));
+                    document.querySelectorAll('div, section').forEach(el => {
+                        var style = window.getComputedStyle(el);
+                        if ((style.position === 'fixed' || style.position === 'absolute') && 
+                            parseInt(style.zIndex) > 100 && !el.querySelector('img[src*="cdn"]')) {
+                            el.remove();
+                        }
+                    });
+                """)
+            except:
+                pass
+            
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            
+            pages = []
+            
+            # Find images (without scrolling to avoid ad triggers)
+            for img in soup.select('img'):
+                src = img.get('data-original') or img.get('data-src') or img.get('data-lazy-src') or img.get('src', '')
+                
+                if not src or src.startswith('data:') or len(src) < 10:
+                    continue
+                
+                src = src.strip()
+                
+                # Ensure full URL
+                if src.startswith('//'):
+                    src = 'https:' + src
+                elif src.startswith('/'):
+                    src = self.BASE_URL + src
+                
+                # Filter for chapter images
+                src_lower = src.lower()
+                skip_keywords = ['logo', 'icon', 'loading', 'avatar', 'banner', 'ad', 'thumb', 'small', 'game']
+                include_keywords = ['media', 'chapter', 'manhua', 'uploads', 'images', 'files', 'cdn', 'wp-content']
+                
+                if any(kw in src_lower for kw in skip_keywords):
+                    continue
+                
+                if any(kw in src_lower for kw in include_keywords) or \
+                   any(ext in src_lower for ext in ['.jpg', '.png', '.webp']):
+                    if src not in pages:
+                        pages.append(src)
+            
+            # Enumerate more images based on URL pattern
+            if pages:
+                import re
+                import requests as req
+                
+                base_url = None
+                extension = None
+                max_found = -1
+                
+                for img_url in pages:
+                    match = re.search(r'(.+/)(\d+)(\.[a-z]+)$', img_url, re.I)
+                    if match:
+                        base_url = match.group(1)
+                        num = int(match.group(2))
+                        extension = match.group(3)
+                        if num > max_found:
+                            max_found = num
+                
+                if base_url and extension:
+                    logger.info(f"Enumerating images from pattern: {base_url}[N]{extension}")
+                    
+                    session = req.Session()
+                    session.headers.update({
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Referer': 'https://manhuato.com/',
+                    })
+                    
+                    # Find all images by enumeration
+                    consecutive_failures = 0
+                    current_num = 0
+                    
+                    while consecutive_failures < 3 and current_num < 200:
+                        test_url = f"{base_url}{current_num}{extension}"
+                        
+                        if test_url not in pages:
+                            try:
+                                resp = session.head(test_url, timeout=5)
+                                if resp.status_code == 200:
+                                    pages.append(test_url)
+                                    consecutive_failures = 0
+                                else:
+                                    consecutive_failures += 1
+                            except:
+                                consecutive_failures += 1
+                        else:
+                            consecutive_failures = 0
+                        
+                        current_num += 1
+                    
+                    # Sort by number
+                    def get_num(url):
+                        m = re.search(r'/(\d+)\.[a-z]+$', url, re.I)
+                        return int(m.group(1)) if m else 0
+                    
+                    pages.sort(key=get_num)
+            
+            logger.info(f"Found {len(pages)} page images")
+            return pages
+            
+        except Exception as e:
+            logger.error(f"Error getting pages: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return []
+
+class DrakeFullScraper(BaseSiteScraper):
+    """Full site scraper for drakecomic.org"""
+    
+    BASE_URL = "https://drakecomic.org"
+    SITE_NAME = "drake"
+    
+    def get_all_series(self) -> List[Series]:
+        """Get all series from Drake Comics"""
+        logger.info("Fetching all series from Drake Comics...")
+        
+        all_series = []
+        page = 1
+        
+        while True:
+            url = f"{self.BASE_URL}/manga/?page={page}" if page > 1 else f"{self.BASE_URL}/manga/"
+            logger.info(f"Fetching page {page}...")
+            
+            try:
+                self._init_driver()
+                self.driver.get(url)
+                time.sleep(3)
+                
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                
+                # Find series containers - div.bs contains each series
+                items = soup.select('div.bs')
+                
+                if not items:
+                    # Fallback to links
+                    items = soup.select('div.bsx a[href*="/manga/"]')
+                
+                if not items:
+                    logger.info(f"No more series found on page {page}")
+                    break
+                
+                found_count = 0
+                for item in items:
+                    try:
+                        # Get the main link
+                        link = item.select_one('a[href*="/manga/"]') if item.name != 'a' else item
+                        if not link:
+                            continue
+                        
+                        href = link.get('href', '')
+                        if not href or '/manga/' not in href:
+                            continue
+                        
+                        # Get title from title attribute or div.tt
+                        title = link.get('title', '')
+                        if not title:
+                            title_elem = item.select_one('div.tt, .title')
+                            if title_elem:
+                                title = title_elem.get_text(strip=True)
+                        
+                        if not title or len(title) < 2:
+                            continue
+                        
+                        full_url = href if href.startswith('http') else self.BASE_URL + href
+                        
+                        # Get type/genre
+                        genres = []
+                        type_elem = item.select_one('span.type')
+                        if type_elem:
+                            genres.append(type_elem.get_text(strip=True))
+                        
+                        # Get rating
+                        rating = 0.0
+                        rating_elem = item.select_one('div.rating')
+                        if rating_elem:
+                            rating_text = rating_elem.get_text(strip=True)
+                            match = re.search(r'(\d+\.?\d*)', rating_text)
+                            if match:
+                                rating = float(match.group(1))
+                                if rating > 5:
+                                    rating = rating / 2
+                        
+                        # Avoid duplicates
+                        if not any(s.url == full_url for s in all_series):
+                            series = Series(
+                                title=title,
+                                url=full_url,
+                                source=self.SITE_NAME,
+                                genres=genres,
+                                rating=round(rating, 2)
+                            )
+                            all_series.append(series)
+                            found_count += 1
+                            logger.debug(f"Found: {title}")
+                            
+                            # Check limit
+                            if self.limit and len(all_series) >= self.limit:
+                                logger.info(f"Reached limit of {self.limit} series")
+                                break
+                    except Exception as e:
+                        logger.debug(f"Error parsing item: {e}")
+                        continue
+                
+                # Check limit after page
+                if self.limit and len(all_series) >= self.limit:
+                    break
+                
+                logger.info(f"Found {found_count} series on page {page}")
+                
+                if found_count == 0:
+                    break
+                    
+                page += 1
+                if page > 200:
+                    logger.warning("Reached page limit (200)")
+                    break
+                
+                time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Error on page {page}: {e}")
+                break
+        
+        logger.info(f"Total series found: {len(all_series)}")
+        return all_series
+    
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        soup = self._get_soup(series.url, use_selenium=True)
+        
+        chapters = []
+        for link in soup.select('#chapterlist li a, .eplister li a, a[href*="chapter"]'):
+            href = link.get('href', '')
+            if not href:
+                continue
+            
+            num_elem = link.select_one('.chapternum, .epl-num, .epxs')
+            text = num_elem.get_text(strip=True) if num_elem else link.get_text(strip=True)
+            
+            match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+            if not match:
+                match = re.search(r'(\d+(?:\.\d+)?)', text)
+            num = match.group(1) if match else text
+            
+            full_url = href if href.startswith('http') else self.BASE_URL + href
+            
+            # Avoid duplicates
+            if not any(c.url == full_url for c in chapters):
+                chapters.append(Chapter(
+                    number=num,
+                    title=text or f"Chapter {num}",
+                    url=full_url
+                ))
+        
+        chapters.reverse()
+        return chapters
+    
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        soup = self._get_soup(chapter.url, use_selenium=True)
+        
+        pages = []
+        for img in soup.select('#readerarea img, .chapter-content img, img.ts-main-image'):
+            src = img.get('data-src') or img.get('src', '')
+            src = src.strip()
+            if src and 'logo' not in src.lower() and 'icon' not in src.lower():
+                if src not in pages:
+                    pages.append(src)
+        
+        return pages
+
+
+# Site registry
+SCRAPERS = {
+    'asura': AsuraFullScraper,
+    'asuracomic': AsuraFullScraper,
+    'asuracomic.net': AsuraFullScraper,
+    'flame': FlameFullScraper,
+    'flamecomics': FlameFullScraper,
+    'flamecomics.xyz': FlameFullScraper,
+    'drake': DrakeFullScraper,
+    'drakecomic': DrakeFullScraper,
+    'drakecomic.org': DrakeFullScraper,
+    'manhuato': ManhuaToScraper,
+    'manhuato.com': ManhuaToScraper,
+    'webtoon': WebtoonScraper,
+    'webtoons': WebtoonScraper,
+    'webtoons.com': WebtoonScraper,
+}
+
+# Primary sites (canonical names only, no aliases) - used for --site all
+# Note: Drake is excluded due to captcha protection
+PRIMARY_SITES = {
+    'asura': AsuraFullScraper,
+    'flame': FlameFullScraper,
+    'manhuato': ManhuaToScraper,
+    'webtoon': WebtoonScraper,
+}
+
+
+def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None) -> BaseSiteScraper:
+    """Get scraper instance by site name"""
+    site_lower = site.lower()
+    
+    for key, scraper_class in SCRAPERS.items():
+        if key in site_lower:
+            # Special handling for Webtoon canvas option
+            if scraper_class == WebtoonScraper:
+                return scraper_class(headless=headless, canvas=canvas, limit=limit)
+            return scraper_class(headless=headless, limit=limit)
+    
+    raise ValueError(f"Unknown site: {site}. Available: {list(SCRAPERS.keys())}")
+
+
+def get_all_scrapers(headless: bool = True, limit: int = None) -> Dict[str, BaseSiteScraper]:
+    """Get all primary scrapers for --site all mode"""
+    scrapers = {}
+    for name, scraper_class in PRIMARY_SITES.items():
+        scrapers[name] = scraper_class(headless=headless, limit=limit)
+    return scrapers
+
+
+def export_series_list(series_list: List[Series], output_file: Path):
+    """Export series list to YAML file"""
+    
+    # Deduplicate by URL first
+    seen_urls = set()
+    unique_series = []
+    for s in series_list:
+        # Normalize URL for comparison
+        normalized_url = s.url.rstrip('/').split('?')[0]
+        if normalized_url not in seen_urls:
+            seen_urls.add(normalized_url)
+            unique_series.append(s)
+    
+    if len(unique_series) < len(series_list):
+        logger.info(f"Removed {len(series_list) - len(unique_series)} duplicate entries")
+    
+    series_list = unique_series
+    
+    # Calculate stats
+    total_chapters = sum(s.chapters_count for s in series_list)
+    series_with_counts = [s for s in series_list if s.chapters_count > 0]
+    series_with_ratings = [s for s in series_list if s.rating > 0]
+    avg_rating = sum(s.rating for s in series_with_ratings) / len(series_with_ratings) if series_with_ratings else 0
+    
+    # Status breakdown
+    status_counts = {}
+    for s in series_list:
+        status = s.status or 'Unknown'
+        status_counts[status] = status_counts.get(status, 0) + 1
+    
+    data = {
+        'generated': datetime.now().isoformat(),
+        'total_series': len(series_list),
+        'total_chapters': total_chapters,
+        'series_with_chapter_info': len(series_with_counts),
+        'series_with_ratings': len(series_with_ratings),
+        'average_rating': round(avg_rating, 2),
+        'status_breakdown': status_counts,
+        'series': []
+    }
+    
+    # Sort by rating first, then chapter count
+    sorted_series = sorted(series_list, key=lambda s: (s.rating, s.chapters_count), reverse=True)
+    
+    for s in sorted_series:
+        entry = {
+            'title': s.title,
+            'url': s.url,
+            'source': s.source,
+            'status': s.status or 'Unknown',
+            'rating': s.rating,
+            'chapters': s.chapters_count,
+            'genres': s.genres,
+            'author': s.author,
+            'artist': s.artist,
+            'description': s.description[:500] if s.description else '',  # Truncate for readability
+            'enabled': True  # User can set to False to skip
+        }
+        data['series'].append(entry)
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    
+    logger.info(f"Exported {len(series_list)} series ({total_chapters} total chapters, {len(series_with_ratings)} with ratings) to {output_file}")
+
+
+def load_series_list(config_file: Path) -> List[Series]:
+    """Load series list from YAML file"""
+    with open(config_file, 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+    
+    series_list = []
+    for item in data.get('series', []):
+        if item.get('enabled', True):
+            series_list.append(Series(
+                title=item['title'],
+                url=item['url'],
+                source=item.get('source', 'unknown'),
+                genres=item.get('genres', []),
+                status=item.get('status', ''),
+                chapters_count=item.get('chapters', 0),
+                rating=item.get('rating', 0.0),
+                description=item.get('description', ''),
+                author=item.get('author', ''),
+                artist=item.get('artist', '')
+            ))
+    
+    return series_list
+
+
+def filter_series(series_list: List[Series], filter_terms: List[str]) -> List[Series]:
+    """Filter series by genre, title, or status keywords (OR logic - matches ANY term)"""
+    if not filter_terms:
+        return series_list
+    
+    filtered = []
+    for s in series_list:
+        # Check title, genres, and status
+        searchable = s.title.lower() + ' ' + ' '.join(s.genres).lower() + ' ' + (s.status or '').lower()
+        if any(term.lower() in searchable for term in filter_terms):
+            filtered.append(s)
+    
+    return filtered
+
+
+def filter_series_all(series_list: List[Series], filter_terms: List[str]) -> List[Series]:
+    """Filter series by genre, title, or status keywords (AND logic - must match ALL terms)"""
+    if not filter_terms:
+        return series_list
+    
+    filtered = []
+    for s in series_list:
+        # Check title, genres, and status
+        searchable = s.title.lower() + ' ' + ' '.join(s.genres).lower() + ' ' + (s.status or '').lower()
+        if all(term.lower() in searchable for term in filter_terms):
+            filtered.append(s)
+    
+    return filtered
+
+
+def apply_keyword_filters(series_list: List[Series], filter_or: str, filter_and: str, status_filter: str = None) -> List[Series]:
+    """Apply OR, AND, and status filters"""
+    result = series_list
+    
+    # Apply OR filter (--filter)
+    if filter_or:
+        filter_terms = [t.strip() for t in filter_or.split(',')]
+        result = filter_series(result, filter_terms)
+    
+    # Apply AND filter (--filter-all)
+    if filter_and:
+        filter_terms = [t.strip() for t in filter_and.split(',')]
+        result = filter_series_all(result, filter_terms)
+    
+    # Apply status filter (--status)
+    if status_filter:
+        statuses = [s.strip() for s in status_filter.split(',')]
+        result = filter_by_status(result, statuses)
+    
+    return result
+
+
+def filter_by_chapter_count(series_list: List[Series], min_chapters: int = 0, max_chapters: int = None) -> List[Series]:
+    """Filter series by chapter count"""
+    filtered = []
+    for s in series_list:
+        if s.chapters_count >= min_chapters:
+            if max_chapters is None or s.chapters_count <= max_chapters:
+                filtered.append(s)
+    return filtered
+
+
+def filter_by_status(series_list: List[Series], statuses: List[str]) -> List[Series]:
+    """Filter series by status (Ongoing, Completed, Hiatus, etc.)"""
+    if not statuses:
+        return series_list
+    
+    # Normalize status names for comparison
+    normalized_statuses = [s.lower().strip() for s in statuses]
+    
+    filtered = []
+    for s in series_list:
+        series_status = (s.status or '').lower().strip()
+        if series_status in normalized_statuses:
+            filtered.append(s)
+        # Also check partial matches (e.g., "complete" matches "completed")
+        elif any(ns in series_status or series_status in ns for ns in normalized_statuses if series_status):
+            filtered.append(s)
+    
+    return filtered
+
+
+def filter_by_rating(series_list: List[Series], min_rating: float) -> List[Series]:
+    """Filter series by minimum rating"""
+    if min_rating <= 0:
+        return series_list
+    
+    filtered = []
+    for s in series_list:
+        if s.rating >= min_rating:
+            filtered.append(s)
+    
+    return filtered
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Scrape entire manhwa sites or specific series',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # List all series from Asura Scans
+  python manhwa_scraper.py --site asura --list-all -o asura_series.yaml
+  
+  # List all series WITH chapter counts (slower but more info)
+  python manhwa_scraper.py --site asura --list-all --with-chapters -o asura_series.yaml
+  
+  # List only series with 50+ chapters
+  python manhwa_scraper.py --site asura --list-all --min-chapters 50 -o popular_series.yaml
+  
+  # List series with 20-100 chapters (avoid very short or very long)
+  python manhwa_scraper.py --site asura --list-all --min-chapters 20 --max-chapters 100 -o mid_series.yaml
+  
+  # Download ALL series (warning: lots of data!)
+  python manhwa_scraper.py --site asura --download-all -o ./library/Manhwa
+  
+  # Download only series with 100+ chapters (established series)
+  python manhwa_scraper.py --site asura --download-all --min-chapters 100 -o ./library/Manhwa
+  
+  # Download only cultivation/martial arts manhwa (OR - matches either)
+  python manhwa_scraper.py --site asura --download-all --filter "cultivation,martial" -o ./library
+  
+  # Series that are BOTH action AND fantasy (AND logic)
+  python manhwa_scraper.py --site asura --list-all --filter-all "action,fantasy" -o action_fantasy.yaml
+  
+  # Combine OR and AND: must be fantasy, can be action or adventure
+  python manhwa_scraper.py --site asura --list-all --filter "action,adventure" --filter-all "fantasy" -o filtered.yaml
+  
+  # Combine filters: action manhwa with 50+ chapters
+  python manhwa_scraper.py --site asura --download-all --filter "action" --min-chapters 50 -o ./library
+  
+  # ============================================
+  # STATUS FILTERING
+  # ============================================
+  
+  # List only completed series
+  python manhwa_scraper.py --site asura --list-all --status completed -o completed.yaml
+  
+  # List only ongoing series
+  python manhwa_scraper.py --site asura --list-all --status ongoing -o ongoing.yaml
+  
+  # Completed fantasy series with 50+ chapters
+  python manhwa_scraper.py --site asura --list-all --filter-all "fantasy" --status completed --min-chapters 50 -o done_fantasy.yaml
+  
+  # Download completed action series
+  python manhwa_scraper.py --site asura --download-all --filter "action" --status completed -o ./library
+  
+  # Multiple statuses: completed or hiatus
+  python manhwa_scraper.py --site asura --list-all --status "completed,hiatus" -o finished.yaml
+  
+  # ============================================
+  # RATING FILTERING
+  # ============================================
+  
+  # List only highly-rated series (4.0+ out of 5)
+  python manhwa_scraper.py --site asura --list-all --min-rating 4.0 -o highly_rated.yaml
+  
+  # Completed series with 4.5+ rating and 100+ chapters (quality binge!)
+  python manhwa_scraper.py --site asura --list-all --status completed --min-rating 4.5 --min-chapters 100 -o best_completed.yaml
+  
+  # Download only top-rated fantasy series
+  python manhwa_scraper.py --site asura --download-all --filter "fantasy" --min-rating 4.0 -o ./library
+  
+  # ============================================
+  # SCRAPE ALL SITES AT ONCE
+  # ============================================
+  
+  # List series from ALL sites (asura, flame, drake, manhuato, webtoon)
+  python manhwa_scraper.py --site all --list-all -o all_series.yaml
+  
+  # List series with 50+ chapters from ALL sites
+  python manhwa_scraper.py --site all --list-all --min-chapters 50 -o popular_all.yaml
+  
+  # Download from ALL sites (auto-adds [Source] prefix to folders)
+  python manhwa_scraper.py --site all --download-all -o ./library
+  
+  # Download action series with 100+ chapters from ALL sites
+  python manhwa_scraper.py --site all --download-all --filter "action" --min-chapters 100 -o ./library
+  
+  # ============================================
+  
+  # List all Webtoon ORIGINALS
+  python manhwa_scraper.py --site webtoon --list-all -o webtoon_originals.yaml
+  
+  # List Webtoon CANVAS (user-created) series
+  python manhwa_scraper.py --site webtoon --canvas --list-all -o webtoon_canvas.yaml
+  
+  # Download Webtoon fantasy series
+  python manhwa_scraper.py --site webtoon --download-all --filter "fantasy,action" -o ./library
+  
+  # Download from ManhuaTo
+  python manhwa_scraper.py --site manhuato --list-all -o manhuato_series.yaml
+  python manhwa_scraper.py --site manhuato --download-all --filter "romance" -o ./library
+  
+  # Compare same series from multiple sources (uses [Source] prefix)
+  python manhwa_scraper.py --site asura --download-all --filter "solo leveling" --source-prefix -o ./library
+  python manhwa_scraper.py --site webtoon --download-all --filter "solo leveling" --source-prefix -o ./library
+  
+  # Download from a curated YAML list
+  python manhwa_scraper.py --config my_series.yaml -o ./library/Manhwa
+        """
+    )
+    
+    parser.add_argument('--site', '-s', help='Site to scrape (asura, flame, drake, manhuato, webtoon, or "all" for all sites)')
+    parser.add_argument('--list-all', action='store_true', help='List all series and export to YAML')
+    parser.add_argument('--download-all', action='store_true', help='Download all series from site')
+    parser.add_argument('--download-url', help='Download a specific series by URL')
+    parser.add_argument('--chapters', help='Chapter range to download (e.g., "1", "1-10", "latest", default: all)')
+    parser.add_argument('--config', '-c', help='YAML config file with series list')
+    parser.add_argument('--output', '-o', required=True, help='Output directory or YAML file')
+    parser.add_argument('--filter', '-f', help='Comma-separated filter terms - OR logic (matches ANY term)')
+    parser.add_argument('--filter-all', help='Comma-separated filter terms - AND logic (must match ALL terms)')
+    parser.add_argument('--min-chapters', type=int, default=0, help='Minimum chapter count to include (default: 0)')
+    parser.add_argument('--max-chapters', type=int, help='Maximum chapter count to include')
+    parser.add_argument('--min-rating', type=float, default=0.0, help='Minimum rating to include (0.0-5.0)')
+    parser.add_argument('--status', help='Filter by status: ongoing, completed, hiatus (comma-separated)')
+    parser.add_argument('--with-chapters', action='store_true', help='Fetch chapter counts, status, and rating (slower but enables filtering)')
+    parser.add_argument('--visible', action='store_true', help='Show browser window')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--limit', type=int, help='Limit number of series to process')
+    parser.add_argument('--canvas', action='store_true', help='For Webtoon: scrape CANVAS instead of ORIGINALS')
+    parser.add_argument('--source-prefix', action='store_true', help='Prefix series folders with [Source] for multi-source comparison')
+    
+    args = parser.parse_args()
+    
+    # Set logging level
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+    
+    headless = not args.visible
+    output_path = Path(args.output)
+    
+    # Mode 0: Download a specific series by URL
+    if args.download_url:
+        if not args.site:
+            # Try to auto-detect site from URL
+            url_lower = args.download_url.lower()
+            if 'asura' in url_lower:
+                args.site = 'asura'
+            elif 'flame' in url_lower:
+                args.site = 'flame'
+            elif 'manhuato' in url_lower:
+                args.site = 'manhuato'
+            elif 'webtoon' in url_lower:
+                args.site = 'webtoon'
+            elif 'drake' in url_lower:
+                args.site = 'drake'
+            else:
+                logger.error("Could not auto-detect site from URL. Please specify with --site")
+                return
+        
+        scraper = get_scraper(args.site, headless)
+        
+        # Create series object from URL
+        series = Series(
+            title="Unknown",  # Will be updated from page
+            url=args.download_url,
+            source=args.site
+        )
+        
+        # Get series details
+        logger.info(f"Fetching details for: {args.download_url}")
+        try:
+            series = scraper.get_series_details(series)
+            logger.info(f"Series: {series.title}")
+        except Exception as e:
+            logger.warning(f"Could not fetch details: {e}")
+            # Extract title from URL as fallback
+            import urllib.parse
+            path = urllib.parse.urlparse(args.download_url).path
+            series.title = path.split('/')[-1].replace('-', ' ').title()
+        
+        # Get chapters
+        logger.info("Fetching chapter list...")
+        chapters = scraper.get_chapters(series)
+        logger.info(f"Found {len(chapters)} chapters")
+        
+        if not chapters:
+            logger.error("No chapters found!")
+            return
+        
+        # Parse chapter range
+        chapters_to_download = chapters
+        if args.chapters:
+            chapter_spec = args.chapters.lower().strip()
+            if chapter_spec == 'latest':
+                chapters_to_download = [chapters[-1]]
+            elif chapter_spec == 'first' or chapter_spec == '1':
+                chapters_to_download = [chapters[0]]
+            elif '-' in chapter_spec:
+                start, end = chapter_spec.split('-')
+                start_idx = int(start) - 1
+                end_idx = int(end)
+                chapters_to_download = chapters[start_idx:end_idx]
+            else:
+                try:
+                    idx = int(chapter_spec) - 1
+                    if 0 <= idx < len(chapters):
+                        chapters_to_download = [chapters[idx]]
+                except ValueError:
+                    pass
+        
+        logger.info(f"Downloading {len(chapters_to_download)} chapter(s)...")
+        
+        # Create output directory
+        output_path.mkdir(parents=True, exist_ok=True)
+        cache_file = output_path / '.download_progress.pkl'
+        tracker = ProgressTracker(cache_file)
+        
+        # Download chapters
+        for i, chapter in enumerate(chapters_to_download, 1):
+            logger.info(f"[{i}/{len(chapters_to_download)}] Downloading Chapter {chapter.number}")
+            try:
+                scraper.download_chapter(chapter, series.title, output_path, tracker, series)
+            except Exception as e:
+                logger.error(f"Error downloading chapter {chapter.number}: {e}")
+        
+        scraper._close_driver()
+        logger.info(f"Done! Downloaded to: {output_path}")
+        return
+    
+    # Mode 1: List all series from a site (or all sites)
+    if args.list_all and args.site:
+        all_series = []
+        
+        # Check if running on all sites
+        if args.site.lower() == 'all':
+            logger.info("Listing series from ALL sites...")
+            scrapers = get_all_scrapers(headless, limit=args.limit)
+            
+            for site_name, scraper in scrapers.items():
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Scraping: {site_name.upper()}")
+                logger.info(f"{'='*50}")
+                
+                try:
+                    series_list = scraper.get_all_series()
+                    
+                    # Always add source prefix in "all" mode for clarity
+                    for s in series_list:
+                        s.source = site_name
+                    
+                    # Apply keyword filters (title/genre based - can be done before enrichment)
+                    if args.filter or args.filter_all:
+                        series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+                    
+                    # Fetch chapter counts and status if needed
+                    needs_enrichment = args.with_chapters or args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
+                    if needs_enrichment:
+                        logger.info(f"Fetching details for {len(series_list)} series...")
+                        series_list = scraper.enrich_with_chapter_counts(series_list)
+                        
+                        if args.min_chapters > 0 or args.max_chapters:
+                            series_list = filter_by_chapter_count(series_list, args.min_chapters, args.max_chapters)
+                        
+                        # Apply status filter after enrichment
+                        if args.status:
+                            statuses = [s.strip() for s in args.status.split(',')]
+                            before_count = len(series_list)
+                            series_list = filter_by_status(series_list, statuses)
+                            logger.info(f"Filtered from {before_count} to {len(series_list)} by status")
+                        
+                        # Apply rating filter after enrichment
+                        if args.min_rating > 0:
+                            before_count = len(series_list)
+                            series_list = filter_by_rating(series_list, args.min_rating)
+                            logger.info(f"Filtered from {before_count} to {len(series_list)} by rating (min: {args.min_rating})")
+                    
+                    logger.info(f"Found {len(series_list)} series from {site_name}")
+                    all_series.extend(series_list)
+                    
+                except Exception as e:
+                    logger.error(f"Error scraping {site_name}: {e}")
+                finally:
+                    scraper._close_driver()
+            
+            logger.info(f"\nTotal: {len(all_series)} series from all sites")
+            export_series_list(all_series, output_path)
+            return
+        
+        # Single site mode
+        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit)
+        series_list = scraper.get_all_series()
+        
+        # Apply keyword filters (title/genre based - can be done before enrichment)
+        if args.filter or args.filter_all:
+            before_count = len(series_list)
+            series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+            logger.info(f"Filtered from {before_count} to {len(series_list)} series by keywords")
+        
+        # Fetch chapter counts and status if needed
+        needs_enrichment = args.with_chapters or args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
+        if needs_enrichment:
+            logger.info(f"Fetching details for {len(series_list)} series (this may take a while)...")
+            series_list = scraper.enrich_with_chapter_counts(series_list)
+            
+            # Apply chapter count filter
+            if args.min_chapters > 0 or args.max_chapters:
+                before_count = len(series_list)
+                series_list = filter_by_chapter_count(series_list, args.min_chapters, args.max_chapters)
+                logger.info(f"Filtered from {before_count} to {len(series_list)} series by chapter count")
+            
+            # Apply status filter
+            if args.status:
+                statuses = [s.strip() for s in args.status.split(',')]
+                before_count = len(series_list)
+                series_list = filter_by_status(series_list, statuses)
+                logger.info(f"Filtered from {before_count} to {len(series_list)} series by status")
+            
+            # Apply rating filter
+            if args.min_rating > 0:
+                before_count = len(series_list)
+                series_list = filter_by_rating(series_list, args.min_rating)
+                logger.info(f"Filtered from {before_count} to {len(series_list)} series by rating (min: {args.min_rating})")
+        
+        export_series_list(series_list, output_path)
+        scraper._close_driver()
+        return
+    
+    # Mode 2: Download all series from a site (or all sites)
+    if args.download_all and args.site:
+        output_path.mkdir(parents=True, exist_ok=True)
+        cache_file = output_path / '.download_progress.pkl'
+        tracker = ProgressTracker(cache_file)
+        
+        # Check if running on all sites
+        if args.site.lower() == 'all':
+            logger.info("Downloading from ALL sites (with source prefix)...")
+            scrapers = get_all_scrapers(headless, limit=args.limit)
+            
+            total_series = 0
+            for site_name, scraper in scrapers.items():
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Processing: {site_name.upper()}")
+                logger.info(f"{'='*50}")
+                
+                try:
+                    series_list = scraper.get_all_series()
+                    
+                    # Set source for all series
+                    for s in series_list:
+                        s.source = site_name
+                    
+                    # Apply keyword filters (title/genre based)
+                    if args.filter or args.filter_all:
+                        series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+                        logger.info(f"Filtered to {len(series_list)} series by keywords")
+                    
+                    # Fetch details if needed for filtering
+                    needs_enrichment = args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
+                    if needs_enrichment:
+                        logger.info(f"Fetching details for {len(series_list)} series...")
+                        series_list = scraper.enrich_with_chapter_counts(series_list)
+                        
+                        if args.min_chapters > 0 or args.max_chapters:
+                            before_count = len(series_list)
+                            series_list = filter_by_chapter_count(series_list, args.min_chapters, args.max_chapters)
+                            logger.info(f"Filtered from {before_count} to {len(series_list)} by chapter count")
+                        
+                        if args.status:
+                            statuses = [s.strip() for s in args.status.split(',')]
+                            before_count = len(series_list)
+                            series_list = filter_by_status(series_list, statuses)
+                            logger.info(f"Filtered from {before_count} to {len(series_list)} by status")
+                        
+                        if args.min_rating > 0:
+                            before_count = len(series_list)
+                            series_list = filter_by_rating(series_list, args.min_rating)
+                            logger.info(f"Filtered from {before_count} to {len(series_list)} by rating (min: {args.min_rating})")
+                    
+                    if args.limit:
+                        series_list = series_list[:args.limit]
+                    
+                    logger.info(f"Will download {len(series_list)} series from {site_name}")
+                    total_series += len(series_list)
+                    
+                    for i, series in enumerate(series_list, 1):
+                        logger.info(f"[{i}/{len(series_list)}] Processing: {series.title}")
+                        
+                        try:
+                            # Fetch full details for metadata if not already done
+                            if series.rating == 0.0 and not series.description:
+                                series = scraper.get_series_details(series)
+                            
+                            chapters = scraper.get_chapters(series)
+                            logger.info(f"  Found {len(chapters)} chapters")
+                            
+                            # Always use source prefix in "all" mode
+                            display_title = f"[{site_name.title()}] {series.title}"
+                            
+                            # Create a copy of series with prefixed title for metadata
+                            series_for_meta = copy.copy(series)
+                            series_for_meta.title = display_title
+                            
+                            for chapter in chapters:
+                                scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta)
+                                
+                        except Exception as e:
+                            logger.error(f"  Error processing {series.title}: {e}")
+                            continue
+                    
+                except Exception as e:
+                    logger.error(f"Error with {site_name}: {e}")
+                finally:
+                    scraper._close_driver()
+            
+            logger.info(f"\nDownload complete! Processed {total_series} series from all sites.")
+            return
+        
+        # Single site mode
+        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit)
+        series_list = scraper.get_all_series()
+        
+        # Apply keyword filters (title/genre based)
+        if args.filter or args.filter_all:
+            series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+            logger.info(f"Filtered to {len(series_list)} series by keywords")
+        
+        # Fetch details if needed for filtering
+        needs_enrichment = args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
+        if needs_enrichment:
+            logger.info(f"Fetching details for {len(series_list)} series to apply filters...")
+            series_list = scraper.enrich_with_chapter_counts(series_list)
+            
+            if args.min_chapters > 0 or args.max_chapters:
+                before_count = len(series_list)
+                series_list = filter_by_chapter_count(series_list, args.min_chapters, args.max_chapters)
+                logger.info(f"Filtered from {before_count} to {len(series_list)} by chapter count (min: {args.min_chapters}, max: {args.max_chapters or 'unlimited'})")
+            
+            if args.status:
+                statuses = [s.strip() for s in args.status.split(',')]
+                before_count = len(series_list)
+                series_list = filter_by_status(series_list, statuses)
+                logger.info(f"Filtered from {before_count} to {len(series_list)} by status")
+            
+            if args.min_rating > 0:
+                before_count = len(series_list)
+                series_list = filter_by_rating(series_list, args.min_rating)
+                logger.info(f"Filtered from {before_count} to {len(series_list)} by rating (min: {args.min_rating})")
+        
+        if args.limit:
+            series_list = series_list[:args.limit]
+        
+        logger.info(f"Will download {len(series_list)} series")
+        
+        # Download each series
+        for i, series in enumerate(series_list, 1):
+            logger.info(f"[{i}/{len(series_list)}] Processing: {series.title}")
+            
+            try:
+                # Fetch full details for metadata if not already done
+                if series.rating == 0.0 and not series.description:
+                    series = scraper.get_series_details(series)
+                
+                chapters = scraper.get_chapters(series)
+                logger.info(f"  Found {len(chapters)} chapters")
+                
+                # Apply source prefix if requested
+                display_title = series.title
+                series_for_meta = series
+                if args.source_prefix:
+                    source_name = series.source.title() if series.source else scraper.SITE_NAME.title()
+                    display_title = f"[{source_name}] {series.title}"
+                    # Create copy with prefixed title for metadata
+                    series_for_meta = copy.copy(series)
+                    series_for_meta.title = display_title
+                
+                for chapter in chapters:
+                    scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta)
+                    
+            except Exception as e:
+                logger.error(f"  Error processing {series.title}: {e}")
+                continue
+        
+        scraper._close_driver()
+        logger.info("Download complete!")
+        return
+    
+    # Mode 3: Download from config file
+    if args.config:
+        series_list = load_series_list(Path(args.config))
+        
+        if args.limit:
+            series_list = series_list[:args.limit]
+        
+        logger.info(f"Loaded {len(series_list)} series from config")
+        
+        output_path.mkdir(parents=True, exist_ok=True)
+        cache_file = output_path / '.download_progress.pkl'
+        tracker = ProgressTracker(cache_file)
+        
+        # Group by source
+        by_source = {}
+        for s in series_list:
+            by_source.setdefault(s.source, []).append(s)
+        
+        for source, series in by_source.items():
+            scraper = get_scraper(source, headless)
+            
+            for i, s in enumerate(series, 1):
+                logger.info(f"[{i}/{len(series)}] Processing: {s.title}")
+                
+                try:
+                    # Fetch full details for metadata if not already in config
+                    if s.rating == 0.0 and not s.description:
+                        s = scraper.get_series_details(s)
+                    
+                    chapters = scraper.get_chapters(s)
+                    for chapter in chapters:
+                        scraper.download_chapter(chapter, s.title, output_path, tracker, s)
+                except Exception as e:
+                    logger.error(f"Error: {e}")
+            
+            scraper._close_driver()
+        
+        logger.info("Download complete!")
+        return
+    
+    parser.print_help()
+
+
+if __name__ == '__main__':
+    main()
