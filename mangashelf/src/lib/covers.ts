@@ -1,4 +1,4 @@
-import { readFile, writeFile, access, mkdir } from "fs/promises";
+import { readFile, writeFile, access, mkdir, stat } from "fs/promises";
 import { join, dirname } from "path";
 import JSZip from "jszip";
 
@@ -12,6 +12,24 @@ async function ensureDir(dir: string) {
   }
 }
 
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getMtime(path: string): Promise<number> {
+  try {
+    const s = await stat(path);
+    return s.mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
 export async function extractCover(
   seriesSlug: string,
   seriesDirPath: string,
@@ -19,28 +37,30 @@ export async function extractCover(
 ): Promise<string | null> {
   const coverOutputPath = join(COVERS_DIR, `${seriesSlug}.jpg`);
 
-  // Check if already cached
-  try {
-    await access(coverOutputPath);
-    return `/covers/${seriesSlug}.jpg`;
-  } catch {
-    // Need to extract
-  }
-
   await ensureDir(COVERS_DIR);
 
-  // Strategy 1: Look for cover.jpg/cover.png in series directory
+  // Strategy 1: Look for cover.jpg/cover.png in series directory (always preferred)
   const coverExtensions = [".jpg", ".jpeg", ".png", ".webp"];
   for (const ext of coverExtensions) {
     const coverPath = join(seriesDirPath, `cover${ext}`);
     try {
       await access(coverPath);
-      const coverData = await readFile(coverPath);
-      await writeFile(coverOutputPath, coverData);
+      // Check if series cover is newer than cached version
+      const srcMtime = await getMtime(coverPath);
+      const cacheMtime = await getMtime(coverOutputPath);
+      if (srcMtime > cacheMtime || cacheMtime === 0) {
+        const coverData = await readFile(coverPath);
+        await writeFile(coverOutputPath, coverData);
+      }
       return `/covers/${seriesSlug}.jpg`;
     } catch {
       continue;
     }
+  }
+
+  // If cached version exists and no cover.* in series dir, use it
+  if (await fileExists(coverOutputPath)) {
+    return `/covers/${seriesSlug}.jpg`;
   }
 
   // Strategy 2: Extract from first CBZ file (!000_cover.* or first image)

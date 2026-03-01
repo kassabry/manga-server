@@ -203,7 +203,7 @@ async function scanSeries(
       if (existing) {
         // Re-read title from ComicInfo.xml to pick up fixes
         const updatedInfo = await extractComicInfo(cbzPath);
-        const newTitle = updatedInfo?.Title || null;
+        const newTitle = updatedInfo?.Title != null ? String(updatedInfo.Title) : null;
         const needsUpdate =
           (existing.filePath !== cbzPath) ||
           (newTitle && newTitle !== existing.title);
@@ -228,9 +228,9 @@ async function scanSeries(
     let source: string | null = null;
     let sourceUrl: string | null = null;
     if (chapterComicInfo?.Web) {
-      sourceUrl = chapterComicInfo.Web;
+      sourceUrl = String(chapterComicInfo.Web);
       try {
-        const url = new URL(chapterComicInfo.Web);
+        const url = new URL(sourceUrl);
         const domain = url.hostname.replace(/^www\./, "");
         const domainMap: Record<string, string> = {
           "manhuato.com": "ManhuaTo",
@@ -250,7 +250,7 @@ async function scanSeries(
       data: {
         seriesId: series.id,
         number: chapterNumber,
-        title: chapterComicInfo?.Title || null,
+        title: chapterComicInfo?.Title != null ? String(chapterComicInfo.Title) : null,
         pageCount,
         filePath: cbzPath,
         fileSize: fileStat.size,

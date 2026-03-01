@@ -6,6 +6,8 @@ Visits the source site for each series (using the URL stored in ComicInfo.xml),
 extracts the cover image, and saves it to the series folder as cover.jpg.
 The ORVault scanner will then use this instead of the first page of chapter 1.
 
+Uses FlareSolverr (if available) to bypass Cloudflare protection on sites like Asura.
+
 Usage:
     python fetch_covers.py /path/to/library/Manhwa
     python fetch_covers.py /path/to/library/Manhwa --dry-run
@@ -27,6 +29,43 @@ from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Sites that need FlareSolverr due to Cloudflare / JS rendering
+CLOUDFLARE_DOMAINS = ['asuracomic', 'drakecomic', 'manhuato', 'flamecomics']
+
+
+def get_flaresolverr_url():
+    """Get FlareSolverr URL from env or default"""
+    return os.environ.get('FLARESOLVERR_URL', 'http://localhost:8191')
+
+
+def flaresolverr_available():
+    """Check if FlareSolverr is running"""
+    try:
+        resp = requests.get(get_flaresolverr_url(), timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def flaresolverr_get(url, max_timeout=60000):
+    """Fetch a page through FlareSolverr to bypass Cloudflare"""
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": max_timeout
+    }
+    resp = requests.post(
+        f"{get_flaresolverr_url()}/v1",
+        json=payload,
+        timeout=max_timeout // 1000 + 30
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        raise RuntimeError(f"FlareSolverr error: {data.get('message')}")
+    solution = data["solution"]
+    return solution["response"], solution.get("cookies", []), solution.get("userAgent", "")
 
 
 def get_source_url_from_cbz(cbz_path: Path) -> str:
@@ -143,6 +182,30 @@ def download_cover(cover_url: str, series_dir: Path, referer: str = '') -> bool:
         return False
 
 
+def needs_flaresolverr(url):
+    """Check if the URL belongs to a Cloudflare-protected site"""
+    return any(domain in url for domain in CLOUDFLARE_DOMAINS)
+
+
+def fetch_page_html(url, session, use_flaresolverr=False):
+    """Fetch page HTML, using FlareSolverr if needed for Cloudflare sites"""
+    if use_flaresolverr and needs_flaresolverr(url):
+        logger.info(f"  Using FlareSolverr for Cloudflare-protected site")
+        html, cookies, user_agent = flaresolverr_get(url)
+        # Apply cookies to session for cover image download
+        for c in cookies:
+            session.cookies.set(c["name"], c["value"],
+                                domain=c.get("domain", ""),
+                                path=c.get("path", "/"))
+        if user_agent:
+            session.headers["User-Agent"] = user_agent
+        return html
+    else:
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python fetch_covers.py /path/to/library [--dry-run] [--force]")
@@ -155,6 +218,13 @@ def main():
     if not library_path.is_dir():
         print(f"Error: {library_path} is not a directory")
         sys.exit(1)
+
+    # Check FlareSolverr availability
+    use_fs = flaresolverr_available()
+    if use_fs:
+        logger.info("FlareSolverr detected - will use for Cloudflare-protected sites")
+    else:
+        logger.warning("FlareSolverr not available - Cloudflare-protected sites may fail")
 
     session = requests.Session()
     session.headers.update({
@@ -207,9 +277,8 @@ def main():
 
         # Fetch the series page
         try:
-            resp = session.get(source_url, timeout=30)
-            resp.raise_for_status()
-            cover_url = extract_cover_url(resp.text, source_url)
+            html = fetch_page_html(source_url, session, use_flaresolverr=use_fs)
+            cover_url = extract_cover_url(html, source_url)
 
             if not cover_url:
                 logger.warning(f"  Could not find cover image on page")
@@ -222,8 +291,9 @@ def main():
             else:
                 failed += 1
 
-            # Rate limit
-            time.sleep(random.uniform(1, 3))
+            # Rate limit (longer for FlareSolverr to avoid overwhelming it)
+            delay = random.uniform(3, 6) if (use_fs and needs_flaresolverr(source_url)) else random.uniform(1, 3)
+            time.sleep(delay)
 
         except Exception as e:
             logger.error(f"  Error: {e}")
