@@ -227,6 +227,55 @@ class BaseSiteScraper:
                 return path
         return None
 
+    def _flaresolverr_url(self):
+        """Get FlareSolverr URL from env or default"""
+        return os.environ.get('FLARESOLVERR_URL', 'http://localhost:8191')
+
+    def _flaresolverr_available(self):
+        """Check if FlareSolverr is reachable"""
+        try:
+            resp = requests.get(self._flaresolverr_url(), timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _flaresolverr_get(self, url: str, max_timeout: int = 60000):
+        """Use FlareSolverr to fetch a URL, solving Cloudflare challenges.
+        Returns (html, cookies_list, user_agent) or raises on failure."""
+        payload = {
+            "cmd": "request.get",
+            "url": url,
+            "maxTimeout": max_timeout,
+        }
+        resp = requests.post(
+            f"{self._flaresolverr_url()}/v1",
+            json=payload,
+            timeout=max_timeout // 1000 + 30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("status") != "ok":
+            raise RuntimeError(f"FlareSolverr error: {data.get('message', 'unknown')}")
+
+        solution = data["solution"]
+        html = solution["response"]
+        cookies = solution.get("cookies", [])
+        user_agent = solution.get("userAgent", "")
+        return html, cookies, user_agent
+
+    def _apply_flaresolverr_cookies(self, cookies: list, user_agent: str = ""):
+        """Apply cookies from FlareSolverr to the requests session"""
+        for c in cookies:
+            self.session.cookies.set(
+                c["name"], c["value"],
+                domain=c.get("domain", ""),
+                path=c.get("path", "/"),
+            )
+        if user_agent:
+            self.session.headers["User-Agent"] = user_agent
+        logger.debug(f"Applied {len(cookies)} FlareSolverr cookies to session")
+
     def _inject_ad_blocker(self):
         """Inject JavaScript to block ads, popups, and redirects"""
         try:
@@ -2095,20 +2144,53 @@ class WebtoonScraper(BaseSiteScraper):
 
 class ManhuaToScraper(BaseSiteScraper):
     """Full site scraper for manhuato.com"""
-    
+
     BASE_URL = "https://manhuato.com"
     SITE_NAME = "manhuato"
-    
+
     # Available genres
     GENRES = [
         'action', 'adventure', 'comedy', 'drama', 'fantasy', 'historical',
         'horror', 'martial-arts', 'mature', 'mystery', 'romance', 'sci-fi',
         'shoujo', 'shounen', 'slice-of-life', 'supernatural', 'tragedy'
     ]
-    
+
     # Content types
     TYPES = ['manhwa', 'manhua', 'manga', 'comics']
-    
+
+    def __init__(self, headless: bool = True, limit: int = None):
+        super().__init__(headless=headless, limit=limit)
+        # On ARM without UC, use FlareSolverr for bot detection bypass
+        self._use_flaresolverr = False
+        if self._is_arm() and not UC_AVAILABLE:
+            if self._flaresolverr_available():
+                logger.info("ARM detected without undetected-chromedriver - using FlareSolverr for ManhuaTo")
+                self._use_flaresolverr = True
+                self._fs_cookies_applied = False
+            else:
+                logger.warning("ARM detected, no undetected-chromedriver and no FlareSolverr - ManhuaTo may not work")
+
+    def _get_soup_fs(self, url: str) -> BeautifulSoup:
+        """Fetch a page using FlareSolverr or cached session cookies"""
+        if not self._fs_cookies_applied:
+            # First request: use FlareSolverr to solve any challenges
+            html, cookies, user_agent = self._flaresolverr_get(url)
+            self._apply_flaresolverr_cookies(cookies, user_agent)
+            self._fs_cookies_applied = True
+            return BeautifulSoup(html, 'html.parser')
+        else:
+            # Subsequent requests: try session with cookies first, fall back to FlareSolverr
+            try:
+                resp = self.session.get(url, timeout=30)
+                resp.raise_for_status()
+                if len(resp.text) > 500:
+                    return BeautifulSoup(resp.text, 'html.parser')
+            except Exception:
+                pass
+            html, cookies, user_agent = self._flaresolverr_get(url)
+            self._apply_flaresolverr_cookies(cookies, user_agent)
+            return BeautifulSoup(html, 'html.parser')
+
     def get_all_series(self, content_type: str = None) -> List[Series]:
         """Get all series from ManhuaTo"""
         logger.info("Fetching all series from ManhuaTo...")
@@ -2136,22 +2218,25 @@ class ManhuaToScraper(BaseSiteScraper):
                 logger.info(f"Fetching page {page} for {ctype}...")
                 
                 try:
-                    # Initialize driver if needed
-                    self._init_driver()
-                    
-                    self.driver.get(url)
-                    time.sleep(3)  # Wait for page to load
-                    
-                    # Wait for content to appear
-                    try:
-                        WebDriverWait(self.driver, 10).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, 'div.visual, div.manga-cover, div.list_wrap'))
-                        )
-                        time.sleep(1)
-                    except:
-                        pass
-                    
-                    soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                    if self._use_flaresolverr:
+                        soup = self._get_soup_fs(url)
+                    else:
+                        # Initialize driver if needed
+                        self._init_driver()
+
+                        self.driver.get(url)
+                        time.sleep(3)  # Wait for page to load
+
+                        # Wait for content to appear
+                        try:
+                            WebDriverWait(self.driver, 10).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, 'div.visual, div.manga-cover, div.list_wrap'))
+                            )
+                            time.sleep(1)
+                        except:
+                            pass
+
+                        soup = BeautifulSoup(self.driver.page_source, 'html.parser')
                     
                     # Find series containers - they're in div.visual
                     visual_items = soup.select('div.visual')
@@ -2305,66 +2390,70 @@ class ManhuaToScraper(BaseSiteScraper):
         try:
             chapter_url = chapter.url.strip()
             logger.info(f"Loading chapter page: {chapter_url}")
-            
-            # Use selenium to load the page
-            self._init_driver()
-            
-            # Load saved cookies if available
-            try:
-                import pickle
-                with open("manhuato_cookies.pkl", 'rb') as f:
-                    cookies = pickle.load(f)
-                self.driver.get("https://manhuato.com")
-                time.sleep(1)
-                for c in cookies:
-                    try:
-                        self.driver.add_cookie(c)
-                    except:
-                        pass
-                logger.info(f"Loaded {len(cookies)} saved cookies")
-            except:
-                pass
-            
-            # Try to load the page with MANY retries (ads cause redirects)
-            max_retries = 15
-            success = False
-            for attempt in range(max_retries):
+
+            if self._use_flaresolverr:
+                # FlareSolverr mode: fetch HTML without needing a browser
+                soup = self._get_soup_fs(chapter_url)
+            else:
+                # Selenium mode: use browser with ad blocking
+                self._init_driver()
+
+                # Load saved cookies if available
                 try:
-                    self.driver.get(chapter_url)
-                    time.sleep(2)
-                    
-                    current = self.driver.current_url.lower()
-                    if 'manhuato.com' in current:
-                        logger.info(f"Successfully loaded chapter page (attempt {attempt + 1})")
-                        success = True
-                        break
-                    else:
-                        logger.warning(f"Redirected to {current[:50]}..., retrying...")
-                        time.sleep(1)
-                except Exception as e:
-                    logger.warning(f"Navigation attempt {attempt + 1} failed: {e}")
+                    import pickle
+                    with open("manhuato_cookies.pkl", 'rb') as f:
+                        cookies = pickle.load(f)
+                    self.driver.get("https://manhuato.com")
                     time.sleep(1)
-            
-            if not success:
-                logger.error("Could not load chapter page after all retries")
-                return []
-            
-            # Remove ad overlays
-            try:
-                self.driver.execute_script("""
-                    document.querySelectorAll('[onclick]').forEach(el => el.removeAttribute('onclick'));
-                    document.querySelectorAll('div, section').forEach(el => {
-                        var style = window.getComputedStyle(el);
-                        if ((style.position === 'fixed' || style.position === 'absolute') && 
-                            parseInt(style.zIndex) > 100 && !el.querySelector('img[src*="cdn"]')) {
-                            el.remove();
-                        }
-                    });
-                """)
-            except:
-                pass
-            
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                    for c in cookies:
+                        try:
+                            self.driver.add_cookie(c)
+                        except:
+                            pass
+                    logger.info(f"Loaded {len(cookies)} saved cookies")
+                except:
+                    pass
+
+                # Try to load the page with MANY retries (ads cause redirects)
+                max_retries = 15
+                success = False
+                for attempt in range(max_retries):
+                    try:
+                        self.driver.get(chapter_url)
+                        time.sleep(2)
+
+                        current = self.driver.current_url.lower()
+                        if 'manhuato.com' in current:
+                            logger.info(f"Successfully loaded chapter page (attempt {attempt + 1})")
+                            success = True
+                            break
+                        else:
+                            logger.warning(f"Redirected to {current[:50]}..., retrying...")
+                            time.sleep(1)
+                    except Exception as e:
+                        logger.warning(f"Navigation attempt {attempt + 1} failed: {e}")
+                        time.sleep(1)
+
+                if not success:
+                    logger.error("Could not load chapter page after all retries")
+                    return []
+
+                # Remove ad overlays
+                try:
+                    self.driver.execute_script("""
+                        document.querySelectorAll('[onclick]').forEach(el => el.removeAttribute('onclick'));
+                        document.querySelectorAll('div, section').forEach(el => {
+                            var style = window.getComputedStyle(el);
+                            if ((style.position === 'fixed' || style.position === 'absolute') &&
+                                parseInt(style.zIndex) > 100 && !el.querySelector('img[src*="cdn"]')) {
+                                el.remove();
+                            }
+                        });
+                    """)
+                except:
+                    pass
+
+                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             
             pages = []
             
@@ -2466,14 +2555,30 @@ class DrakeFullScraper(BaseSiteScraper):
     SITE_NAME = "drake"
 
     def __init__(self, headless: bool = True, limit: int = None):
-        # Drake is behind Cloudflare which detects headless Chrome
-        # Force non-headless mode for reliable access
-        if headless:
-            logger.info("Drake Comics requires non-headless mode (Cloudflare protection). Overriding to visible browser.")
-        super().__init__(headless=False, limit=limit)
+        super().__init__(headless=headless, limit=limit)
+        # On ARM without UC, check if FlareSolverr is available
+        self._use_flaresolverr = False
+        if self._is_arm() and not UC_AVAILABLE:
+            if self._flaresolverr_available():
+                logger.info("ARM detected without undetected-chromedriver - using FlareSolverr for Cloudflare bypass")
+                self._use_flaresolverr = True
+                self._fs_cookies_applied = False
+            else:
+                logger.warning("ARM detected, no undetected-chromedriver and no FlareSolverr - Drake may not work")
+        elif not self._is_arm():
+            # On x86, force non-headless for UC Cloudflare bypass
+            if headless:
+                logger.info("Drake Comics requires non-headless mode (Cloudflare protection). Overriding to visible browser.")
+            self.headless = False
 
     def _init_driver(self):
         """Override to use minimal options for Cloudflare bypass"""
+        # If using FlareSolverr, we don't need a browser driver at all for page fetching
+        # But we may still need one for JS-heavy chapter page rendering
+        if self._use_flaresolverr and not self.driver:
+            # Only init regular selenium if explicitly needed (e.g. get_pages)
+            return
+
         if not SELENIUM_AVAILABLE:
             raise RuntimeError("Selenium not available")
         if self.driver:
@@ -2517,23 +2622,35 @@ class DrakeFullScraper(BaseSiteScraper):
         return False
 
     def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
-        """Override to add Cloudflare wait"""
+        """Override to handle Cloudflare - uses FlareSolverr on ARM, UC/Selenium otherwise"""
         self._delay()
 
-        if use_selenium:
-            self._init_driver()
-            self.driver.get(url)
-            self._wait_for_cloudflare()
-            time.sleep(2)
-            html = self.driver.page_source
-        else:
-            # For Drake, always use selenium due to Cloudflare
-            self._init_driver()
-            self.driver.get(url)
-            self._wait_for_cloudflare()
-            time.sleep(2)
-            html = self.driver.page_source
+        if self._use_flaresolverr:
+            try:
+                logger.info(f"FlareSolverr: fetching {url}")
+                html, cookies, user_agent = self._flaresolverr_get(url)
+                self._apply_flaresolverr_cookies(cookies, user_agent)
+                self._fs_cookies_applied = True
+                return BeautifulSoup(html, 'html.parser')
+            except Exception as e:
+                logger.error(f"FlareSolverr failed: {e}")
+                # Try with session cookies if we got them from a previous request
+                if self._fs_cookies_applied:
+                    logger.info("Trying with cached FlareSolverr cookies...")
+                    try:
+                        resp = self.session.get(url, timeout=30)
+                        resp.raise_for_status()
+                        return BeautifulSoup(resp.text, 'html.parser')
+                    except Exception as e2:
+                        logger.error(f"Session fallback also failed: {e2}")
+                raise
 
+        # Non-ARM path: use Selenium with UC
+        self._init_driver()
+        self.driver.get(url)
+        self._wait_for_cloudflare()
+        time.sleep(2)
+        html = self.driver.page_source
         return BeautifulSoup(html, 'html.parser')
 
     def get_all_series(self) -> List[Series]:
@@ -2548,12 +2665,7 @@ class DrakeFullScraper(BaseSiteScraper):
             logger.info(f"Fetching page {page}...")
 
             try:
-                self._init_driver()
-                self.driver.get(url)
-                self._wait_for_cloudflare()
-                time.sleep(3)
-                
-                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+                soup = self._get_soup(url)
                 
                 # Find series containers - div.bs contains each series
                 items = soup.select('div.bs')
@@ -2683,6 +2795,9 @@ class DrakeFullScraper(BaseSiteScraper):
     
     def _sync_cookies_from_driver(self):
         """Transfer Cloudflare cookies and UA from selenium to requests session"""
+        # In FlareSolverr mode, cookies are already on the session
+        if self._use_flaresolverr:
+            return
         if self.driver:
             for cookie in self.driver.get_cookies():
                 self.session.cookies.set(cookie['name'], cookie['value'],
@@ -2696,6 +2811,7 @@ class DrakeFullScraper(BaseSiteScraper):
             logger.debug("Synced cookies and UA from browser to requests session")
 
     def get_pages(self, chapter: Chapter) -> List[str]:
+        # _get_soup handles FlareSolverr vs Selenium internally
         soup = self._get_soup(chapter.url, use_selenium=True)
 
         # Sync Cloudflare cookies so image downloads work

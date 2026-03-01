@@ -1,7 +1,9 @@
 #!/bin/bash
 # Run all scrapers sequentially
-# ManhuaTo requires undetected-chromedriver (not available on ARM/Pi)
-# To run ManhuaTo, use your Windows PC instead
+# On ARM (Raspberry Pi), Drake and ManhuaTo use FlareSolverr instead of
+# undetected-chromedriver. Make sure FlareSolverr is running:
+#   docker compose -f docker-compose-custom-sources.yml up -d flaresolverr
+# You can set FLARESOLVERR_URL if it's not at http://localhost:8191
 
 set -e
 cd "$(dirname "$0")"
@@ -18,10 +20,9 @@ echo "=== Drake Comics ==="
 xvfb-run python3 scripts/manhwa_scraper.py --site drake --list-all -o drake.yaml && \
 xvfb-run python3 scripts/manhwa_scraper.py --site drake --download-all -o ./library/Manhwa
 
-# ManhuaTo - uncomment if undetected-chromedriver is available (x86 only)
-# echo "=== ManhuaTo ==="
-# xvfb-run python3 scripts/manhwa_scraper.py --site manhuato --list-all -o manhuato.yaml && \
-# xvfb-run python3 scripts/manhwa_scraper.py --site manhuato --download-all -o ./library/Manhua
+echo "=== ManhuaTo ==="
+xvfb-run python3 scripts/manhwa_scraper.py --site manhuato --list-all -o manhuato.yaml && \
+xvfb-run python3 scripts/manhwa_scraper.py --site manhuato --download-all -o ./library/Manhua
 
 echo "=== Webtoon ==="
 xvfb-run python3 scripts/manhwa_scraper.py --site webtoon --list-all -o webtoon.yaml && \
