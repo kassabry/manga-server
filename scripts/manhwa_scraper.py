@@ -43,6 +43,7 @@ from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
 from datetime import datetime
 import pickle
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import requests
@@ -153,22 +154,36 @@ class BaseSiteScraper:
     # Rate limiting
     MIN_DELAY = 2  # Minimum seconds between requests
     MAX_DELAY = 5  # Maximum seconds between requests
-    
+
+    # Cloudflare-protected sites that benefit from FlareSolverr
+    CLOUDFLARE_SITE = False
+
     def __init__(self, headless: bool = True, limit: int = None):
         self.headless = headless
         self.driver = None
         self.limit = limit  # Stop after finding this many series
+        self._use_flaresolverr = False
+        self._fs_cookies_applied = False
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
         })
+        # Auto-detect FlareSolverr for Cloudflare sites on ARM
+        if self.CLOUDFLARE_SITE and self._is_arm() and not UC_AVAILABLE:
+            if self._flaresolverr_available():
+                logger.info(f"ARM detected - using FlareSolverr for {self.SITE_NAME}")
+                self._use_flaresolverr = True
     
     def _delay(self):
         """Random delay between requests to avoid rate limiting"""
-        delay = random.uniform(self.MIN_DELAY, self.MAX_DELAY)
-        time.sleep(delay)
+        if self._use_flaresolverr and self._fs_cookies_applied:
+            # Using cached cookies — lighter delay since we're not hitting Cloudflare
+            time.sleep(random.uniform(0.5, 1.5))
+        else:
+            delay = random.uniform(self.MIN_DELAY, self.MAX_DELAY)
+            time.sleep(delay)
     
     def _detect_chrome_version(self):
         """Detect installed Chrome version for undetected-chromedriver compatibility"""
@@ -418,23 +433,48 @@ class BaseSiteScraper:
             self.driver = None
     
     def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
-        """Get BeautifulSoup object from URL"""
+        """Get BeautifulSoup object from URL.
+
+        Uses FlareSolverr when available (much faster than Selenium on ARM),
+        falls back to Selenium, then to plain requests.
+        """
         self._delay()
-        
+
+        # FlareSolverr path: no browser needed, ~2-5s per request vs ~15-20s Selenium
+        if self._use_flaresolverr and use_selenium:
+            # Try cached session cookies first (instant)
+            if self._fs_cookies_applied:
+                try:
+                    resp = self.session.get(url, timeout=30)
+                    resp.raise_for_status()
+                    if len(resp.text) > 500:
+                        return BeautifulSoup(resp.text, 'html.parser')
+                except Exception:
+                    pass
+            # Fall back to FlareSolverr
+            try:
+                html, cookies, user_agent = self._flaresolverr_get(url)
+                self._apply_flaresolverr_cookies(cookies, user_agent)
+                self._fs_cookies_applied = True
+                return BeautifulSoup(html, 'html.parser')
+            except Exception as e:
+                logger.warning(f"FlareSolverr failed for {url}: {e}")
+                # Fall through to Selenium if available
+
         if use_selenium:
             self._init_driver()
             self.driver.get(url)
-            
+
             # Wait for page to load
             wait_time = 5
             time.sleep(wait_time)
-            
+
             # Try to wait for specific content to appear (grid of series)
             try:
                 from selenium.webdriver.support.ui import WebDriverWait
                 from selenium.webdriver.support import expected_conditions as EC
                 from selenium.webdriver.common.by import By
-                
+
                 # Wait for any links to series pages
                 WebDriverWait(self.driver, 10).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="series/"]'))
@@ -442,13 +482,13 @@ class BaseSiteScraper:
                 time.sleep(1)  # Extra time for all content to render
             except:
                 pass  # Continue even if wait fails
-            
+
             html = self.driver.page_source
         else:
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
             html = response.text
-        
+
         return BeautifulSoup(html, 'html.parser')
     
     def get_all_series(self) -> List[Series]:
@@ -1091,19 +1131,25 @@ class BaseSiteScraper:
             temp_dir = series_dir / f".temp_{safe_chapter}"
             temp_dir.mkdir(exist_ok=True)
             
-            # Download images
+            # Download images concurrently (CDN images, no rate limiting needed)
             success_count = 0
+            download_tasks = []
             for i, page_url in enumerate(pages, 1):
                 ext = self._get_extension(page_url)
                 img_path = temp_dir / f"{i:03d}{ext}"
-                
-                if self._download_image(page_url, img_path, chapter.url):
-                    success_count += 1
-                else:
-                    logger.warning(f"Failed to download page {i}")
-                
-                # Small delay between images
-                time.sleep(0.5)
+                download_tasks.append((i, page_url, img_path))
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {
+                    pool.submit(self._download_image, url, path, chapter.url): page_num
+                    for page_num, url, path in download_tasks
+                }
+                for future in as_completed(futures):
+                    page_num = futures[future]
+                    if future.result():
+                        success_count += 1
+                    else:
+                        logger.warning(f"Failed to download page {page_num}")
             
             if success_count == 0:
                 logger.error(f"No images downloaded for chapter {chapter.number}")
@@ -1198,9 +1244,10 @@ class BaseSiteScraper:
 
 class AsuraFullScraper(BaseSiteScraper):
     """Full site scraper for asuracomic.net"""
-    
+
     BASE_URL = "https://asuracomic.net"
     SITE_NAME = "asura"
+    CLOUDFLARE_SITE = True
     
     def get_series_status(self, series: Series) -> str:
         """Get status for a series from Asura Scans"""
@@ -1542,9 +1589,10 @@ class AsuraFullScraper(BaseSiteScraper):
 
 class FlameFullScraper(BaseSiteScraper):
     """Full site scraper for flamecomics.xyz"""
-    
+
     BASE_URL = "https://flamecomics.xyz"
     SITE_NAME = "flame"
+    CLOUDFLARE_SITE = True
     
     def get_all_series(self) -> List[Series]:
         """Get all series from Flame Comics"""
@@ -2173,6 +2221,7 @@ class ManhuaToScraper(BaseSiteScraper):
 
     BASE_URL = "https://manhuato.com"
     SITE_NAME = "manhuato"
+    CLOUDFLARE_SITE = True
 
     # Available genres
     GENRES = [
@@ -2183,18 +2232,6 @@ class ManhuaToScraper(BaseSiteScraper):
 
     # Content types
     TYPES = ['manhwa', 'manhua', 'manga', 'comics']
-
-    def __init__(self, headless: bool = True, limit: int = None):
-        super().__init__(headless=headless, limit=limit)
-        # On ARM without UC, use FlareSolverr for bot detection bypass
-        self._use_flaresolverr = False
-        if self._is_arm() and not UC_AVAILABLE:
-            if self._flaresolverr_available():
-                logger.info("ARM detected without undetected-chromedriver - using FlareSolverr for ManhuaTo")
-                self._use_flaresolverr = True
-                self._fs_cookies_applied = False
-            else:
-                logger.warning("ARM detected, no undetected-chromedriver and no FlareSolverr - ManhuaTo may not work")
 
     def _get_soup_fs(self, url: str) -> BeautifulSoup:
         """Fetch a page using FlareSolverr or cached session cookies"""
@@ -2579,19 +2616,11 @@ class DrakeFullScraper(BaseSiteScraper):
 
     BASE_URL = "https://drakecomic.org"
     SITE_NAME = "drake"
+    CLOUDFLARE_SITE = True
 
     def __init__(self, headless: bool = True, limit: int = None):
         super().__init__(headless=headless, limit=limit)
-        # On ARM without UC, check if FlareSolverr is available
-        self._use_flaresolverr = False
-        if self._is_arm() and not UC_AVAILABLE:
-            if self._flaresolverr_available():
-                logger.info("ARM detected without undetected-chromedriver - using FlareSolverr for Cloudflare bypass")
-                self._use_flaresolverr = True
-                self._fs_cookies_applied = False
-            else:
-                logger.warning("ARM detected, no undetected-chromedriver and no FlareSolverr - Drake may not work")
-        elif not self._is_arm():
+        if not self._is_arm() and not self._use_flaresolverr:
             # On x86, force non-headless for UC Cloudflare bypass
             if headless:
                 logger.info("Drake Comics requires non-headless mode (Cloudflare protection). Overriding to visible browser.")
@@ -2648,30 +2677,12 @@ class DrakeFullScraper(BaseSiteScraper):
         return False
 
     def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
-        """Override to handle Cloudflare - uses FlareSolverr on ARM, UC/Selenium otherwise"""
-        self._delay()
-
+        """Override to handle Cloudflare wait on non-FlareSolverr path"""
         if self._use_flaresolverr:
-            try:
-                logger.info(f"FlareSolverr: fetching {url}")
-                html, cookies, user_agent = self._flaresolverr_get(url)
-                self._apply_flaresolverr_cookies(cookies, user_agent)
-                self._fs_cookies_applied = True
-                return BeautifulSoup(html, 'html.parser')
-            except Exception as e:
-                logger.error(f"FlareSolverr failed: {e}")
-                # Try with session cookies if we got them from a previous request
-                if self._fs_cookies_applied:
-                    logger.info("Trying with cached FlareSolverr cookies...")
-                    try:
-                        resp = self.session.get(url, timeout=30)
-                        resp.raise_for_status()
-                        return BeautifulSoup(resp.text, 'html.parser')
-                    except Exception as e2:
-                        logger.error(f"Session fallback also failed: {e2}")
-                raise
+            return super()._get_soup(url, use_selenium=True)
 
-        # Non-ARM path: use Selenium with UC
+        # Non-ARM path: use Selenium with UC + Cloudflare wait
+        self._delay()
         self._init_driver()
         self.driver.get(url)
         self._wait_for_cloudflare()
