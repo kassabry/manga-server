@@ -26,36 +26,35 @@ export default function HomePage() {
   const [needsSetup, setNeedsSetup] = useState(false);
   const [columns, setColumns] = useState(6);
 
+  // Fetch setup, preferences, and series in parallel instead of sequentially
   useEffect(() => {
-    fetch("/api/setup")
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.needsSetup) {
-          setNeedsSetup(true);
-          router.replace("/setup");
-        }
-      });
-  }, [router]);
+    const fetchAll = async () => {
+      const setupPromise = fetch("/api/setup").then((r) => r.json());
+      const seriesPromise = fetch("/api/series?sort=recent&limit=30").then((r) => r.json());
+      const prefsPromise = session?.user
+        ? fetch("/api/user/preferences").then((r) => r.json()).catch(() => null)
+        : Promise.resolve(null);
 
-  // Load user preferences for columns setting
-  useEffect(() => {
-    if (!session?.user) return;
-    fetch("/api/user/preferences")
-      .then((r) => r.json())
-      .then((prefs) => {
-        if (prefs?.carouselColumns) {
-          setColumns(prefs.carouselColumns);
-        }
-      })
-      .catch(() => {});
-  }, [session]);
+      const [setupData, seriesData, prefs] = await Promise.all([
+        setupPromise,
+        seriesPromise,
+        prefsPromise,
+      ]);
 
-  useEffect(() => {
-    if (needsSetup) return;
-    fetch("/api/series?sort=recent&limit=30")
-      .then((r) => r.json())
-      .then((data) => setUpdatedSeries(data.series || []));
-  }, [needsSetup]);
+      if (setupData.needsSetup) {
+        setNeedsSetup(true);
+        router.replace("/setup");
+        return;
+      }
+
+      setUpdatedSeries(seriesData.series || []);
+      if (prefs?.carouselColumns) {
+        setColumns(prefs.carouselColumns);
+      }
+    };
+
+    fetchAll();
+  }, [router, session]);
 
   if (needsSetup || status === "loading") return null;
 

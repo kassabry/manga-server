@@ -8,12 +8,45 @@ const xmlParser = new XMLParser({
   trimValues: true,
 });
 
+// LRU cache for loaded ZIP objects — avoids re-reading CBZ from disk on every page
+const ZIP_CACHE_MAX = 10;
+const zipCache = new Map<string, { zip: JSZip; lastAccess: number }>();
+
+async function getZip(cbzPath: string): Promise<JSZip> {
+  const cached = zipCache.get(cbzPath);
+  if (cached) {
+    cached.lastAccess = Date.now();
+    return cached.zip;
+  }
+
+  const data = await readFile(cbzPath);
+  const zip = await JSZip.loadAsync(data);
+
+  // Evict oldest entry if cache is full
+  if (zipCache.size >= ZIP_CACHE_MAX) {
+    let oldestKey = "";
+    let oldestTime = Infinity;
+    for (const [key, entry] of zipCache) {
+      if (entry.lastAccess < oldestTime) {
+        oldestTime = entry.lastAccess;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey) zipCache.delete(oldestKey);
+  }
+
+  zipCache.set(cbzPath, { zip, lastAccess: Date.now() });
+  return zip;
+}
+
+// Cache page lists separately (lightweight, can keep more)
+const pageListCache = new Map<string, string[]>();
+
 export async function extractComicInfo(
   cbzPath: string
 ): Promise<ComicInfo | null> {
   try {
-    const data = await readFile(cbzPath);
-    const zip = await JSZip.loadAsync(data);
+    const zip = await getZip(cbzPath);
     const comicInfoFile = zip.file("ComicInfo.xml");
     if (!comicInfoFile) return null;
 
@@ -26,8 +59,10 @@ export async function extractComicInfo(
 }
 
 export async function getPageList(cbzPath: string): Promise<string[]> {
-  const data = await readFile(cbzPath);
-  const zip = await JSZip.loadAsync(data);
+  const cached = pageListCache.get(cbzPath);
+  if (cached) return cached;
+
+  const zip = await getZip(cbzPath);
 
   const imageExtensions = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
   const pages: string[] = [];
@@ -43,14 +78,16 @@ export async function getPageList(cbzPath: string): Promise<string[]> {
     }
   });
 
-  return pages.sort((a, b) => {
-    // Sort naturally: 001.jpg before 010.jpg, skip cover files to end or beginning
+  const sorted = pages.sort((a, b) => {
     const aIsCover = a.toLowerCase().includes("cover");
     const bIsCover = b.toLowerCase().includes("cover");
     if (aIsCover && !bIsCover) return -1;
     if (!aIsCover && bIsCover) return 1;
     return a.localeCompare(b, undefined, { numeric: true });
   });
+
+  pageListCache.set(cbzPath, sorted);
+  return sorted;
 }
 
 export async function extractPage(
@@ -58,8 +95,7 @@ export async function extractPage(
   pageName: string
 ): Promise<{ data: Buffer; mimeType: string } | null> {
   try {
-    const fileData = await readFile(cbzPath);
-    const zip = await JSZip.loadAsync(fileData);
+    const zip = await getZip(cbzPath);
     const pageFile = zip.file(pageName);
     if (!pageFile) return null;
 
@@ -82,7 +118,6 @@ export async function extractPage(
 export async function getPageCount(cbzPath: string): Promise<number> {
   try {
     const pages = await getPageList(cbzPath);
-    // Don't count cover images in page count
     return pages.filter((p) => !p.toLowerCase().includes("cover")).length;
   } catch {
     return 0;

@@ -118,10 +118,15 @@ export async function GET(request: NextRequest) {
     };
   });
 
-  return NextResponse.json({
-    series: seriesWithLatest,
-    total,
-    page,
-    totalPages: Math.ceil(total / limit),
-  });
+  return NextResponse.json(
+    {
+      series: seriesWithLatest,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+    },
+    {
+      headers: { "Cache-Control": "private, max-age=30" },
+    }
+  );
 }
