@@ -193,17 +193,30 @@ async function scanSeries(
     const cbzPath = join(seriesDirPath, cbzFile);
     const chapterNumber = parseChapterNumber(cbzFile);
 
-    // Skip if already exists with correct path
-    if (existingPaths.has(cbzPath)) continue;
-
-    // If chapter exists with old path (e.g. Windows -> Linux migration), update path
+    // Check if chapter already exists (by path or number)
+    const existingByPath = existingPaths.has(cbzPath);
     const existingChapter = existingByNumber.get(chapterNumber);
-    if (existingChapter) {
-      if (existingChapter.filePath !== cbzPath) {
-        await prisma.chapter.update({
-          where: { id: existingChapter.id },
-          data: { filePath: cbzPath },
-        });
+
+    if (existingByPath || existingChapter) {
+      const existing = existingChapter ||
+        series.chapters.find((c: { filePath: string }) => c.filePath === cbzPath);
+      if (existing) {
+        // Re-read title from ComicInfo.xml to pick up fixes
+        const updatedInfo = await extractComicInfo(cbzPath);
+        const newTitle = updatedInfo?.Title || null;
+        const needsUpdate =
+          (existing.filePath !== cbzPath) ||
+          (newTitle && newTitle !== existing.title);
+
+        if (needsUpdate) {
+          await prisma.chapter.update({
+            where: { id: existing.id },
+            data: {
+              filePath: cbzPath,
+              ...(newTitle && newTitle !== existing.title ? { title: newTitle } : {}),
+            },
+          });
+        }
       }
       continue;
     }
