@@ -1318,14 +1318,22 @@ class AsuraFullScraper(BaseSiteScraper):
                     
                     # Get title - need to find the actual title, not badges like "MANHWA"
                     title = None
-                    
-                    # Method 1: img alt attribute (most reliable)
+                    cover_url = ""
+
+                    # Method 1: img alt attribute (most reliable) + grab cover URL
                     img = item.select_one('img')
                     if img:
                         alt = img.get('alt', '').strip()
                         # Skip if alt is just a type badge
                         if alt and len(alt) > 3 and alt.upper() not in ['MANHWA', 'MANHUA', 'MANGA', 'WEBTOON']:
                             title = alt
+                        # Grab cover image URL from the listing card
+                        raw_src = img.get('src') or img.get('data-src') or ''
+                        raw_src = raw_src.strip()
+                        if raw_src and not raw_src.startswith('data:'):
+                            if raw_src.startswith('//'):
+                                raw_src = 'https:' + raw_src
+                            cover_url = raw_src
                     
                     # Method 2: Look for span with font-bold that has actual title text
                     if not title:
@@ -1389,7 +1397,8 @@ class AsuraFullScraper(BaseSiteScraper):
                         url=full_url,
                         source=self.SITE_NAME,
                         status=status,
-                        rating=round(rating, 2)
+                        rating=round(rating, 2),
+                        cover_url=cover_url
                     )
                     all_series.append(series)
                     found_count += 1
@@ -1437,7 +1446,6 @@ class AsuraFullScraper(BaseSiteScraper):
         # Look for chapter links - on Asura they're typically in a list
         for link in soup.select('a[href*="chapter"]'):
             href = link.get('href', '').strip()
-            text = link.get_text(strip=True)
 
             if not href:
                 continue
@@ -1456,16 +1464,34 @@ class AsuraFullScraper(BaseSiteScraper):
                 continue
             seen_urls.add(full_url)
 
-            # Extract chapter number
+            # Extract chapter number from URL first (most reliable)
             match = re.search(r'chapter[/\- ]?(\d+(?:\.\d+)?)', href, re.I)
-            if not match:
-                match = re.search(r'chapter[/\- ]?(\d+(?:\.\d+)?)', text, re.I)
+
+            # Extract chapter title from the first text node or span only,
+            # avoiding date/time spans that get concatenated by get_text()
+            title = None
+            title_elem = link.select_one('.chapternum, .epl-num, .epxs, span:first-child')
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+            if not title:
+                # Use direct text content of the link, excluding child elements
+                title = link.find(string=True, recursive=False)
+                if title:
+                    title = title.strip()
+
+            if not match and title:
+                match = re.search(r'chapter[/\- ]?(\d+(?:\.\d+)?)', title, re.I)
 
             if match:
                 num = match.group(1)
+                # Clean title: use extracted title or fall back to "Chapter N"
+                clean_title = title if title else f"Chapter {num}"
+                # If title still has date junk concatenated, just use "Chapter N"
+                if re.search(r'chapter\s*\d.*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', clean_title, re.I):
+                    clean_title = f"Chapter {num}"
                 chapters.append(Chapter(
                     number=num,
-                    title=text or f"Chapter {num}",
+                    title=clean_title,
                     url=full_url
                 ))
 
