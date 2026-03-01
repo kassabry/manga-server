@@ -18,9 +18,10 @@ RUN pip install --no-cache-dir \
     requests \
     beautifulsoup4 \
     selenium \
-    webdriver-manager \
     pyyaml \
-    schedule
+    schedule \
+    ebooklib \
+    lxml
 
 # Set Chrome path for Selenium
 ENV CHROME_BIN=/usr/bin/chromium

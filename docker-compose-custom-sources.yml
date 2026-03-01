@@ -97,6 +97,7 @@ services:
       - ./config:/app/config
       - ./library:/app/library
       - ./logs:/app/logs
+      - ./run_all_scrapers.sh:/app/run_all_scrapers.sh
     environment:
       - TZ=America/Chicago
       - DISPLAY=:99
