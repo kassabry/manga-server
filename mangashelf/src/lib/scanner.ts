@@ -100,12 +100,24 @@ async function scanSeries(
     include: { chapters: true },
   });
 
-  // Extract metadata from first CBZ if new series
-  const firstCbzPath = join(seriesDirPath, cbzFiles[0]);
-  const comicInfo = await extractComicInfo(firstCbzPath);
+  // Quick check: if series exists and chapter count hasn't changed, skip heavy work
+  const hasNewChapters = !series || cbzFiles.length !== series.chapters.length;
 
-  // Extract/cache cover image
-  const coverPath = await extractCover(seriesSlug, seriesDirPath, firstCbzPath);
+  // Only read ComicInfo from first CBZ when needed:
+  // - New series (need all metadata)
+  // - Series missing key metadata (backfill from updated CBZ files)
+  const needsMetadataRead = !series ||
+    !series.genres || !series.description;
+
+  const firstCbzPath = join(seriesDirPath, cbzFiles[0]);
+  const comicInfo = needsMetadataRead
+    ? await extractComicInfo(firstCbzPath)
+    : null;
+
+  // Only re-extract cover when there are new chapters or series is new
+  const coverPath = hasNewChapters
+    ? await extractCover(seriesSlug, seriesDirPath, firstCbzPath)
+    : series?.coverPath ?? null;
 
   if (!series) {
     // Create or update series (upsert by slug to handle library path changes)
@@ -155,7 +167,7 @@ async function scanSeries(
       });
       result.seriesAdded++;
     }
-  } else {
+  } else if (hasNewChapters || needsMetadataRead) {
     // Backfill lastChapterAt for series that existed before this field was added
     let backfillLastChapter = undefined;
     if (!series.lastChapterAt) {
@@ -172,15 +184,26 @@ async function scanSeries(
       data: {
         chapterCount: cbzFiles.length,
         coverPath: coverPath || series.coverPath,
-        description: comicInfo?.Summary || series.description,
-        author: comicInfo?.Writer || series.author,
-        artist: comicInfo?.Penciller || series.artist,
-        genres: comicInfo?.Genre || series.genres,
+        ...(comicInfo?.Summary && !series.description
+          ? { description: comicInfo.Summary }
+          : {}),
+        ...(comicInfo?.Writer && !series.author
+          ? { author: comicInfo.Writer }
+          : {}),
+        ...(comicInfo?.Penciller && !series.artist
+          ? { artist: comicInfo.Penciller }
+          : {}),
+        ...(comicInfo?.Genre && !series.genres
+          ? { genres: comicInfo.Genre }
+          : {}),
         ...(backfillLastChapter ? { lastChapterAt: backfillLastChapter } : {}),
       },
     });
     result.seriesUpdated++;
   }
+
+  // If no new chapters, skip the per-chapter loop entirely
+  if (!hasNewChapters) return;
 
   // Scan chapters — match by number to handle library path migrations
   const existingByNumber = new Map(
@@ -201,20 +224,11 @@ async function scanSeries(
       const existing = existingChapter ||
         series.chapters.find((c: { filePath: string }) => c.filePath === cbzPath);
       if (existing) {
-        // Re-read title from ComicInfo.xml to pick up fixes
-        const updatedInfo = await extractComicInfo(cbzPath);
-        const newTitle = updatedInfo?.Title != null ? String(updatedInfo.Title) : null;
-        const needsUpdate =
-          (existing.filePath !== cbzPath) ||
-          (newTitle && newTitle !== existing.title);
-
-        if (needsUpdate) {
+        // Only update if the file path changed (library migration)
+        if (existing.filePath !== cbzPath) {
           await prisma.chapter.update({
             where: { id: existing.id },
-            data: {
-              filePath: cbzPath,
-              ...(newTitle && newTitle !== existing.title ? { title: newTitle } : {}),
-            },
+            data: { filePath: cbzPath },
           });
         }
       }

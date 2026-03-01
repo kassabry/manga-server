@@ -1249,35 +1249,119 @@ class AsuraFullScraper(BaseSiteScraper):
     SITE_NAME = "asura"
     CLOUDFLARE_SITE = True
     
-    def get_series_status(self, series: Series) -> str:
-        """Get status for a series from Asura Scans"""
+    def get_series_details(self, series: Series) -> Series:
+        """Fetch full details from Asura's series page.
+
+        Asura uses a Next.js app with Tailwind classes. Key HTML patterns:
+        - Genres: <b>Genres:</b> followed by <a href="/series?page=1&genres=N">
+        - Synopsis: <h3>Synopsis ...</h3><span ...><p>text</p></span>
+        - Status/Type: <h3>Status</h3><h3 class="... capitalize">Ongoing</h3>
+        - Author/Artist: <h3>Author</h3><h3>Name</h3> in a grid
+        - Rating: <div class="inline-block ml-[5px] ...">9.7</div>
+        """
         try:
             soup = self._get_soup(series.url, use_selenium=True)
-            
-            # Look for status span with bg-blue or bg-green etc
-            status_elem = soup.select_one('span.status, span[class*="status"], span[class*="bg-blue"], span[class*="bg-green"]')
-            if status_elem:
-                text = status_elem.get_text(strip=True).lower()
-                if 'completed' in text or 'finished' in text:
-                    return 'Completed'
-                elif 'ongoing' in text:
-                    return 'Ongoing'
-                elif 'hiatus' in text:
-                    return 'Hiatus'
-                elif 'dropped' in text:
-                    return 'Dropped'
-            
-            # Fallback: search page text
-            page_text = soup.get_text().lower()
-            if 'completed' in page_text:
-                return 'Completed'
-            elif 'ongoing' in page_text:
-                return 'Ongoing'
-            
-            return 'Unknown'
+
+            # --- Genres ---
+            if not series.genres:
+                genre_links = soup.select('a[href*="/series?page=1&genres="]')
+                if genre_links:
+                    genres = []
+                    for link in genre_links:
+                        text = link.get_text(strip=True).strip(',').strip()
+                        if text and text.lower() != 'genres':
+                            genres.append(text)
+                    if genres:
+                        # Deduplicate (page has desktop + mobile copies)
+                        seen = set()
+                        unique = []
+                        for g in genres:
+                            if g.lower() not in seen:
+                                seen.add(g.lower())
+                                unique.append(g)
+                        series.genres = unique
+
+            # --- Synopsis ---
+            if not series.description:
+                # Look for h3 containing "Synopsis" then grab next sibling's <p>
+                for h3 in soup.select('h3'):
+                    if 'Synopsis' in h3.get_text():
+                        sibling = h3.find_next_sibling('span')
+                        if sibling:
+                            p = sibling.find('p')
+                            text = (p or sibling).get_text(strip=True)
+                            if len(text) > 20:
+                                series.description = re.sub(r'\s+', ' ', text)[:2000]
+                                break
+
+            # --- Status ---
+            if not series.status or series.status in ['', 'Unknown']:
+                for h3 in soup.select('h3'):
+                    if h3.get_text(strip=True) == 'Status':
+                        next_h3 = h3.find_next_sibling('h3')
+                        if next_h3:
+                            text = next_h3.get_text(strip=True).lower()
+                            if 'completed' in text or 'finished' in text:
+                                series.status = 'Completed'
+                            elif 'ongoing' in text:
+                                series.status = 'Ongoing'
+                            elif 'hiatus' in text:
+                                series.status = 'Hiatus'
+                            elif 'dropped' in text:
+                                series.status = 'Dropped'
+                        break
+
+            # --- Rating ---
+            if series.rating == 0.0:
+                # Rating is in an italic div like: <div class="inline-block ml-[5px] ... italic ...">9.7</div>
+                for div in soup.select('div[class*="italic"]'):
+                    text = div.get_text(strip=True)
+                    try:
+                        val = float(text)
+                        if 0 < val <= 10:
+                            series.rating = round(val / 2, 2) if val > 5 else round(val, 2)
+                            break
+                    except ValueError:
+                        continue
+
+            # --- Author ---
+            if not series.author:
+                for h3 in soup.select('h3'):
+                    if h3.get_text(strip=True) == 'Author':
+                        next_h3 = h3.find_next_sibling('h3')
+                        if next_h3:
+                            text = next_h3.get_text(strip=True)
+                            if text and text != '_':
+                                series.author = text
+                        break
+
+            # --- Artist ---
+            if not series.artist:
+                for h3 in soup.select('h3'):
+                    if h3.get_text(strip=True) == 'Artist':
+                        next_h3 = h3.find_next_sibling('h3')
+                        if next_h3:
+                            text = next_h3.get_text(strip=True)
+                            if text and text != '_':
+                                series.artist = text
+                        break
+
+            # --- Cover ---
+            if not series.cover_url:
+                series.cover_url = self._extract_cover_from_soup(soup)
+
+            # --- Chapter count ---
+            if series.chapters_count == 0:
+                try:
+                    chapters = self.get_chapters(series)
+                    series.chapters_count = len(chapters)
+                except Exception:
+                    pass
+
+            return series
         except Exception as e:
-            logger.debug(f"Error getting status: {e}")
-            return 'Unknown'
+            logger.debug(f"Error getting details for {series.title}: {e}")
+            return series
     
     def get_all_series(self) -> List[Series]:
         """Get all series from Asura Scans"""
