@@ -125,6 +125,8 @@ services:
       context: ./mangashelf
       dockerfile: Dockerfile
     container_name: orvault
+    security_opt:
+      - seccomp:unconfined
     volumes:
       - ./library:/library:ro
       - ./mangashelf/data:/app/data

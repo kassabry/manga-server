@@ -1,39 +1,44 @@
 #!/bin/bash
 # Run all scrapers sequentially
-# On ARM (Raspberry Pi), Drake and ManhuaTo use FlareSolverr instead of
+# On ARM (Raspberry Pi), Cloudflare sites use FlareSolverr instead of
 # undetected-chromedriver. Make sure FlareSolverr is running:
-#   docker compose -f docker-compose-custom-sources.yml up -d flaresolverr
+#   docker compose up -d flaresolverr
 # You can set FLARESOLVERR_URL if it's not at http://localhost:8191
 
 set -e
 cd "$(dirname "$0")"
 
+# Start Xvfb once in the background (needed for Selenium fallback)
+if command -v Xvfb &>/dev/null; then
+    Xvfb :99 -screen 0 1920x1080x24 &>/dev/null &
+    XVFB_PID=$!
+    export DISPLAY=:99
+    echo "Xvfb started on :99 (PID $XVFB_PID)"
+    trap "kill $XVFB_PID 2>/dev/null" EXIT
+else
+    echo "WARNING: Xvfb not found. Selenium-based scrapers may fail."
+    echo "Proceeding anyway (FlareSolverr will handle Cloudflare sites)."
+fi
+
 echo "=== Asura Scans ==="
-xvfb-run python3 scripts/manhwa_scraper.py --site asura --list-all -o asura.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site asura --download-all -o ./library/Manhwa
+python3 scripts/manhwa_scraper.py --site asura --download-all -o ./library/Manhwa
 
 echo "=== Flame Comics ==="
-xvfb-run python3 scripts/manhwa_scraper.py --site flame --list-all -o flame.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site flame --download-all -o ./library/Manhwa
+python3 scripts/manhwa_scraper.py --site flame --download-all -o ./library/Manhwa
 
 echo "=== Drake Comics ==="
-xvfb-run python3 scripts/manhwa_scraper.py --site drake --list-all -o drake.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site drake --download-all -o ./library/Manhwa
+python3 scripts/manhwa_scraper.py --site drake --download-all -o ./library/Manhwa
 
 echo "=== ManhuaTo ==="
-xvfb-run python3 scripts/manhwa_scraper.py --site manhuato --list-all -o manhuato.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site manhuato --download-all -o ./library/Manhua
+python3 scripts/manhwa_scraper.py --site manhuato --download-all -o ./library/Manhua
 
 echo "=== Webtoon ==="
-xvfb-run python3 scripts/manhwa_scraper.py --site webtoon --list-all -o webtoon.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site webtoon --download-all -o ./library/Manhwa
+python3 scripts/manhwa_scraper.py --site webtoon --download-all -o ./library/Manhwa
 
 echo "=== LightNovelPub ==="
-xvfb-run python3 scripts/lightnovel_scraper.py --site lightnovelpub --list-all --popular --pages 10 -o lightnovelpub_popular.yaml && \
-xvfb-run python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 -o ./library/LightNovels
+python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 -o ./library/LightNovels
 
 echo "=== NovelBin ==="
-xvfb-run python3 scripts/lightnovel_scraper.py --site novelbin --list-all --popular --pages 10 -o novelbin_popular.yaml && \
-xvfb-run python3 scripts/lightnovel_scraper.py --site novelbin --download-all --popular --pages 10 -o ./library/LightNovels
+python3 scripts/lightnovel_scraper.py --site novelbin --download-all --popular --pages 10 -o ./library/LightNovels
 
 echo "=== All scrapers complete ==="

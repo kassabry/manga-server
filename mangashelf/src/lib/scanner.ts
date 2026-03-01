@@ -36,6 +36,11 @@ export interface ScanResult {
   errors: string[];
 }
 
+export interface ScanCleanup {
+  seriesRemoved: number;
+  chaptersRemoved: number;
+}
+
 export async function scanLibrary(
   libraryPath: string
 ): Promise<ScanResult> {
@@ -47,6 +52,9 @@ export async function scanLibrary(
   };
 
   const resolvedPath = resolve(libraryPath);
+
+  // Track all valid library paths found on disk
+  const validLibraryPaths = new Set<string>();
 
   for (const [type, dirName] of Object.entries(TYPE_DIRS)) {
     const typePath = join(resolvedPath, dirName);
@@ -63,6 +71,7 @@ export async function scanLibrary(
       if (!entry.isDirectory()) continue;
 
       const seriesDirPath = join(typePath, entry.name);
+      validLibraryPaths.add(seriesDirPath);
       const seriesTitle = entry.name;
       const seriesSlug = slugify(seriesTitle);
 
@@ -76,7 +85,38 @@ export async function scanLibrary(
     }
   }
 
+  // Remove series from DB that no longer exist on disk
+  const cleanup = await cleanupDeletedSeries(validLibraryPaths);
+  if (cleanup.seriesRemoved > 0) {
+    console.log(
+      `Cleanup: removed ${cleanup.seriesRemoved} series (${cleanup.chaptersRemoved} chapters) no longer on disk`
+    );
+  }
+
   return result;
+}
+
+async function cleanupDeletedSeries(
+  validPaths: Set<string>
+): Promise<ScanCleanup> {
+  const allSeries = await prisma.series.findMany({
+    select: { id: true, title: true, libraryPath: true, _count: { select: { chapters: true } } },
+  });
+
+  let seriesRemoved = 0;
+  let chaptersRemoved = 0;
+
+  for (const series of allSeries) {
+    if (!validPaths.has(series.libraryPath)) {
+      // Series folder no longer exists — delete from DB (chapters cascade)
+      console.log(`Removing deleted series: ${series.title}`);
+      await prisma.series.delete({ where: { id: series.id } });
+      seriesRemoved++;
+      chaptersRemoved += series._count.chapters;
+    }
+  }
+
+  return { seriesRemoved, chaptersRemoved };
 }
 
 async function scanSeries(

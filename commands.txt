@@ -1,17 +1,133 @@
-tmux new -s scrape-all
+===============================================================
+  ORVault / Manga Server - Quick Command Reference
+  All commands run on the Pi at /mnt/manga-storage/manga-server
+===============================================================
 
-xvfb-run python3 scripts/manhwa_scraper.py --site asura --list-all -o asura.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site asura --download-all -i asura.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site flame --list-all -o flame.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site flame --download-all -i flame.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site drake --list-all -o drake.yaml && \
-xvfb-run python3 scripts/manhwa_scraper.py --site drake --download-all -i drake.yaml && \
-python3 scripts/manhwa_scraper.py --site manhuato --list-all -o manhuato.yaml && \
-python3 scripts/manhwa_scraper.py --site manhuato --download-all -i manhuato.yaml && \
-python3 scripts/manhwa_scraper.py --site webtoon --list-all -o webtoon.yaml && \
-python3 scripts/manhwa_scraper.py --site webtoon --download-all -i webtoon.yaml && \
-xvfb-run python3 scripts/lightnovel_scraper.py --site lightnovelpub --list-all --popular --pages 10 -o lightnovelpub_popular.yaml && \
-xvfb-run python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 -o ./library/LightNovels && \
-xvfb-run python3 scripts/lightnovel_scraper.py --site novelbin --list-all --popular --pages 10 -o novelbin_popular.yaml && \
-xvfb-run python3 scripts/lightnovel_scraper.py --site novelbin --download-all --popular --pages 10 -o ./library/LightNovels
+---------------------------------------------------------------
+  DOCKER - Start / Stop / Status
+---------------------------------------------------------------
 
+# Start everything
+docker compose up -d
+
+# Stop everything
+docker compose down
+
+# Check what's running
+docker compose ps
+
+# Restart a single service
+docker compose restart orvault
+docker compose restart vpn
+
+# Rebuild after code changes (git pull first)
+git pull && docker compose up -d --build
+
+# View logs (live)
+docker compose logs -f                   # All services
+docker compose logs -f orvault           # Just ORVault
+docker compose logs -f manhwa-downloader # Just scraper
+docker compose logs -f vpn               # VPN status
+
+---------------------------------------------------------------
+  SCRAPERS - Run All Sites
+---------------------------------------------------------------
+
+# Run all scrapers (Asura, Flame, Drake, ManhuaTo, Webtoon, LightNovels)
+# Use inside tmux so you can see output AND survive SSH disconnect
+docker exec -it manhwa-downloader bash /app/run_all_scrapers.sh
+
+# Or run detached (no output, but survives SSH disconnect)
+docker exec -d manhwa-downloader bash /app/run_all_scrapers.sh
+
+---------------------------------------------------------------
+  SCRAPERS - Run Individual Sites
+---------------------------------------------------------------
+
+# Asura (Manhwa)
+docker exec -it manhwa-downloader \
+  python3 scripts/manhwa_scraper.py --site asura --download-all -o ./library/Manhwa
+
+# Flame Comics (Manhwa)
+docker exec -it manhwa-downloader \
+  python3 scripts/manhwa_scraper.py --site flame --download-all -o ./library/Manhwa
+
+# Drake Comics (Manhwa)
+docker exec -it manhwa-downloader \
+  python3 scripts/manhwa_scraper.py --site drake --download-all -o ./library/Manhwa
+
+# ManhuaTo (Manhua)
+docker exec -it manhwa-downloader \
+  python3 scripts/manhwa_scraper.py --site manhuato --download-all -o ./library/Manhua
+
+# Webtoon (Manhwa)
+docker exec -it manhwa-downloader \
+  python3 scripts/manhwa_scraper.py --site webtoon --download-all -o ./library/Manhwa
+
+# LightNovelPub (Light Novels)
+docker exec -it manhwa-downloader \
+  python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 -o ./library/LightNovels
+
+# NovelBin (Light Novels)
+docker exec -it manhwa-downloader \
+  python3 scripts/lightnovel_scraper.py --site novelbin --download-all --popular --pages 10 -o ./library/LightNovels
+
+---------------------------------------------------------------
+  SCRAPERS - Download a Single Series by URL
+---------------------------------------------------------------
+
+docker exec -it manhwa-downloader \
+  python3 scripts/manhwa_downloader.py --url 'SERIES_URL_HERE' --output ./library/Manhwa
+
+---------------------------------------------------------------
+  COVERS & METADATA
+---------------------------------------------------------------
+
+# Fetch missing covers for all Manhwa
+docker exec -it manhwa-downloader python3 scripts/fetch_covers.py ./library/Manhwa
+
+# Force re-fetch all covers
+docker exec -it manhwa-downloader python3 scripts/fetch_covers.py ./library/Manhwa --force
+
+# Backfill metadata (genres, descriptions, ratings) into existing CBZ files
+docker exec -it manhwa-downloader python3 scripts/backfill_metadata.py ./library/Manhwa
+
+# Dry-run backfill (preview only, no changes)
+docker exec -it manhwa-downloader python3 scripts/backfill_metadata.py ./library/Manhwa --dry-run
+
+# Fix chapter title metadata in CBZ files
+docker exec -it manhwa-downloader python3 scripts/fix_cbz_metadata.py ./library/Manhwa
+
+---------------------------------------------------------------
+  DEBUGGING & TROUBLESHOOTING
+---------------------------------------------------------------
+
+# Shell into the scraper container
+docker exec -it manhwa-downloader /bin/bash
+
+# Check if VPN is working (from inside scraper)
+docker exec manhwa-downloader curl -s https://am.i.mullvad.net/connected
+
+# Check if FlareSolverr is running
+docker exec manhwa-downloader curl -s http://localhost:8191
+
+# Check disk usage
+du -sh /mnt/manga-storage/manga-server/library/*
+
+# Check runc version (must be v1.2.5 to avoid ARM64 seccomp crash)
+runc --version
+
+---------------------------------------------------------------
+  RUNC FIX (if Docker builds break after apt upgrade)
+---------------------------------------------------------------
+
+# The Pi's runc is pinned to v1.2.5 to avoid ARM64 seccomp crash.
+# If apt upgrade overwrites it, re-apply:
+
+wget https://github.com/opencontainers/runc/releases/download/v1.2.5/runc.arm64
+sudo install -m 755 runc.arm64 /usr/bin/runc
+sudo systemctl restart docker
+rm runc.arm64
+
+# Re-pin to prevent future overwrites
+sudo apt-mark hold runc
