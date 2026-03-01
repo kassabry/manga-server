@@ -183,14 +183,48 @@ class BaseSiteScraper:
             return int(version.split('.')[0])
         except:
             pass
-        try:
-            # Linux/Mac - run chrome --version
-            result = subprocess.run(['google-chrome', '--version'], capture_output=True, text=True)
-            match = regex.search(r'(\d+)\.', result.stdout)
-            if match:
-                return int(match.group(1))
-        except:
-            pass
+        # Linux - try multiple browser names
+        for browser in ['google-chrome', 'chromium-browser', 'chromium']:
+            try:
+                result = subprocess.run([browser, '--version'], capture_output=True, text=True, timeout=5)
+                match = regex.search(r'(\d+)\.', result.stdout)
+                if match:
+                    return int(match.group(1))
+            except:
+                pass
+        return None
+
+    def _is_arm(self):
+        """Check if running on ARM architecture"""
+        import platform
+        machine = platform.machine().lower()
+        return machine in ('aarch64', 'armv7l', 'armv6l', 'arm64')
+
+    def _find_system_chromedriver(self):
+        """Find system-installed chromedriver binary"""
+        import shutil
+        for name in ['chromedriver', 'chromium.chromedriver']:
+            path = shutil.which(name)
+            if path:
+                return path
+        # Common paths on Debian/Ubuntu/Pi OS
+        for path in ['/usr/bin/chromedriver', '/usr/lib/chromium/chromedriver',
+                     '/usr/lib/chromium-browser/chromedriver', '/snap/bin/chromium.chromedriver']:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+        return None
+
+    def _find_chromium_binary(self):
+        """Find system-installed Chromium browser binary"""
+        import shutil
+        for name in ['chromium', 'chromium-browser', 'google-chrome']:
+            path = shutil.which(name)
+            if path:
+                return path
+        for path in ['/usr/bin/chromium', '/usr/bin/chromium-browser',
+                     '/snap/bin/chromium']:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
         return None
 
     def _inject_ad_blocker(self):
@@ -281,10 +315,10 @@ class BaseSiteScraper:
         # Fallback to regular selenium
         logger.info("Using regular selenium (undetected-chromedriver not available or failed)")
         options = Options()
-        
+
         if self.headless:
             options.add_argument('--headless=new')
-        
+
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-gpu')
@@ -294,13 +328,29 @@ class BaseSiteScraper:
         options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
-        
-        try:
-            from webdriver_manager.chrome import ChromeDriverManager
-            service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=options)
-        except Exception:
-            self.driver = webdriver.Chrome(options=options)
+
+        # On ARM (Raspberry Pi), use system-installed chromedriver directly
+        # webdriver-manager downloads x86 binaries which don't work on ARM
+        if self._is_arm():
+            chromium_bin = self._find_chromium_binary()
+            if chromium_bin:
+                logger.info(f"ARM detected - using Chromium binary: {chromium_bin}")
+                options.binary_location = chromium_bin
+            system_driver = self._find_system_chromedriver()
+            if system_driver:
+                logger.info(f"ARM detected - using system chromedriver: {system_driver}")
+                service = Service(system_driver)
+                self.driver = webdriver.Chrome(service=service, options=options)
+            else:
+                logger.warning("ARM detected but no system chromedriver found. Trying default...")
+                self.driver = webdriver.Chrome(options=options)
+        else:
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                service = Service(ChromeDriverManager().install())
+                self.driver = webdriver.Chrome(service=service, options=options)
+            except Exception:
+                self.driver = webdriver.Chrome(options=options)
         
         # Try to mask automation
         try:

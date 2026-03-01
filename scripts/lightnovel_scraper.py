@@ -170,6 +170,48 @@ class BaseLightNovelScraper:
                     return int(match.group(1))
         except Exception:
             pass
+        # Linux - try multiple browser names
+        for browser in ['google-chrome', 'chromium-browser', 'chromium']:
+            try:
+                import subprocess as sp
+                result = sp.run([browser, '--version'], capture_output=True, text=True, timeout=5)
+                match = re.search(r'(\d+)\.', result.stdout)
+                if match:
+                    return int(match.group(1))
+            except Exception:
+                pass
+        return None
+
+    def _is_arm(self):
+        """Check if running on ARM architecture"""
+        import platform
+        machine = platform.machine().lower()
+        return machine in ('aarch64', 'armv7l', 'armv6l', 'arm64')
+
+    def _find_system_chromedriver(self):
+        """Find system-installed chromedriver binary"""
+        import shutil
+        for name in ['chromedriver', 'chromium.chromedriver']:
+            path = shutil.which(name)
+            if path:
+                return path
+        for path in ['/usr/bin/chromedriver', '/usr/lib/chromium/chromedriver',
+                     '/usr/lib/chromium-browser/chromedriver', '/snap/bin/chromium.chromedriver']:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+        return None
+
+    def _find_chromium_binary(self):
+        """Find system-installed Chromium browser binary"""
+        import shutil
+        for name in ['chromium', 'chromium-browser', 'google-chrome']:
+            path = shutil.which(name)
+            if path:
+                return path
+        for path in ['/usr/bin/chromium', '/usr/bin/chromium-browser',
+                     '/snap/bin/chromium']:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
         return None
 
     def _init_selenium(self):
@@ -203,12 +245,28 @@ class BaseLightNovelScraper:
 
         options = Options()
         if self.headless:
-            options.add_argument('--headless')
+            options.add_argument('--headless=new')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
         options.add_argument('--window-size=1920,1080')
         options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-        self.driver = webdriver.Chrome(options=options)
+
+        # On ARM (Raspberry Pi), use system-installed chromedriver directly
+        if self._is_arm():
+            chromium_bin = self._find_chromium_binary()
+            if chromium_bin:
+                logger.info(f"ARM detected - using Chromium binary: {chromium_bin}")
+                options.binary_location = chromium_bin
+            system_driver = self._find_system_chromedriver()
+            if system_driver:
+                logger.info(f"ARM detected - using system chromedriver: {system_driver}")
+                service = Service(system_driver)
+                self.driver = webdriver.Chrome(service=service, options=options)
+            else:
+                self.driver = webdriver.Chrome(options=options)
+        else:
+            self.driver = webdriver.Chrome(options=options)
     
     def _close_driver(self):
         """Close Selenium driver"""
