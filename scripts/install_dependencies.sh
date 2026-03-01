@@ -72,18 +72,14 @@ log_info "System packages installed."
 # ============================================================================
 log_step "Step 2/6: Installing Chromium browser..."
 
-if $IS_PI; then
-    # Raspberry Pi OS packages
-    sudo apt-get install -y --no-install-recommends \
-        chromium-browser \
-        chromium-chromedriver
+# Try modern package names first (Debian Bookworm+), fall back to legacy names
+if sudo apt-get install -y --no-install-recommends chromium chromium-driver 2>/dev/null; then
+    CHROME_BIN=$(which chromium 2>/dev/null || echo "/usr/bin/chromium")
+elif sudo apt-get install -y --no-install-recommends chromium-browser chromium-chromedriver 2>/dev/null; then
     CHROME_BIN=$(which chromium-browser 2>/dev/null || echo "/usr/bin/chromium-browser")
 else
-    # Standard Debian/Ubuntu
-    sudo apt-get install -y --no-install-recommends \
-        chromium \
-        chromium-driver
-    CHROME_BIN=$(which chromium 2>/dev/null || which chromium-browser 2>/dev/null || echo "/usr/bin/chromium")
+    log_warn "Could not install Chromium. You may need to install it manually."
+    CHROME_BIN=""
 fi
 
 # Verify
