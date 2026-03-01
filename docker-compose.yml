@@ -96,8 +96,8 @@ services:
     environment:
       - TZ=America/Chicago
       - DISPLAY=:99
-      # Check for new chapters every 6 hours (21600 seconds)
-      - CHECK_INTERVAL=7200
+      # Check for new chapters every 12 hours (43200 seconds)
+      - CHECK_INTERVAL=43200
       # FlareSolverr is on the same VPN network stack, so use localhost
       - FLARESOLVERR_URL=http://localhost:8191
     restart: unless-stopped

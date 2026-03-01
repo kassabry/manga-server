@@ -35,15 +35,13 @@ echo "Manhwa Downloader starting..."\n\
 echo "Check interval: ${CHECK_INTERVAL:-21600} seconds"\n\
 \n\
 while true; do\n\
-    echo "$(date): Checking for new chapters..."\n\
+    echo "$(date): Running all scrapers..."\n\
     \n\
-    if [ -f /app/config/sources.yaml ]; then\n\
-        python /app/scripts/manhwa_downloader.py \\\n\
-            --config /app/config/sources.yaml \\\n\
-            --output /app/library/Manhwa \\\n\
+    if [ -f /app/run_all_scrapers.sh ]; then\n\
+        bash /app/run_all_scrapers.sh \\\n\
             2>&1 | tee -a /app/logs/downloader.log\n\
     else\n\
-        echo "No sources.yaml found. Create one at config/sources.yaml"\n\
+        echo "run_all_scrapers.sh not found"\n\
     fi\n\
     \n\
     echo "$(date): Sleeping for ${CHECK_INTERVAL:-21600} seconds..."\n\
