@@ -8,6 +8,7 @@ export const metadata: Metadata = {
   title: "ORVault",
   description: "Self-hosted manga reader and tracker",
   manifest: "/manifest.json",
+  robots: { index: false, follow: false },
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
