@@ -99,6 +99,9 @@ def extract_asura_details(soup):
             if sibling:
                 p = sibling.find('p')
                 text = (p or sibling).get_text(strip=True)
+                # Strip Asura promo prefix like [By ... that brought you ...!]
+                text = re.sub(r'^\s*\[.*?(?:brought you|studio).*?\]\s*', '', text, flags=re.I | re.S)
+                text = text.strip()
                 if len(text) > 20:
                     details['description'] = re.sub(r'\s+', ' ', text)[:2000]
             break
@@ -112,13 +115,14 @@ def extract_asura_details(soup):
                 details['status'] = text.capitalize()
             break
 
-    # Rating
+    # Rating — normalize to 5-point scale
     for div in soup.select('div[class*="italic"]'):
         text = div.get_text(strip=True)
         try:
             val = float(text)
             if 0 < val <= 10:
-                details['rating'] = round(val, 1)
+                # Normalize: Asura uses 10-point scale, store as 5-point
+                details['rating'] = round(val / 2, 1) if val > 5 else round(val, 1)
                 break
         except ValueError:
             continue
@@ -288,8 +292,8 @@ def update_xml(xml_content, details):
     if details.get('rating'):
         existing_rating = re.search(r'<CommunityRating>(.*?)</CommunityRating>', xml_content)
         if not existing_rating or not existing_rating.group(1).strip():
-            rating_5 = details['rating'] / 2 if details['rating'] > 5 else details['rating']
-            xml_content = set_field(xml_content, 'CommunityRating', f'{rating_5:.1f}')
+            # Rating is already normalized to 5-point scale by extract_*_details()
+            xml_content = set_field(xml_content, 'CommunityRating', f'{details["rating"]:.1f}')
 
     if details.get('status'):
         existing_notes = re.search(r'<Notes>(.*?)</Notes>', xml_content)
@@ -398,36 +402,41 @@ def main():
 
         found = []
         if details.get('genres'):
-            found.append(f"genres={details['genres'][:60]}")
+            found.append(f"genres={details['genres']}")
         if details.get('description'):
-            found.append(f"desc={details['description'][:50]}...")
+            found.append(f"desc={details['description'][:80]}...")
         if details.get('author'):
             found.append(f"author={details['author']}")
         if details.get('status'):
             found.append(f"status={details['status']}")
         if details.get('rating'):
-            found.append(f"rating={details['rating']}")
+            found.append(f"rating={details['rating']}/5")
         logger.info(f"  Found: {', '.join(found)}")
 
         # Update all CBZ files in the series
         series_updated = 0
-        for cbz_path in cbz_files:
+        total_cbz = len(cbz_files)
+        for idx, cbz_path in enumerate(cbz_files, 1):
             xml = read_comic_info(cbz_path)
             if not xml:
                 continue
             new_xml, modified = update_xml(xml, details)
             if modified:
                 if args.dry_run:
-                    logger.info(f"  Would update: {cbz_path.name}")
+                    pass  # Don't log every file in dry-run
                 else:
                     if update_cbz(cbz_path, new_xml):
                         series_updated += 1
+            # Progress logging for large series
+            if total_cbz > 50 and idx % 50 == 0:
+                logger.info(f"  Progress: {idx}/{total_cbz} files...")
 
         if series_updated > 0 or args.dry_run:
             updated_series += 1
             updated_files += series_updated
             action = "Would update" if args.dry_run else "Updated"
-            logger.info(f"  {action} {series_updated if not args.dry_run else len(cbz_files)} CBZ files")
+            count = total_cbz if args.dry_run else series_updated
+            logger.info(f"  {action} {count}/{total_cbz} CBZ files")
 
         # Rate limit
         time.sleep(random.uniform(1, 3))

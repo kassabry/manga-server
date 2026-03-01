@@ -1290,6 +1290,9 @@ class AsuraFullScraper(BaseSiteScraper):
                         if sibling:
                             p = sibling.find('p')
                             text = (p or sibling).get_text(strip=True)
+                            # Strip Asura promo prefix like [By ... that brought you ...!]
+                            text = re.sub(r'^\s*\[.*?(?:brought you|studio).*?\]\s*', '', text, flags=re.I | re.S)
+                            text = text.strip()
                             if len(text) > 20:
                                 series.description = re.sub(r'\s+', ' ', text)[:2000]
                                 break
