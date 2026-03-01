@@ -1093,26 +1093,32 @@ class BaseSiteScraper:
                         series: Series = None) -> bool:
         """Download a chapter and create CBZ with metadata"""
 
-        # Check if already downloaded
-        if tracker.is_downloaded(chapter.url):
-            logger.debug(f"Skipping (already downloaded): {series_title} Ch.{chapter.number}")
-            return True
-
         safe_title = self._sanitize_filename(series_title)
         safe_chapter = self._sanitize_filename(chapter.number)
 
         series_dir = output_dir / safe_title
+        cbz_name = f"{safe_title} - Chapter {safe_chapter}.cbz"
+        cbz_path = series_dir / cbz_name
+
+        # Check if already downloaded — but only trust the cache if the CBZ file
+        # actually exists on disk.  If the file was deleted, re-download it.
+        if tracker.is_downloaded(chapter.url):
+            if cbz_path.exists():
+                logger.debug(f"Skipping (already downloaded): {series_title} Ch.{chapter.number}")
+                return True
+            else:
+                # File was deleted — clear from cache so we re-download
+                tracker.downloaded.discard(chapter.url)
+                tracker.save()
+                logger.info(f"Re-downloading (file missing): {cbz_name}")
+
         series_dir.mkdir(parents=True, exist_ok=True)
 
         # Download series cover image once (if not already present)
-        # Kavita uses cover.jpg/cover.png in the series folder as the series thumbnail
         if series and series.cover_url:
             existing_covers = list(series_dir.glob('cover.*'))
             if not existing_covers:
                 self._download_cover(series.cover_url, series_dir, referer=series.url)
-
-        cbz_name = f"{safe_title} - Chapter {safe_chapter}.cbz"
-        cbz_path = series_dir / cbz_name
 
         if cbz_path.exists():
             tracker.mark_downloaded(chapter.url)
@@ -1634,40 +1640,66 @@ class AsuraFullScraper(BaseSiteScraper):
         return chapters
 
     def get_pages(self, chapter: Chapter) -> List[str]:
-        """Get image URLs for a chapter from Asura Scans"""
-        try:
-            soup = self._get_soup(chapter.url, use_selenium=True)
+        """Get image URLs for a chapter from Asura Scans.
 
+        Asura is a Next.js app — chapter images are NOT in <img> tags in the
+        initial HTML.  They're serialised inside self.__next_f.push() script
+        blocks.  A plain HTTP fetch (or FlareSolverr) returns the full HTML
+        including these scripts, so we can extract URLs with a regex instead
+        of needing Selenium to render the page.
+        """
+        try:
+            # Plain HTTP with cookies is enough — we just need the HTML source
+            soup = self._get_soup(chapter.url, use_selenium=True)
+            html = str(soup)
+
+            # --- Strategy 1: extract from Next.js serialised data ---
+            # URLs look like: https://gg.asuracomic.net/storage/media/319264/conversions/01-optimized.webp
+            # They appear inside escaped JSON in <script> tags.
+            raw_urls = re.findall(
+                r'https?://gg\.asuracomic\.net/storage/media/\d+/conversions/[^"\\]+\.(?:webp|jpg|png)',
+                html
+            )
+
+            # Deduplicate while preserving order
+            seen = set()
+            pages = []
+            for url in raw_urls:
+                # Skip sidebar cover thumbnails (thumb-small, thumb-medium)
+                if '-thumb-' in url:
+                    continue
+                if url not in seen:
+                    seen.add(url)
+                    pages.append(url)
+
+            if pages:
+                # Sort by the media ID to get correct page order
+                def sort_key(url):
+                    m = re.search(r'/media/(\d+)/', url)
+                    return int(m.group(1)) if m else 0
+                pages.sort(key=sort_key)
+                logger.info(f"Found {len(pages)} chapter images from Next.js data")
+                return pages
+
+            # --- Strategy 2: fallback to <img> tags (legacy / Selenium) ---
             pages = []
             for img in soup.select('img'):
                 src = img.get('src', img.get('data-src', ''))
                 if not src:
                     continue
-
-                # Only accept images from Asura's CDN (gg.asuracomic.net)
                 if 'gg.asuracomic.net/storage/media/' not in src:
                     continue
-
-                # Skip profile images, avatars, and sidebar recommendations
                 if '/profile_images/' in src or '/profile/' in src:
                     continue
-
-                # Chapter images are in /conversions/ with numbered filenames
-                if '/conversions/' in src and src not in pages:
+                if '/conversions/' in src and '-thumb-' not in src and src not in pages:
                     pages.append(src)
 
-            # If no conversions-style images, try broader CDN match
-            if not pages:
-                for img in soup.select('img'):
-                    src = img.get('src', img.get('data-src', ''))
-                    if not src:
-                        continue
-                    if 'gg.asuracomic.net/storage/media/' in src and '/profile' not in src:
-                        if src not in pages:
-                            pages.append(src)
+            if pages:
+                logger.info(f"Found {len(pages)} chapter images from img tags")
+                return pages
 
-            logger.info(f"Found {len(pages)} page images")
-            return pages
+            logger.warning(f"No chapter images found for {chapter.url}")
+            return []
 
         except Exception as e:
             logger.error(f"Error getting pages: {e}")
