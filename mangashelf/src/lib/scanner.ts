@@ -300,16 +300,25 @@ async function scanSeries(
       }
     }
 
-    await prisma.chapter.create({
-      data: {
+    const chapterData = {
+      seriesId: series.id,
+      number: chapterNumber,
+      title: chapterComicInfo?.Title != null ? String(chapterComicInfo.Title) : null,
+      pageCount,
+      filePath: cbzPath,
+      fileSize: fileStat.size,
+      source,
+      sourceUrl,
+    };
+
+    await prisma.chapter.upsert({
+      where: { filePath: cbzPath },
+      create: chapterData,
+      update: {
         seriesId: series.id,
         number: chapterNumber,
-        title: chapterComicInfo?.Title != null ? String(chapterComicInfo.Title) : null,
         pageCount,
-        filePath: cbzPath,
         fileSize: fileStat.size,
-        source,
-        sourceUrl,
       },
     });
     result.chaptersAdded++;
