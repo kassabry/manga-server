@@ -432,6 +432,25 @@ class BaseSiteScraper:
             self.driver.quit()
             self.driver = None
     
+    @staticmethod
+    def _is_cloudflare_challenge(html: str) -> bool:
+        """Detect Cloudflare challenge/block pages that aren't real content."""
+        markers = [
+            'Just a moment...',
+            'Checking your browser',
+            'cf-challenge-running',
+            'cf_chl_opt',
+            '_cf_chl_tk',
+            'Attention Required! | Cloudflare',
+            'Enable JavaScript and cookies to continue',
+        ]
+        # Quick length check — real chapter pages are large
+        if len(html) < 5000:
+            return any(m in html for m in markers)
+        # For longer pages, only flag if multiple markers present
+        hits = sum(1 for m in markers if m in html)
+        return hits >= 2
+
     def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
         """Get BeautifulSoup object from URL.
 
@@ -448,7 +467,13 @@ class BaseSiteScraper:
                     resp = self.session.get(url, timeout=30)
                     resp.raise_for_status()
                     if len(resp.text) > 500:
-                        return BeautifulSoup(resp.text, 'html.parser')
+                        # Check if we got a Cloudflare challenge instead of real content
+                        if self._is_cloudflare_challenge(resp.text):
+                            logger.info(f"Cached cookies returned Cloudflare challenge, refreshing via FlareSolverr")
+                            self._fs_cookies_applied = False
+                            # Fall through to fresh FlareSolverr below
+                        else:
+                            return BeautifulSoup(resp.text, 'html.parser')
                 except Exception:
                     pass
             # Fall back to FlareSolverr
@@ -1639,6 +1664,57 @@ class AsuraFullScraper(BaseSiteScraper):
         chapters.sort(key=lambda x: float(x.number) if x.number.replace('.', '').isdigit() else 0)
         return chapters
 
+    def _extract_asura_images(self, html: str) -> List[str]:
+        """Extract chapter image URLs from Asura HTML (Next.js data or img tags).
+
+        Returns a sorted, deduplicated list of image URLs, or empty list if none found.
+        """
+        # --- Strategy 1: extract from Next.js serialised data ---
+        # URLs look like: https://gg.asuracomic.net/storage/media/319264/conversions/01-optimized.webp
+        # They appear inside escaped JSON in <script> tags.
+        raw_urls = re.findall(
+            r'https?://gg\.asuracomic\.net/storage/media/\d+/conversions/[^"\\]+\.(?:webp|jpg|png)',
+            html
+        )
+
+        # Deduplicate while preserving order
+        seen = set()
+        pages = []
+        for url in raw_urls:
+            # Skip sidebar cover thumbnails (thumb-small, thumb-medium)
+            if '-thumb-' in url:
+                continue
+            if url not in seen:
+                seen.add(url)
+                pages.append(url)
+
+        if pages:
+            # Sort by the media ID to get correct page order
+            def sort_key(url):
+                m = re.search(r'/media/(\d+)/', url)
+                return int(m.group(1)) if m else 0
+            pages.sort(key=sort_key)
+            logger.info(f"Found {len(pages)} chapter images from Next.js data")
+            return pages
+
+        # --- Strategy 2: fallback to <img> tags (legacy / Selenium) ---
+        soup = BeautifulSoup(html, 'html.parser')
+        pages = []
+        for img in soup.select('img'):
+            src = img.get('src', img.get('data-src', ''))
+            if not src:
+                continue
+            if 'gg.asuracomic.net/storage/media/' not in src:
+                continue
+            if '/profile_images/' in src or '/profile/' in src:
+                continue
+            if '/conversions/' in src and '-thumb-' not in src and src not in pages:
+                pages.append(src)
+
+        if pages:
+            logger.info(f"Found {len(pages)} chapter images from img tags")
+        return pages
+
     def get_pages(self, chapter: Chapter) -> List[str]:
         """Get image URLs for a chapter from Asura Scans.
 
@@ -1647,63 +1723,48 @@ class AsuraFullScraper(BaseSiteScraper):
         blocks.  A plain HTTP fetch (or FlareSolverr) returns the full HTML
         including these scripts, so we can extract URLs with a regex instead
         of needing Selenium to render the page.
+
+        If the initial fetch returns no images (e.g. stale cookies gave us a
+        Cloudflare challenge page), we force a fresh FlareSolverr request and
+        retry once before giving up.
         """
-        try:
-            # Plain HTTP with cookies is enough — we just need the HTML source
-            soup = self._get_soup(chapter.url, use_selenium=True)
-            html = str(soup)
+        max_attempts = 2 if self._use_flaresolverr else 1
 
-            # --- Strategy 1: extract from Next.js serialised data ---
-            # URLs look like: https://gg.asuracomic.net/storage/media/319264/conversions/01-optimized.webp
-            # They appear inside escaped JSON in <script> tags.
-            raw_urls = re.findall(
-                r'https?://gg\.asuracomic\.net/storage/media/\d+/conversions/[^"\\]+\.(?:webp|jpg|png)',
-                html
-            )
+        for attempt in range(1, max_attempts + 1):
+            try:
+                soup = self._get_soup(chapter.url, use_selenium=True)
+                html = str(soup)
 
-            # Deduplicate while preserving order
-            seen = set()
-            pages = []
-            for url in raw_urls:
-                # Skip sidebar cover thumbnails (thumb-small, thumb-medium)
-                if '-thumb-' in url:
+                pages = self._extract_asura_images(html)
+                if pages:
+                    return pages
+
+                # No images found — on first attempt, force fresh FlareSolverr cookies
+                if attempt < max_attempts and self._use_flaresolverr:
+                    logger.warning(
+                        f"No images found for {chapter.url} (attempt {attempt}), "
+                        f"forcing fresh FlareSolverr request..."
+                    )
+                    # Clear stale cookies so _get_soup() goes through FlareSolverr again
+                    self._fs_cookies_applied = False
+                    self.session.cookies.clear()
+                    time.sleep(2)  # Brief pause before retry
                     continue
-                if url not in seen:
-                    seen.add(url)
-                    pages.append(url)
 
-            if pages:
-                # Sort by the media ID to get correct page order
-                def sort_key(url):
-                    m = re.search(r'/media/(\d+)/', url)
-                    return int(m.group(1)) if m else 0
-                pages.sort(key=sort_key)
-                logger.info(f"Found {len(pages)} chapter images from Next.js data")
-                return pages
+                # Final attempt exhausted
+                logger.warning(f"No chapter images found for {chapter.url} after {attempt} attempt(s)")
+                return []
 
-            # --- Strategy 2: fallback to <img> tags (legacy / Selenium) ---
-            pages = []
-            for img in soup.select('img'):
-                src = img.get('src', img.get('data-src', ''))
-                if not src:
+            except Exception as e:
+                logger.error(f"Error getting pages (attempt {attempt}): {e}")
+                if attempt < max_attempts:
+                    self._fs_cookies_applied = False
+                    self.session.cookies.clear()
+                    time.sleep(2)
                     continue
-                if 'gg.asuracomic.net/storage/media/' not in src:
-                    continue
-                if '/profile_images/' in src or '/profile/' in src:
-                    continue
-                if '/conversions/' in src and '-thumb-' not in src and src not in pages:
-                    pages.append(src)
+                return []
 
-            if pages:
-                logger.info(f"Found {len(pages)} chapter images from img tags")
-                return pages
-
-            logger.warning(f"No chapter images found for {chapter.url}")
-            return []
-
-        except Exception as e:
-            logger.error(f"Error getting pages: {e}")
-            return []
+        return []
 
 
 class FlameFullScraper(BaseSiteScraper):
