@@ -1442,6 +1442,7 @@ Examples:
     parser.add_argument('--with-details', action='store_true', help='Fetch full details (slower)')
     parser.add_argument('--visible', action='store_true', help='Show browser window')
     parser.add_argument('--limit', type=int, help='Limit number of novels')
+    parser.add_argument('--source-prefix', action='store_true', help='Prefix output files with [Source] for multi-source comparison')
     
     args = parser.parse_args()
     
@@ -1560,30 +1561,37 @@ Examples:
                         if tracker.is_downloaded(novel.url):
                             logger.info(f"[{i}/{len(novels)}] Skipping (already downloaded): {novel.title}")
                             continue
-                        
+
                         logger.info(f"[{i}/{len(novels)}] Downloading: {novel.title}")
-                        
+
                         try:
                             # Get full details if not already
                             if not novel.description:
                                 novel = scraper.get_novel_details(novel)
-                            
+
+                            # Apply source prefix
+                            if args.source_prefix:
+                                import copy
+                                novel = copy.copy(novel)
+                                source_name = novel.source.title() if novel.source else site_name.title()
+                                novel.title = f"[{source_name}] {novel.title}"
+
                             # Get chapters
                             chapters = scraper.get_chapters(novel)
                             logger.info(f"  Found {len(chapters)} chapters")
-                            
+
                             # Get content for each chapter
                             for j, chapter in enumerate(chapters, 1):
                                 logger.info(f"  [{j}/{len(chapters)}] Fetching: {chapter.title}")
                                 chapter.content = scraper.get_chapter_content(chapter)
                                 time.sleep(0.5)
-                            
+
                             # Create EPUB
                             epub_path = scraper.create_epub(novel, chapters, output_path)
                             logger.info(f"  Created: {epub_path.name}")
-                            
+
                             tracker.mark_downloaded(novel.url)
-                            
+
                         except Exception as e:
                             logger.error(f"  Error: {e}")
                 
@@ -1624,29 +1632,36 @@ Examples:
                 if tracker.is_downloaded(novel.url):
                     logger.info(f"[{i}/{len(novels)}] Skipping: {novel.title}")
                     continue
-                
+
                 logger.info(f"[{i}/{len(novels)}] Downloading: {novel.title}")
-                
+
                 try:
                     if not novel.description:
                         novel = scraper.get_novel_details(novel)
-                    
+
+                    # Apply source prefix
+                    if args.source_prefix:
+                        import copy
+                        novel = copy.copy(novel)
+                        source_name = novel.source.title() if novel.source else args.site.title()
+                        novel.title = f"[{source_name}] {novel.title}"
+
                     chapters = scraper.get_chapters(novel)
                     logger.info(f"  Found {len(chapters)} chapters")
-                    
+
                     for j, chapter in enumerate(chapters, 1):
                         logger.info(f"  [{j}/{len(chapters)}] Fetching: {chapter.title}")
                         chapter.content = scraper.get_chapter_content(chapter)
                         time.sleep(0.5)
-                    
+
                     epub_path = scraper.create_epub(novel, chapters, output_path)
                     logger.info(f"  Created: {epub_path.name}")
-                    
+
                     tracker.mark_downloaded(novel.url)
-                    
+
                 except Exception as e:
                     logger.error(f"  Error: {e}")
-            
+
             scraper._close_driver()
         
         logger.info("Download complete!")

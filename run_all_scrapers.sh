@@ -36,9 +36,9 @@ echo "=== Webtoon ==="
 python3 scripts/manhwa_scraper.py --site webtoon --download-all --source-prefix -o ./library/Manhwa
 
 echo "=== LightNovelPub ==="
-python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 -o ./library/LightNovels
+python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 --source-prefix -o ./library/LightNovels
 
 echo "=== NovelBin ==="
-python3 scripts/lightnovel_scraper.py --site novelbin --download-all --popular --pages 10 -o ./library/LightNovels
+python3 scripts/lightnovel_scraper.py --site novelbin --download-all --popular --pages 10 --source-prefix -o ./library/LightNovels
 
 echo "=== All scrapers complete ==="
