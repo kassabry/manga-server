@@ -1,8 +1,10 @@
 import { readFile, writeFile, access, mkdir, stat } from "fs/promises";
-import { join, dirname } from "path";
+import { join } from "path";
 import JSZip from "jszip";
 
-const COVERS_DIR = join(process.cwd(), "public", "covers");
+// Store covers in the data directory (writable, volume-mounted)
+// rather than public/ which has permission issues with standalone mode
+const COVERS_DIR = join(process.cwd(), "data", "covers");
 
 async function ensureDir(dir: string) {
   try {
@@ -30,12 +32,16 @@ async function getMtime(path: string): Promise<number> {
   }
 }
 
+export function getCoversDir(): string {
+  return COVERS_DIR;
+}
+
 export async function extractCover(
   seriesSlug: string,
   seriesDirPath: string,
   firstCbzPath?: string
 ): Promise<string | null> {
-  const coverOutputPath = join(COVERS_DIR, `${seriesSlug}.jpg`);
+  const coverOutputPath = join(COVERS_DIR, `${seriesSlug}.dat`);
 
   await ensureDir(COVERS_DIR);
 
@@ -52,7 +58,7 @@ export async function extractCover(
         const coverData = await readFile(coverPath);
         await writeFile(coverOutputPath, coverData);
       }
-      return `/covers/${seriesSlug}.jpg`;
+      return `/api/covers/${seriesSlug}`;
     } catch {
       continue;
     }
@@ -60,7 +66,7 @@ export async function extractCover(
 
   // If cached version exists and no cover.* in series dir, use it
   if (await fileExists(coverOutputPath)) {
-    return `/covers/${seriesSlug}.jpg`;
+    return `/api/covers/${seriesSlug}`;
   }
 
   // Strategy 2: Extract from first CBZ file (!000_cover.* or first image)
@@ -88,7 +94,7 @@ export async function extractCover(
       if (targetFile) {
         const imgData = await zip.file(targetFile)!.async("nodebuffer");
         await writeFile(coverOutputPath, imgData);
-        return `/covers/${seriesSlug}.jpg`;
+        return `/api/covers/${seriesSlug}`;
       }
     } catch {
       // Fall through
@@ -99,5 +105,5 @@ export async function extractCover(
 }
 
 export function getCoverUrl(seriesSlug: string): string {
-  return `/covers/${seriesSlug}.jpg`;
+  return `/api/covers/${seriesSlug}`;
 }

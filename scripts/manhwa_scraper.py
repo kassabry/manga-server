@@ -1151,7 +1151,14 @@ class BaseSiteScraper:
             return True
 
         logger.info(f"Downloading: {series_title} - Chapter {chapter.number}")
-        
+
+        # Store cover media ID so get_pages() can exclude it from chapter images
+        self._cover_media_ids = set()
+        if series and series.cover_url and 'asuracomic' in series.cover_url:
+            m = re.search(r'/media/(\d+)/', series.cover_url)
+            if m:
+                self._cover_media_ids.add(int(m.group(1)))
+
         try:
             pages = self.get_pages(chapter)
             if not pages:
@@ -1314,7 +1321,9 @@ class AsuraFullScraper(BaseSiteScraper):
 
             # --- Synopsis ---
             if not series.description:
-                # Look for h3 containing "Synopsis" then grab next sibling's <p>
+                html = str(soup)
+
+                # Strategy 1: Look for h3 containing "Synopsis" then grab next sibling's <p>
                 for h3 in soup.select('h3'):
                     if 'Synopsis' in h3.get_text():
                         sibling = h3.find_next_sibling('span')
@@ -1327,6 +1336,23 @@ class AsuraFullScraper(BaseSiteScraper):
                             if len(text) > 20:
                                 series.description = re.sub(r'\s+', ' ', text)[:2000]
                                 break
+
+                # Strategy 2: Extract from Next.js serialized data
+                if not series.description:
+                    # Descriptions in Next.js data often appear as "description":"..."
+                    desc_matches = re.findall(
+                        r'"description"\s*:\s*"((?:[^"\\]|\\.){20,})"',
+                        html
+                    )
+                    for raw_desc in desc_matches:
+                        # Unescape JSON string
+                        text = raw_desc.replace('\\n', ' ').replace('\\"', '"').replace('\\\\', '\\')
+                        # Strip Asura promo prefix
+                        text = re.sub(r'^\s*\[.*?(?:brought you|studio).*?\]\s*', '', text, flags=re.I | re.S)
+                        text = re.sub(r'\s+', ' ', text).strip()
+                        if len(text) > 20:
+                            series.description = text[:2000]
+                            break
 
             # --- Status ---
             if not series.status or series.status in ['', 'Unknown']:
@@ -1664,6 +1690,74 @@ class AsuraFullScraper(BaseSiteScraper):
         chapters.sort(key=lambda x: float(x.number) if x.number.replace('.', '').isdigit() else 0)
         return chapters
 
+    @staticmethod
+    def _get_media_id(url: str) -> int:
+        """Extract numeric media ID from an Asura CDN URL."""
+        m = re.search(r'/media/(\d+)/', url)
+        return int(m.group(1)) if m else 0
+
+    def _filter_outlier_images(self, pages: List[str]) -> List[str]:
+        """Remove sidebar/cover images that don't belong to the chapter.
+
+        Chapter page images have sequential media IDs clustered together.
+        Sidebar covers have isolated media IDs far from the main cluster.
+        Also excludes any media IDs matching the known series cover.
+        """
+        if len(pages) <= 3:
+            return pages  # Too few to reliably detect outliers
+
+        # Get known cover media IDs to exclude
+        cover_ids = getattr(self, '_cover_media_ids', set())
+
+        # Extract media IDs and pair with URLs
+        id_url_pairs = [(self._get_media_id(url), url) for url in pages]
+
+        # First pass: exclude known cover media IDs
+        if cover_ids:
+            before = len(id_url_pairs)
+            id_url_pairs = [(mid, url) for mid, url in id_url_pairs if mid not in cover_ids]
+            removed = before - len(id_url_pairs)
+            if removed:
+                logger.info(f"Excluded {removed} image(s) matching series cover media ID")
+
+        if len(id_url_pairs) <= 3:
+            return [url for _, url in id_url_pairs]
+
+        # Second pass: outlier detection via clustering
+        # Chapter images have consecutive/close media IDs; sidebar images are far away
+        ids = sorted(mid for mid, _ in id_url_pairs)
+        gaps = [ids[i+1] - ids[i] for i in range(len(ids) - 1)]
+
+        if not gaps:
+            return [url for _, url in id_url_pairs]
+
+        # Median gap between consecutive chapter images (usually 1-5)
+        sorted_gaps = sorted(gaps)
+        median_gap = sorted_gaps[len(sorted_gaps) // 2]
+
+        # Threshold: if a gap is >50x the median AND >100, it's a cluster break
+        threshold = max(median_gap * 50, 100)
+
+        # Find the largest contiguous cluster
+        clusters = [[ids[0]]]
+        for i, gap in enumerate(gaps):
+            if gap > threshold:
+                clusters.append([ids[i+1]])
+            else:
+                clusters[-1].append(ids[i+1])
+
+        # The main cluster is the one with the most IDs
+        main_cluster = max(clusters, key=len)
+        main_ids = set(main_cluster)
+
+        # Filter to only keep images in the main cluster
+        filtered = [(mid, url) for mid, url in id_url_pairs if mid in main_ids]
+        outliers_removed = len(id_url_pairs) - len(filtered)
+        if outliers_removed > 0:
+            logger.info(f"Removed {outliers_removed} outlier image(s) outside chapter media ID cluster")
+
+        return [url for _, url in filtered]
+
     def _extract_asura_images(self, html: str) -> List[str]:
         """Extract chapter image URLs from Asura HTML (Next.js data or img tags).
 
@@ -1690,12 +1784,12 @@ class AsuraFullScraper(BaseSiteScraper):
 
         if pages:
             # Sort by the media ID to get correct page order
-            def sort_key(url):
-                m = re.search(r'/media/(\d+)/', url)
-                return int(m.group(1)) if m else 0
-            pages.sort(key=sort_key)
-            logger.info(f"Found {len(pages)} chapter images from Next.js data")
-            return pages
+            pages.sort(key=lambda u: self._get_media_id(u))
+            # Filter out sidebar/cover images
+            pages = self._filter_outlier_images(pages)
+            if pages:
+                logger.info(f"Found {len(pages)} chapter images from Next.js data")
+                return pages
 
         # --- Strategy 2: fallback to <img> tags (legacy / Selenium) ---
         soup = BeautifulSoup(html, 'html.parser')
@@ -1712,7 +1806,9 @@ class AsuraFullScraper(BaseSiteScraper):
                 pages.append(src)
 
         if pages:
-            logger.info(f"Found {len(pages)} chapter images from img tags")
+            pages = self._filter_outlier_images(pages)
+            if pages:
+                logger.info(f"Found {len(pages)} chapter images from img tags")
         return pages
 
     def get_pages(self, chapter: Chapter) -> List[str]:

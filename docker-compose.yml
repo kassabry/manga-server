@@ -130,7 +130,6 @@ services:
     volumes:
       - ./library:/library:ro
       - ./mangashelf/data:/app/data
-      - ./mangashelf/public/covers:/app/public/covers
     environment:
       - TZ=America/Chicago
       - DATABASE_URL=file:../data/mangashelf.db

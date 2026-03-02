@@ -154,8 +154,12 @@ async function scanSeries(
     ? await extractComicInfo(firstCbzPath)
     : null;
 
-  // Only re-extract cover when there are new chapters or series is new
-  const coverPath = hasNewChapters
+  // Re-extract cover when there are new chapters, series is new, or cover
+  // still uses the old /covers/ static path (migrate to /api/covers/)
+  const needsCoverUpdate = hasNewChapters ||
+    !series?.coverPath ||
+    series?.coverPath?.startsWith("/covers/");
+  const coverPath = needsCoverUpdate
     ? await extractCover(seriesSlug, seriesDirPath, firstCbzPath)
     : series?.coverPath ?? null;
 
