@@ -16,6 +16,7 @@ interface ChapterData {
   number: number;
   title: string | null;
   pageCount: number;
+  isEpub?: boolean;
   series: { id: string; title: string; slug: string };
   pages: PageInfo[];
   prevChapter: { id: string; number: number } | null;
@@ -64,6 +65,23 @@ const BG_COLORS: Record<BgColor, string> = {
   white: "#f5f5f5",
 };
 
+/**
+ * Strip EPUB HTML to just the body content, removing scripts and
+ * dangerous elements while keeping text formatting.
+ */
+function sanitizeEpubHtml(html: string): string {
+  // Extract body content if full HTML document
+  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  const content = bodyMatch ? bodyMatch[1] : html;
+
+  // Remove script and style tags
+  return content
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/\s*on\w+="[^"]*"/gi, "") // Remove event handlers
+    .replace(/\s*on\w+='[^']*'/gi, "");
+}
+
 function ReaderContent({ chapterId }: { chapterId: string }) {
   const { data: session } = useSession();
   const searchParams = useSearchParams();
@@ -77,6 +95,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   const [showSettings, setShowSettings] = useState(false);
   const [showChapterPicker, setShowChapterPicker] = useState(false);
   const [autoHideTimer, setAutoHideTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
+  const [epubHtmlPages, setEpubHtmlPages] = useState<string[]>([]);
 
   // Touch/swipe state
   const touchStartX = useRef(0);
@@ -162,6 +181,21 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         }, 2000);
       });
   }, [chapterId, initialPage]);
+
+  // Fetch EPUB HTML content when chapter is EPUB
+  useEffect(() => {
+    if (!chapter?.isEpub || chapter.pages.length === 0) {
+      setEpubHtmlPages([]);
+      return;
+    }
+
+    // Load all EPUB chapter pages as HTML
+    Promise.all(
+      chapter.pages.map((page) =>
+        fetch(page.url).then((r) => r.text())
+      )
+    ).then(setEpubHtmlPages);
+  }, [chapter?.id, chapter?.isEpub, chapter?.pages]);
 
   // Restore saved progress if no page param in URL
   useEffect(() => {
@@ -732,7 +766,57 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
       >
-        {settings.layout === "longstrip" ? (
+        {chapter.isEpub ? (
+          /* EPUB text reader mode */
+          <div className="mx-auto max-w-2xl px-4 py-8">
+            {chapter.prevChapter && (
+              <div className="flex items-center justify-center py-6 text-white/40">
+                <Link href={`/read/${chapter.prevChapter.id}`} className="flex flex-col items-center gap-2 hover:text-white/60" onClick={(e) => e.stopPropagation()}>
+                  <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+                  </svg>
+                  <span className="text-sm">Previous Volume ({chapter.prevChapter.number})</span>
+                </Link>
+              </div>
+            )}
+
+            {epubHtmlPages.length > 0 ? (
+              epubHtmlPages.map((html, i) => (
+                <div
+                  key={i}
+                  data-page-index={i}
+                  className="epub-content mb-8"
+                  dangerouslySetInnerHTML={{ __html: sanitizeEpubHtml(html) }}
+                />
+              ))
+            ) : (
+              <div className="flex items-center justify-center py-20 text-white/40">
+                <span>Loading content...</span>
+              </div>
+            )}
+
+            <div className="flex items-center justify-center gap-4 py-12">
+              {chapter.prevChapter && (
+                <Link
+                  href={`/read/${chapter.prevChapter.id}`}
+                  className="rounded-lg bg-white/10 px-6 py-3 text-white hover:bg-white/20"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  &larr; Previous
+                </Link>
+              )}
+              {chapter.nextChapter && (
+                <Link
+                  href={`/read/${chapter.nextChapter.id}`}
+                  className="rounded-lg bg-accent px-6 py-3 text-white hover:bg-accent/80"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  Next &rarr;
+                </Link>
+              )}
+            </div>
+          </div>
+        ) : settings.layout === "longstrip" ? (
           <div className="mx-auto max-w-3xl">
             {chapter.prevChapter && (
               <div data-sentinel="prev" className="flex items-center justify-center py-8 text-white/40">

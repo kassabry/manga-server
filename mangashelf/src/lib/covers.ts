@@ -104,6 +104,23 @@ export async function extractCover(
   return null;
 }
 
+/**
+ * Save a cover image from a raw buffer (e.g. extracted from EPUB)
+ */
+export async function extractCoverFromBuffer(
+  seriesSlug: string,
+  coverData: Buffer
+): Promise<string | null> {
+  try {
+    const coverOutputPath = join(COVERS_DIR, `${seriesSlug}.dat`);
+    await ensureDir(COVERS_DIR);
+    await writeFile(coverOutputPath, coverData);
+    return `/api/covers/${seriesSlug}`;
+  } catch {
+    return null;
+  }
+}
+
 export function getCoverUrl(seriesSlug: string): string {
   return `/api/covers/${seriesSlug}`;
 }

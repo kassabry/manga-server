@@ -2,6 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { dirname } from "path";
 import { prisma } from "@/lib/db";
 import { getPageList } from "@/lib/cbz";
+import { getEpubChapterList } from "@/lib/epub";
+
+function isEpubFile(filePath: string): boolean {
+  return filePath.toLowerCase().endsWith(".epub");
+}
 
 export async function GET(
   _request: NextRequest,
@@ -24,10 +29,11 @@ export async function GET(
 
   // Determine this chapter's source directory for same-source navigation
   const chapterDir = dirname(chapter.filePath);
+  const epub = isEpubFile(chapter.filePath);
 
-  // Run page list and all DB queries in parallel
+  // Get page/chapter list based on file type
   const [pages, allChapters] = await Promise.all([
-    getPageList(chapter.filePath),
+    epub ? getEpubChapterList(chapter.filePath) : getPageList(chapter.filePath),
     prisma.chapter.findMany({
       where: { seriesId: chapter.seriesId },
       orderBy: { number: "asc" },
@@ -42,6 +48,7 @@ export async function GET(
   return NextResponse.json(
     {
       ...chapter,
+      isEpub: epub,
       pages: pages.map((p, i) => ({
         index: i,
         name: p,

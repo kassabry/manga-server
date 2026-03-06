@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
 import { getPageList, extractPage } from "@/lib/cbz";
+import { getEpubChapterList, extractEpubChapter } from "@/lib/epub";
+
+function isEpubFile(filePath: string): boolean {
+  return filePath.toLowerCase().endsWith(".epub");
+}
 
 export async function GET(
   _request: NextRequest,
@@ -14,6 +19,27 @@ export async function GET(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
+  if (isEpubFile(chapter.filePath)) {
+    // EPUB: serve HTML chapter content
+    const chapterList = await getEpubChapterList(chapter.filePath);
+    if (pageIndex < 0 || pageIndex >= chapterList.length) {
+      return NextResponse.json({ error: "Page not found" }, { status: 404 });
+    }
+
+    const result = await extractEpubChapter(chapter.filePath, chapterList[pageIndex]);
+    if (!result) {
+      return NextResponse.json({ error: "Failed to extract chapter" }, { status: 500 });
+    }
+
+    return new NextResponse(result.html, {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "public, max-age=86400, immutable",
+      },
+    });
+  }
+
+  // CBZ: serve image page
   const pages = await getPageList(chapter.filePath);
   if (pageIndex < 0 || pageIndex >= pages.length) {
     return NextResponse.json({ error: "Page not found" }, { status: 404 });

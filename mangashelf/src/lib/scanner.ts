@@ -2,7 +2,8 @@ import { readdir, stat } from "fs/promises";
 import { join, resolve } from "path";
 import { prisma } from "./db";
 import { extractComicInfo, getPageCount } from "./cbz";
-import { extractCover } from "./covers";
+import { extractEpubMetadata, getEpubPageCount, extractEpubCover } from "./epub";
+import { extractCover, extractCoverFromBuffer } from "./covers";
 
 function slugify(text: string): string {
   return text
@@ -12,14 +13,28 @@ function slugify(text: string): string {
 }
 
 function parseChapterNumber(filename: string): number {
+  // Match "Chapter X" pattern
   const match = filename.match(/Chapter\s+(\d+(?:\.\d+)?)/i);
   if (match) return parseFloat(match[1]);
 
-  // Fallback: look for any number pattern before .cbz
-  const numMatch = filename.match(/(\d+(?:\.\d+)?)\s*\.cbz$/i);
+  // Match "Vol. X" pattern for light novels
+  const volMatch = filename.match(/Vol\.?\s*(\d+(?:\.\d+)?)/i);
+  if (volMatch) return parseFloat(volMatch[1]);
+
+  // Fallback: look for any number pattern before extension
+  const numMatch = filename.match(/(\d+(?:\.\d+)?)\s*\.(cbz|epub)$/i);
   if (numMatch) return parseFloat(numMatch[1]);
 
   return 0;
+}
+
+function isBookFile(filename: string): boolean {
+  const lower = filename.toLowerCase();
+  return lower.endsWith(".cbz") || lower.endsWith(".epub");
+}
+
+function isEpub(filename: string): boolean {
+  return filename.toLowerCase().endsWith(".epub");
 }
 
 const TYPE_DIRS: Record<string, string> = {
@@ -160,13 +175,13 @@ async function scanSeries(
   result: ScanResult,
   sourceTag?: string | null
 ) {
-  // Find all CBZ files in this directory
+  // Find all book files (CBZ + EPUB) in this directory
   const files = await readdir(seriesDirPath);
-  const cbzFiles = files
-    .filter((f) => f.toLowerCase().endsWith(".cbz"))
+  const bookFiles = files
+    .filter((f) => isBookFile(f))
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
-  if (cbzFiles.length === 0) return;
+  if (bookFiles.length === 0) return;
 
   // Look up series by slug (primary merge key)
   let series = await prisma.series.findUnique({
@@ -179,18 +194,23 @@ async function scanSeries(
     (c) => c.filePath.startsWith(seriesDirPath)
   ) ?? [];
 
-  // Quick check: if same number of CBZ files as chapters from this directory, skip heavy work
-  const hasNewChapters = !series || cbzFiles.length !== thisDirectoryChapters.length;
+  // Quick check: if same number of book files as chapters from this directory, skip heavy work
+  const hasNewChapters = !series || bookFiles.length !== thisDirectoryChapters.length;
 
-  // Only read ComicInfo from first CBZ when needed:
+  // Only read metadata from first book when needed:
   // - New series (need all metadata)
-  // - Series missing key metadata (backfill from updated CBZ files)
+  // - Series missing key metadata (backfill)
   const needsMetadataRead = !series ||
     !series.genres || !series.description;
 
-  const firstCbzPath = join(seriesDirPath, cbzFiles[0]);
+  const firstBookPath = join(seriesDirPath, bookFiles[0]);
+  const firstIsEpub = isEpub(bookFiles[0]);
+
+  // Extract metadata from first book (CBZ ComicInfo.xml or EPUB OPF)
   const comicInfo = needsMetadataRead
-    ? await extractComicInfo(firstCbzPath)
+    ? (firstIsEpub
+      ? await extractEpubMetadata(firstBookPath)
+      : await extractComicInfo(firstBookPath))
     : null;
 
   // Re-extract cover when there are new chapters, series is new, or cover
@@ -198,9 +218,22 @@ async function scanSeries(
   const needsCoverUpdate = hasNewChapters ||
     !series?.coverPath ||
     series?.coverPath?.startsWith("/covers/");
-  const coverPath = needsCoverUpdate
-    ? await extractCover(seriesSlug, seriesDirPath, firstCbzPath)
-    : series?.coverPath ?? null;
+
+  let coverPath = series?.coverPath ?? null;
+  if (needsCoverUpdate) {
+    if (firstIsEpub) {
+      // Extract cover from EPUB
+      const coverBuffer = await extractEpubCover(firstBookPath);
+      if (coverBuffer) {
+        coverPath = await extractCoverFromBuffer(seriesSlug, coverBuffer);
+      } else {
+        // Try directory-level cover files only
+        coverPath = await extractCover(seriesSlug, seriesDirPath);
+      }
+    } else {
+      coverPath = await extractCover(seriesSlug, seriesDirPath, firstBookPath);
+    }
+  }
 
   if (!series) {
     // Brand new series — create it
@@ -221,7 +254,7 @@ async function scanSeries(
         libraryPath: seriesDirPath,
         publisher: sourceTag || comicInfo?.Publisher || null,
         ageRating: comicInfo?.AgeRating || null,
-        chapterCount: cbzFiles.length,
+        chapterCount: bookFiles.length,
         lastChapterAt: new Date(),
       },
       include: { chapters: true },
@@ -232,8 +265,8 @@ async function scanSeries(
     let backfillLastChapter = undefined;
     if (!series.lastChapterAt) {
       try {
-        const lastCbz = join(seriesDirPath, cbzFiles[cbzFiles.length - 1]);
-        const lastStat = await stat(lastCbz);
+        const lastBook = join(seriesDirPath, bookFiles[bookFiles.length - 1]);
+        const lastStat = await stat(lastBook);
         backfillLastChapter = lastStat.mtime;
       } catch {}
     }
@@ -287,21 +320,29 @@ async function scanSeries(
   const existingPaths = new Set(series.chapters.map((c) => c.filePath));
   let seriesChaptersAdded = 0;
 
-  for (const cbzFile of cbzFiles) {
-    const cbzPath = join(seriesDirPath, cbzFile);
-    const chapterNumber = parseChapterNumber(cbzFile);
+  for (const bookFile of bookFiles) {
+    const bookPath = join(seriesDirPath, bookFile);
+    const chapterNumber = parseChapterNumber(bookFile);
+    const bookIsEpub = isEpub(bookFile);
 
     // Skip if this exact file is already in the DB
-    if (existingPaths.has(cbzPath)) continue;
+    if (existingPaths.has(bookPath)) continue;
 
-    const chapterComicInfo = await extractComicInfo(cbzPath);
-    const pageCount = await getPageCount(cbzPath);
-    const fileStat = await stat(cbzPath);
+    // Extract metadata and page count based on file type
+    const chapterMeta = bookIsEpub
+      ? await extractEpubMetadata(bookPath)
+      : await extractComicInfo(bookPath);
+
+    const pageCount = bookIsEpub
+      ? await getEpubPageCount(bookPath)
+      : await getPageCount(bookPath);
+
+    const fileStat = await stat(bookPath);
 
     let source: string | null = sourceTag || null;
     let sourceUrl: string | null = null;
-    if (chapterComicInfo?.Web) {
-      sourceUrl = String(chapterComicInfo.Web);
+    if (chapterMeta?.Web) {
+      sourceUrl = String(chapterMeta.Web);
       try {
         const url = new URL(sourceUrl);
         const domain = url.hostname.replace(/^www\./, "");
@@ -312,6 +353,8 @@ async function scanSeries(
           "flamecomics.xyz": "FlameComics",
           "drakecomic.org": "DrakeComic",
           "mangadex.org": "MangaDex",
+          "lightnovelpub.com": "LightNovelPub",
+          "novelbin.com": "NovelBin",
         };
         source = domainMap[domain] || source || domain;
       } catch {
@@ -319,14 +362,19 @@ async function scanSeries(
       }
     }
 
+    // Use publisher from EPUB metadata as source if no other source
+    if (!source && bookIsEpub && chapterMeta?.Publisher) {
+      source = chapterMeta.Publisher;
+    }
+
     await prisma.chapter.upsert({
-      where: { filePath: cbzPath },
+      where: { filePath: bookPath },
       create: {
         seriesId: series.id,
         number: chapterNumber,
-        title: chapterComicInfo?.Title != null ? String(chapterComicInfo.Title) : null,
+        title: chapterMeta?.Title != null ? String(chapterMeta.Title) : null,
         pageCount,
-        filePath: cbzPath,
+        filePath: bookPath,
         fileSize: fileStat.size,
         source,
         sourceUrl,
