@@ -22,6 +22,11 @@ export async function GET(
           sourceUrl: true,
         },
       },
+      libraryPaths: {
+        select: {
+          source: true,
+        },
+      },
     },
   });
 

@@ -52,9 +52,9 @@ model InviteCode {
 }
 
 model Series {
-  id             String      @id @default(cuid())
+  id             String       @id @default(cuid())
   title          String
-  slug           String      @unique
+  slug           String       @unique
   description    String?
   author         String?
   artist         String?
@@ -63,16 +63,27 @@ model Series {
   genres         String?
   rating         Float?
   coverPath      String?
-  libraryPath    String      @unique
+  libraryPath    String       @unique
   publisher      String?
   ageRating      String?
-  chapterCount   Int         @default(0)
+  chapterCount   Int          @default(0)
   lastChapterAt  DateTime?
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
   chapters       Chapter[]
   follows        Follow[]
   listEntries    ListEntry[]
+  libraryPaths   SeriesPath[]
+}
+
+model SeriesPath {
+  id       String @id @default(cuid())
+  seriesId String
+  path     String @unique
+  source   String?
+  series   Series @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  @@index([seriesId])
 }
 
 model Chapter {

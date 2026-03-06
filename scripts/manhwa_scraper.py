@@ -2530,31 +2530,55 @@ class ManhuaToScraper(BaseSiteScraper):
             self._apply_flaresolverr_cookies(cookies, user_agent)
             return BeautifulSoup(html, 'html.parser')
 
-    def get_all_series(self, content_type: str = None) -> List[Series]:
-        """Get all series from ManhuaTo"""
-        logger.info("Fetching all series from ManhuaTo...")
-        
+    def get_all_series(self, content_type: str = None, genre_filter: List[str] = None) -> List[Series]:
+        """Get all series from ManhuaTo.
+
+        If genre_filter is provided (e.g. ['action', 'fantasy']), browse
+        the /genre/{genre} pages instead of /type/ pages.  This is MUCH
+        more comprehensive — /genre/action alone has 55+ pages.
+        """
         all_series = []
         seen_urls = set()
-        
-        # If specific type requested, only scrape that
+
+        # Determine what to browse: genres or types
+        if genre_filter:
+            # Map filter terms to ManhuaTo genre slugs
+            genre_slugs = []
+            for term in genre_filter:
+                slug = term.lower().replace(' ', '-')
+                if slug in [g.lower() for g in self.GENRES]:
+                    genre_slugs.append(slug)
+            if genre_slugs:
+                logger.info(f"Browsing ManhuaTo by genres: {genre_slugs}")
+                return self._browse_pages(genre_slugs, 'genre', seen_urls)
+            # If no valid genres matched, fall through to type browsing
+
+        logger.info("Fetching all series from ManhuaTo by type...")
         types_to_scrape = [content_type] if content_type else self.TYPES
-        
-        for ctype in types_to_scrape:
-            logger.info(f"Fetching type: {ctype}")
+        return self._browse_pages(types_to_scrape, 'type', seen_urls)
+
+    def _browse_pages(self, categories: List[str], browse_type: str,
+                      seen_urls: set) -> List[Series]:
+        """Browse ManhuaTo pages by type or genre.
+
+        browse_type: 'type' for /type/{cat} or 'genre' for /genre/{cat}
+        """
+        all_series = []
+
+        for category in categories:
+            logger.info(f"Fetching {browse_type}: {category}")
             page = 1
             consecutive_failures = 0
-            
-            # Initialize driver for this content type
+
+            # Initialize driver for this category
             self._close_driver()
-            
+
             while True:
-                # Use the correct URL structure: /type/{type}?page=N
                 if page > 1:
-                    url = f"{self.BASE_URL}/type/{ctype}?page={page}"
+                    url = f"{self.BASE_URL}/{browse_type}/{category}?page={page}"
                 else:
-                    url = f"{self.BASE_URL}/type/{ctype}"
-                logger.info(f"Fetching page {page} for {ctype}...")
+                    url = f"{self.BASE_URL}/{browse_type}/{category}"
+                logger.info(f"Fetching page {page} for {category}...")
                 
                 try:
                     if self._use_flaresolverr:
@@ -2629,7 +2653,7 @@ class ManhuaToScraper(BaseSiteScraper):
                                     title=title,
                                     url=full_url,
                                     source=self.SITE_NAME,
-                                    genres=[ctype.title()]
+                                    genres=[category.title()]
                                 )
                                 all_series.append(series)
                                 found_count += 1
@@ -2656,7 +2680,7 @@ class ManhuaToScraper(BaseSiteScraper):
                     
                     # Safety limit per type
                     if page > 200:
-                        logger.warning(f"Reached page limit for {ctype}")
+                        logger.warning(f"Reached page limit for {category}")
                         break
                     
                     time.sleep(0.5)  # Be nice to server
@@ -2667,7 +2691,7 @@ class ManhuaToScraper(BaseSiteScraper):
                     self._close_driver()
                     consecutive_failures += 1
                     if consecutive_failures >= 3:
-                        logger.error(f"Too many failures for {ctype}, moving to next type")
+                        logger.error(f"Too many failures for {category}, moving to next")
                         break
                     continue
             
@@ -3638,16 +3662,23 @@ Examples:
                 logger.info(f"{'='*50}")
                 
                 try:
-                    series_list = scraper.get_all_series()
-                    
+                    # For ManhuaTo, pass filter terms as genre_filter for server-side genre browsing
+                    filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
+                    if isinstance(scraper, ManhuaToScraper) and filter_terms:
+                        series_list = scraper.get_all_series(genre_filter=filter_terms)
+                    else:
+                        series_list = scraper.get_all_series()
+
                     # Always add source prefix in "all" mode for clarity
                     for s in series_list:
                         s.source = site_name
-                    
+
                     # Apply keyword filters (title/genre based - can be done before enrichment)
+                    # For ManhuaTo with genre_filter, skip re-filtering since genres were used for browsing
                     if args.filter or args.filter_all:
-                        series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
-                    
+                        if not (isinstance(scraper, ManhuaToScraper) and filter_terms):
+                            series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+
                     # Fetch chapter counts and status if needed
                     needs_enrichment = args.with_chapters or args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
                     if needs_enrichment:
@@ -3684,14 +3715,20 @@ Examples:
         
         # Single site mode
         scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit)
-        series_list = scraper.get_all_series()
-        
+        filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
+        if isinstance(scraper, ManhuaToScraper) and filter_terms:
+            series_list = scraper.get_all_series(genre_filter=filter_terms)
+        else:
+            series_list = scraper.get_all_series()
+
         # Apply keyword filters (title/genre based - can be done before enrichment)
+        # For ManhuaTo with genre_filter, skip re-filtering since genres were used for browsing
         if args.filter or args.filter_all:
-            before_count = len(series_list)
-            series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
-            logger.info(f"Filtered from {before_count} to {len(series_list)} series by keywords")
-        
+            if not (isinstance(scraper, ManhuaToScraper) and filter_terms):
+                before_count = len(series_list)
+                series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+                logger.info(f"Filtered from {before_count} to {len(series_list)} series by keywords")
+
         # Fetch chapter counts and status if needed
         needs_enrichment = args.with_chapters or args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
         if needs_enrichment:
@@ -3739,16 +3776,23 @@ Examples:
                 logger.info(f"{'='*50}")
                 
                 try:
-                    series_list = scraper.get_all_series()
-                    
+                    # For ManhuaTo, pass filter terms as genre_filter for server-side genre browsing
+                    filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
+                    if isinstance(scraper, ManhuaToScraper) and filter_terms:
+                        series_list = scraper.get_all_series(genre_filter=filter_terms)
+                    else:
+                        series_list = scraper.get_all_series()
+
                     # Set source for all series
                     for s in series_list:
                         s.source = site_name
-                    
+
                     # Apply keyword filters (title/genre based)
+                    # For ManhuaTo with genre_filter, skip re-filtering since genres were used for browsing
                     if args.filter or args.filter_all:
-                        series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
-                        logger.info(f"Filtered to {len(series_list)} series by keywords")
+                        if not (isinstance(scraper, ManhuaToScraper) and filter_terms):
+                            series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+                            logger.info(f"Filtered to {len(series_list)} series by keywords")
                     
                     # Fetch details if needed for filtering
                     needs_enrichment = args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
@@ -3813,13 +3857,19 @@ Examples:
         
         # Single site mode
         scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit)
-        series_list = scraper.get_all_series()
-        
+        filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
+        if isinstance(scraper, ManhuaToScraper) and filter_terms:
+            series_list = scraper.get_all_series(genre_filter=filter_terms)
+        else:
+            series_list = scraper.get_all_series()
+
         # Apply keyword filters (title/genre based)
+        # For ManhuaTo with genre_filter, skip re-filtering since genres were used for browsing
         if args.filter or args.filter_all:
-            series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
-            logger.info(f"Filtered to {len(series_list)} series by keywords")
-        
+            if not (isinstance(scraper, ManhuaToScraper) and filter_terms):
+                series_list = apply_keyword_filters(series_list, args.filter, args.filter_all, None)
+                logger.info(f"Filtered to {len(series_list)} series by keywords")
+
         # Fetch details if needed for filtering
         needs_enrichment = args.min_chapters > 0 or args.max_chapters or args.status or args.min_rating > 0
         if needs_enrichment:

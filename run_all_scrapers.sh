@@ -21,19 +21,19 @@ else
 fi
 
 echo "=== Asura Scans ==="
-python3 scripts/manhwa_scraper.py --site asura --download-all --source-prefix -o ./library/Manhwa
-
-echo "=== Flame Comics ==="
-python3 scripts/manhwa_scraper.py --site flame --download-all --source-prefix -o ./library/Manhwa
-
-echo "=== Drake Comics ==="
-python3 scripts/manhwa_scraper.py --site drake --download-all --source-prefix -o ./library/Manhwa
+python3 scripts/manhwa_scraper.py --site asura --download-all --filter "action,fantasy,adventure" --source-prefix -o ./library/Manhwa
 
 echo "=== ManhuaTo ==="
-python3 scripts/manhwa_scraper.py --site manhuato --download-all --source-prefix -o ./library/Manhua
+python3 scripts/manhwa_scraper.py --site manhuato --download-all --filter "action,fantasy,adventure" --source-prefix -o ./library/Manhua
 
 echo "=== Webtoon ==="
-python3 scripts/manhwa_scraper.py --site webtoon --download-all --source-prefix -o ./library/Manhwa
+python3 scripts/manhwa_scraper.py --site webtoon --download-all --filter "action,fantasy,adventure" --source-prefix -o ./library/Manhwa
+
+echo "=== Flame Comics ==="
+python3 scripts/manhwa_scraper.py --site flame --download-all --filter "action,fantasy,adventure" --source-prefix -o ./library/Manhwa
+
+echo "=== Drake Comics ==="
+python3 scripts/manhwa_scraper.py --site drake --download-all --filter "action,fantasy,adventure" --source-prefix -o ./library/Manhwa
 
 echo "=== LightNovelPub ==="
 python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 --source-prefix -o ./library/LightNovels

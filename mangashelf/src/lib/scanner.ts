@@ -39,6 +39,7 @@ export interface ScanResult {
 export interface ScanCleanup {
   seriesRemoved: number;
   chaptersRemoved: number;
+  pathsRemoved: number;
 }
 
 export async function scanLibrary(
@@ -72,11 +73,16 @@ export async function scanLibrary(
 
       const seriesDirPath = join(typePath, entry.name);
       validLibraryPaths.add(seriesDirPath);
-      const seriesTitle = entry.name;
+
+      // Strip [Source] prefix from directory name to get clean title
+      // e.g. "[Asura] Solo Leveling" -> title: "Solo Leveling", source: "Asura"
+      const prefixMatch = entry.name.match(/^\[([^\]]+)\]\s*(.+)$/);
+      const seriesTitle = prefixMatch ? prefixMatch[2] : entry.name;
+      const dirSourceTag = prefixMatch ? prefixMatch[1] : null;
       const seriesSlug = slugify(seriesTitle);
 
       try {
-        await scanSeries(seriesDirPath, seriesTitle, seriesSlug, type, result);
+        await scanSeries(seriesDirPath, seriesTitle, seriesSlug, type, result, dirSourceTag);
       } catch (err) {
         result.errors.push(
           `Error scanning ${seriesTitle}: ${err instanceof Error ? err.message : String(err)}`
@@ -85,11 +91,11 @@ export async function scanLibrary(
     }
   }
 
-  // Remove series from DB that no longer exist on disk
+  // Remove series/paths from DB that no longer exist on disk
   const cleanup = await cleanupDeletedSeries(validLibraryPaths);
-  if (cleanup.seriesRemoved > 0) {
+  if (cleanup.seriesRemoved > 0 || cleanup.pathsRemoved > 0) {
     console.log(
-      `Cleanup: removed ${cleanup.seriesRemoved} series (${cleanup.chaptersRemoved} chapters) no longer on disk`
+      `Cleanup: removed ${cleanup.pathsRemoved} paths, ${cleanup.seriesRemoved} series (${cleanup.chaptersRemoved} chapters) no longer on disk`
     );
   }
 
@@ -99,24 +105,51 @@ export async function scanLibrary(
 async function cleanupDeletedSeries(
   validPaths: Set<string>
 ): Promise<ScanCleanup> {
-  const allSeries = await prisma.series.findMany({
-    select: { id: true, title: true, libraryPath: true, _count: { select: { chapters: true } } },
-  });
-
   let seriesRemoved = 0;
   let chaptersRemoved = 0;
+  let pathsRemoved = 0;
 
-  for (const series of allSeries) {
-    if (!validPaths.has(series.libraryPath)) {
-      // Series folder no longer exists — delete from DB (chapters cascade)
-      console.log(`Removing deleted series: ${series.title}`);
-      await prisma.series.delete({ where: { id: series.id } });
-      seriesRemoved++;
-      chaptersRemoved += series._count.chapters;
+  // 1. Clean up SeriesPath entries for directories no longer on disk
+  const allSeriesPaths = await prisma.seriesPath.findMany({
+    include: { series: { select: { id: true, title: true } } },
+  });
+
+  for (const sp of allSeriesPaths) {
+    if (!validPaths.has(sp.path)) {
+      // Delete chapters from this specific directory
+      const deleted = await prisma.chapter.deleteMany({
+        where: {
+          seriesId: sp.seriesId,
+          filePath: { startsWith: sp.path },
+        },
+      });
+      chaptersRemoved += deleted.count;
+
+      console.log(`Removing deleted path: ${sp.path} (${deleted.count} chapters)`);
+      await prisma.seriesPath.delete({ where: { id: sp.id } });
+      pathsRemoved++;
     }
   }
 
-  return { seriesRemoved, chaptersRemoved };
+  // 2. Remove series with no remaining paths whose primary libraryPath is also gone
+  // (Keeps legacy series that haven't been scanned yet with new code)
+  const orphanSeries = await prisma.series.findMany({
+    where: {
+      libraryPaths: { none: {} },
+    },
+    select: { id: true, title: true, libraryPath: true, _count: { select: { chapters: true } } },
+  });
+
+  for (const s of orphanSeries) {
+    if (!validPaths.has(s.libraryPath)) {
+      console.log(`Removing orphan series: ${s.title}`);
+      await prisma.series.delete({ where: { id: s.id } });
+      seriesRemoved++;
+      chaptersRemoved += s._count.chapters;
+    }
+  }
+
+  return { seriesRemoved, chaptersRemoved, pathsRemoved };
 }
 
 async function scanSeries(
@@ -124,9 +157,10 @@ async function scanSeries(
   seriesTitle: string,
   seriesSlug: string,
   type: string,
-  result: ScanResult
+  result: ScanResult,
+  sourceTag?: string | null
 ) {
-  // Find all CBZ files
+  // Find all CBZ files in this directory
   const files = await readdir(seriesDirPath);
   const cbzFiles = files
     .filter((f) => f.toLowerCase().endsWith(".cbz"))
@@ -134,14 +168,19 @@ async function scanSeries(
 
   if (cbzFiles.length === 0) return;
 
-  // Check if series exists
+  // Look up series by slug (primary merge key)
   let series = await prisma.series.findUnique({
-    where: { libraryPath: seriesDirPath },
+    where: { slug: seriesSlug },
     include: { chapters: true },
   });
 
-  // Quick check: if series exists and chapter count hasn't changed, skip heavy work
-  const hasNewChapters = !series || cbzFiles.length !== series.chapters.length;
+  // Count chapters from THIS directory only (for accurate change detection)
+  const thisDirectoryChapters = series?.chapters.filter(
+    (c) => c.filePath.startsWith(seriesDirPath)
+  ) ?? [];
+
+  // Quick check: if same number of CBZ files as chapters from this directory, skip heavy work
+  const hasNewChapters = !series || cbzFiles.length !== thisDirectoryChapters.length;
 
   // Only read ComicInfo from first CBZ when needed:
   // - New series (need all metadata)
@@ -164,53 +203,30 @@ async function scanSeries(
     : series?.coverPath ?? null;
 
   if (!series) {
-    // Create or update series (upsert by slug to handle library path changes)
-    const existingBySlug = await prisma.series.findUnique({
-      where: { slug: seriesSlug },
+    // Brand new series — create it
+    series = await prisma.series.create({
+      data: {
+        title: comicInfo?.Series || seriesTitle,
+        slug: seriesSlug,
+        description: comicInfo?.Summary || null,
+        author: comicInfo?.Writer || null,
+        artist: comicInfo?.Penciller || null,
+        status: parseStatus(comicInfo?.Notes),
+        type,
+        genres: comicInfo?.Genre || null,
+        rating: comicInfo?.CommunityRating
+          ? parseFloat(comicInfo.CommunityRating)
+          : null,
+        coverPath,
+        libraryPath: seriesDirPath,
+        publisher: sourceTag || comicInfo?.Publisher || null,
+        ageRating: comicInfo?.AgeRating || null,
+        chapterCount: cbzFiles.length,
+        lastChapterAt: new Date(),
+      },
       include: { chapters: true },
     });
-
-    if (existingBySlug) {
-      // Series exists with different libraryPath (e.g. migrated to new machine)
-      await prisma.series.update({
-        where: { id: existingBySlug.id },
-        data: {
-          libraryPath: seriesDirPath,
-          chapterCount: cbzFiles.length,
-          coverPath: coverPath || existingBySlug.coverPath,
-          description: comicInfo?.Summary || existingBySlug.description,
-          author: comicInfo?.Writer || existingBySlug.author,
-          artist: comicInfo?.Penciller || existingBySlug.artist,
-          genres: comicInfo?.Genre || existingBySlug.genres,
-        },
-      });
-      series = { ...existingBySlug, libraryPath: seriesDirPath };
-      result.seriesUpdated++;
-    } else {
-      series = await prisma.series.create({
-        data: {
-          title: comicInfo?.Series || seriesTitle,
-          slug: seriesSlug,
-          description: comicInfo?.Summary || null,
-          author: comicInfo?.Writer || null,
-          artist: comicInfo?.Penciller || null,
-          status: parseStatus(comicInfo?.Notes),
-          type,
-          genres: comicInfo?.Genre || null,
-          rating: comicInfo?.CommunityRating
-            ? parseFloat(comicInfo.CommunityRating)
-            : null,
-          coverPath,
-          libraryPath: seriesDirPath,
-          publisher: comicInfo?.Publisher || null,
-          ageRating: comicInfo?.AgeRating || null,
-          chapterCount: cbzFiles.length,
-          lastChapterAt: new Date(),
-        },
-        include: { chapters: true },
-      });
-      result.seriesAdded++;
-    }
+    result.seriesAdded++;
   } else if (hasNewChapters || needsMetadataRead) {
     // Backfill lastChapterAt for series that existed before this field was added
     let backfillLastChapter = undefined;
@@ -222,12 +238,15 @@ async function scanSeries(
       } catch {}
     }
 
-    // Update series metadata
+    // Update series metadata (don't change libraryPath — keep the primary one)
     await prisma.series.update({
       where: { id: series.id },
       data: {
-        chapterCount: cbzFiles.length,
+        title: seriesTitle,
         coverPath: coverPath || series.coverPath,
+        ...(sourceTag && !series.publisher
+          ? { publisher: sourceTag }
+          : {}),
         ...(comicInfo?.Summary && !series.description
           ? { description: comicInfo.Summary }
           : {}),
@@ -246,13 +265,25 @@ async function scanSeries(
     result.seriesUpdated++;
   }
 
-  // If no new chapters, skip the per-chapter loop entirely
+  // Track this directory as a source path for the series
+  await prisma.seriesPath.upsert({
+    where: { path: seriesDirPath },
+    create: {
+      seriesId: series.id,
+      path: seriesDirPath,
+      source: sourceTag || null,
+    },
+    update: {
+      seriesId: series.id,
+      source: sourceTag || null,
+    },
+  });
+
+  // If no new chapters from this directory, skip the per-chapter loop
   if (!hasNewChapters) return;
 
-  // Scan chapters — match by number to handle library path migrations
-  const existingByNumber = new Map(
-    series.chapters.map((c) => [c.number, c])
-  );
+  // Scan chapters — only match by filePath (not by number)
+  // This allows same chapter number from different sources to coexist
   const existingPaths = new Set(series.chapters.map((c) => c.filePath));
   let seriesChaptersAdded = 0;
 
@@ -260,30 +291,14 @@ async function scanSeries(
     const cbzPath = join(seriesDirPath, cbzFile);
     const chapterNumber = parseChapterNumber(cbzFile);
 
-    // Check if chapter already exists (by path or number)
-    const existingByPath = existingPaths.has(cbzPath);
-    const existingChapter = existingByNumber.get(chapterNumber);
-
-    if (existingByPath || existingChapter) {
-      const existing = existingChapter ||
-        series.chapters.find((c: { filePath: string }) => c.filePath === cbzPath);
-      if (existing) {
-        // Only update if the file path changed (library migration)
-        if (existing.filePath !== cbzPath) {
-          await prisma.chapter.update({
-            where: { id: existing.id },
-            data: { filePath: cbzPath },
-          });
-        }
-      }
-      continue;
-    }
+    // Skip if this exact file is already in the DB
+    if (existingPaths.has(cbzPath)) continue;
 
     const chapterComicInfo = await extractComicInfo(cbzPath);
     const pageCount = await getPageCount(cbzPath);
     const fileStat = await stat(cbzPath);
 
-    let source: string | null = null;
+    let source: string | null = sourceTag || null;
     let sourceUrl: string | null = null;
     if (chapterComicInfo?.Web) {
       sourceUrl = String(chapterComicInfo.Web);
@@ -298,42 +313,47 @@ async function scanSeries(
           "drakecomic.org": "DrakeComic",
           "mangadex.org": "MangaDex",
         };
-        source = domainMap[domain] || domain;
+        source = domainMap[domain] || source || domain;
       } catch {
-        source = null;
+        // Keep sourceTag as source
       }
     }
 
-    const chapterData = {
-      seriesId: series.id,
-      number: chapterNumber,
-      title: chapterComicInfo?.Title != null ? String(chapterComicInfo.Title) : null,
-      pageCount,
-      filePath: cbzPath,
-      fileSize: fileStat.size,
-      source,
-      sourceUrl,
-    };
-
     await prisma.chapter.upsert({
       where: { filePath: cbzPath },
-      create: chapterData,
+      create: {
+        seriesId: series.id,
+        number: chapterNumber,
+        title: chapterComicInfo?.Title != null ? String(chapterComicInfo.Title) : null,
+        pageCount,
+        filePath: cbzPath,
+        fileSize: fileStat.size,
+        source,
+        sourceUrl,
+      },
       update: {
         seriesId: series.id,
         number: chapterNumber,
         pageCount,
         fileSize: fileStat.size,
+        source,
       },
     });
     result.chaptersAdded++;
     seriesChaptersAdded++;
   }
 
-  // Update lastChapterAt if new chapters were added
+  // Update chapterCount to reflect total chapters across ALL source directories
   if (seriesChaptersAdded > 0) {
+    const totalChapters = await prisma.chapter.count({
+      where: { seriesId: series.id },
+    });
     await prisma.series.update({
       where: { id: series.id },
-      data: { lastChapterAt: new Date() },
+      data: {
+        chapterCount: totalChapters,
+        lastChapterAt: new Date(),
+      },
     });
   }
 }
