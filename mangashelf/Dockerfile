@@ -34,9 +34,13 @@ COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
+COPY --from=builder /app/node_modules/prisma ./node_modules/prisma
 
-# Create data directory for SQLite
+# Create data directory for SQLite and startup script
 RUN mkdir -p /app/data /app/public/covers && chown -R nextjs:nodejs /app/data /app/public/covers
+
+# Startup script: apply schema migrations then start server
+RUN printf '#!/bin/sh\necho "Applying database migrations..."\nnode node_modules/prisma/build/index.js db push --skip-generate 2>&1 || echo "Warning: migration failed"\nexec node server.js\n' > /app/start.sh && chmod +x /app/start.sh
 
 USER nextjs
 
@@ -44,4 +48,4 @@ EXPOSE 3000
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
-CMD ["node", "server.js"]
+CMD ["/app/start.sh"]
