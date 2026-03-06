@@ -183,11 +183,65 @@ async function scanSeries(
 
   if (bookFiles.length === 0) return;
 
-  // Look up series by slug (primary merge key)
+  // Look up series by slug (primary merge key for cross-source merging)
   let series = await prisma.series.findUnique({
     where: { slug: seriesSlug },
     include: { chapters: true },
   });
+
+  // Fallback: look up by libraryPath for backward compatibility
+  // Old DB entries may have slugs that include [Source] prefix (e.g. "asura-solo-leveling")
+  // while the new scanner generates stripped slugs (e.g. "solo-leveling")
+  if (!series) {
+    const existingByPath = await prisma.series.findFirst({
+      where: { libraryPath: seriesDirPath },
+      include: { chapters: true },
+    });
+
+    if (existingByPath) {
+      // Found by path but not by slug — migrate to new stripped slug/title
+      try {
+        await prisma.series.update({
+          where: { id: existingByPath.id },
+          data: { slug: seriesSlug, title: seriesTitle },
+        });
+        console.log(`Migrated series: "${existingByPath.title}" → "${seriesTitle}" (slug: ${existingByPath.slug} → ${seriesSlug})`);
+        existingByPath.slug = seriesSlug;
+        existingByPath.title = seriesTitle;
+        series = existingByPath;
+      } catch {
+        // Slug collision: another series already has this slug (e.g. from a different source dir)
+        // Merge this series' chapters into that canonical series
+        const canonical = await prisma.series.findUnique({
+          where: { slug: seriesSlug },
+          include: { chapters: true },
+        });
+        if (canonical) {
+          console.log(`Merging duplicate series "${existingByPath.title}" into "${canonical.title}"`);
+          // Move chapters from old series to canonical
+          await prisma.chapter.updateMany({
+            where: { seriesId: existingByPath.id },
+            data: { seriesId: canonical.id },
+          });
+          // Move SeriesPath entries
+          await prisma.seriesPath.updateMany({
+            where: { seriesId: existingByPath.id },
+            data: { seriesId: canonical.id },
+          }).catch(() => {});
+          // Delete old duplicate (cascades remaining relations)
+          await prisma.series.delete({ where: { id: existingByPath.id } });
+          // Refresh canonical with merged chapters
+          series = await prisma.series.findUnique({
+            where: { id: canonical.id },
+            include: { chapters: true },
+          });
+        } else {
+          // Shouldn't happen, but use the existing series as-is
+          series = existingByPath;
+        }
+      }
+    }
+  }
 
   // Count chapters from THIS directory only (for accurate change detection)
   const thisDirectoryChapters = series?.chapters.filter(
