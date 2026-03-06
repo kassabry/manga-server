@@ -25,6 +25,7 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV DATABASE_URL="file:../data/mangashelf.db"
 
+RUN apk add --no-cache sqlite
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 
@@ -34,13 +35,18 @@ COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
+
+# Generate SQL migration script from Prisma schema at build time
 COPY --from=builder /app/node_modules/prisma ./node_modules/prisma
+RUN node node_modules/prisma/build/index.js migrate diff \
+      --from-empty --to-schema-datamodel prisma/schema.prisma \
+      --script > /app/prisma/full_schema.sql 2>/dev/null || true
 
 # Create data directory for SQLite and startup script
 RUN mkdir -p /app/data /app/public/covers && chown -R nextjs:nodejs /app/data /app/public/covers
 
-# Startup script: apply schema migrations then start server
-RUN printf '#!/bin/sh\necho "Applying database migrations..."\nnode node_modules/prisma/build/index.js db push --skip-generate 2>&1 || echo "Warning: migration failed"\nexec node server.js\n' > /app/start.sh && chmod +x /app/start.sh
+# Startup script: ensure all tables exist then start server
+RUN printf '#!/bin/sh\necho "Ensuring database schema..."\nif [ -f /app/prisma/full_schema.sql ] && [ -s /app/prisma/full_schema.sql ]; then\n  sqlite3 /app/data/mangashelf.db < /app/prisma/full_schema.sql 2>/dev/null || true\nfi\n# Ensure SeriesPath table exists (critical for scanner)\nsqlite3 /app/data/mangashelf.db "CREATE TABLE IF NOT EXISTS \\\"SeriesPath\\\" (\\\"id\\\" TEXT NOT NULL PRIMARY KEY, \\\"seriesId\\\" TEXT NOT NULL, \\\"path\\\" TEXT NOT NULL, \\\"source\\\" TEXT, CONSTRAINT \\\"SeriesPath_seriesId_fkey\\\" FOREIGN KEY (\\\"seriesId\\\") REFERENCES \\\"Series\\\" (\\\"id\\\") ON DELETE CASCADE ON UPDATE CASCADE); CREATE UNIQUE INDEX IF NOT EXISTS \\\"SeriesPath_path_key\\\" ON \\\"SeriesPath\\\"(\\\"path\\\"); CREATE INDEX IF NOT EXISTS \\\"SeriesPath_seriesId_idx\\\" ON \\\"SeriesPath\\\"(\\\"seriesId\\\");" 2>/dev/null || true\necho "Database ready"\nexec node server.js\n' > /app/start.sh && chmod +x /app/start.sh
 
 USER nextjs
 
