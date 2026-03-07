@@ -37,6 +37,30 @@ function isEpub(filename: string): boolean {
   return filename.toLowerCase().endsWith(".epub");
 }
 
+// Normalize source tag casing so "Manhuato" and "ManhuaTo" are treated the same
+const SOURCE_NORMALIZE: Record<string, string> = {
+  manhuato: "ManhuaTo",
+  asura: "AsuraScans",
+  asurascans: "AsuraScans",
+  flame: "FlameComics",
+  flamecomics: "FlameComics",
+  drake: "DrakeComic",
+  drakecomic: "DrakeComic",
+  mangadex: "MangaDex",
+  lightnovelpub: "LightNovelPub",
+  novelbin: "NovelBin",
+  webtoon: "Webtoon",
+};
+
+function normalizeSource(raw: string): string {
+  return SOURCE_NORMALIZE[raw.toLowerCase()] || raw;
+}
+
+// Strip [Source] prefix from a title string (e.g. from ComicInfo.xml metadata)
+function stripSourcePrefix(title: string): string {
+  return title.replace(/^\[[^\]]+\]\s*/, "");
+}
+
 const TYPE_DIRS: Record<string, string> = {
   Manga: "Manga",
   Manhwa: "Manhwa",
@@ -93,7 +117,7 @@ export async function scanLibrary(
       // e.g. "[Asura] Solo Leveling" -> title: "Solo Leveling", source: "Asura"
       const prefixMatch = entry.name.match(/^\[([^\]]+)\]\s*(.+)$/);
       const seriesTitle = prefixMatch ? prefixMatch[2] : entry.name;
-      const dirSourceTag = prefixMatch ? prefixMatch[1] : null;
+      const dirSourceTag = prefixMatch ? normalizeSource(prefixMatch[1]) : null;
       const seriesSlug = slugify(seriesTitle);
 
       try {
@@ -289,11 +313,21 @@ async function scanSeries(
     }
   }
 
+  // Force-update title if it still has a [Source] prefix (from old scans or ComicInfo metadata)
+  if (series && /^\[.+\]/.test(series.title) && series.title !== seriesTitle) {
+    await prisma.series.update({
+      where: { id: series.id },
+      data: { title: seriesTitle },
+    });
+    series.title = seriesTitle;
+  }
+
   if (!series) {
     // Brand new series — create it
+    const cleanMetaTitle = comicInfo?.Series ? stripSourcePrefix(comicInfo.Series) : null;
     series = await prisma.series.create({
       data: {
-        title: comicInfo?.Series || seriesTitle,
+        title: cleanMetaTitle || seriesTitle,
         slug: seriesSlug,
         description: comicInfo?.Summary || null,
         author: comicInfo?.Writer || null,
@@ -353,16 +387,17 @@ async function scanSeries(
   }
 
   // Track this directory as a source path for the series
+  const normalizedSourceTag = sourceTag ? normalizeSource(sourceTag) : null;
   await prisma.seriesPath.upsert({
     where: { path: seriesDirPath },
     create: {
       seriesId: series.id,
       path: seriesDirPath,
-      source: sourceTag || null,
+      source: normalizedSourceTag,
     },
     update: {
       seriesId: series.id,
-      source: sourceTag || null,
+      source: normalizedSourceTag,
     },
   });
 
@@ -393,7 +428,7 @@ async function scanSeries(
 
     const fileStat = await stat(bookPath);
 
-    let source: string | null = sourceTag || null;
+    let source: string | null = sourceTag ? normalizeSource(sourceTag) : null;
     let sourceUrl: string | null = null;
     if (chapterMeta?.Web) {
       sourceUrl = String(chapterMeta.Web);
@@ -443,6 +478,20 @@ async function scanSeries(
     });
     result.chaptersAdded++;
     seriesChaptersAdded++;
+  }
+
+  // Normalize source tags on existing chapters from this directory
+  // Fixes inconsistent casing like "Manhuato" → "ManhuaTo"
+  if (sourceTag) {
+    const normalized = normalizeSource(sourceTag);
+    await prisma.chapter.updateMany({
+      where: {
+        seriesId: series.id,
+        filePath: { startsWith: seriesDirPath },
+        source: { not: normalized },
+      },
+      data: { source: normalized },
+    });
   }
 
   // Update chapterCount to reflect total chapters across ALL source directories
