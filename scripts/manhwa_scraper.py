@@ -741,34 +741,34 @@ class BaseSiteScraper:
             '.author', '[class*="author"]', 'span:contains("Author")',
             '.writer', '[class*="writer"]'
         ]
-        
+
         for selector in author_selectors:
             try:
                 elem = soup.select_one(selector)
                 if elem:
                     text = elem.get_text(strip=True)
-                    # Clean up common prefixes
-                    text = re.sub(r'^(Author|Writer|By)[:\s]*', '', text, flags=re.I)
-                    if text and len(text) < 100:
+                    # Clean up common prefixes (including plurals like "Authors:")
+                    text = re.sub(r'^(Authors?|Writers?|By)[:\s]*', '', text, flags=re.I)
+                    if text and len(text) > 1 and len(text) < 100:
                         return text
             except:
                 continue
         return ""
-    
+
     def _extract_artist_from_soup(self, soup) -> str:
         """Extract artist from parsed soup"""
         artist_selectors = [
             '.artist', '[class*="artist"]', 'span:contains("Artist")',
             '.illustrator', '[class*="illustrator"]'
         ]
-        
+
         for selector in artist_selectors:
             try:
                 elem = soup.select_one(selector)
                 if elem:
                     text = elem.get_text(strip=True)
-                    text = re.sub(r'^(Artist|Illustrator)[:\s]*', '', text, flags=re.I)
-                    if text and len(text) < 100:
+                    text = re.sub(r'^(Artists?|Illustrators?)[:\s]*', '', text, flags=re.I)
+                    if text and len(text) > 1 and len(text) < 100:
                         return text
             except:
                 continue

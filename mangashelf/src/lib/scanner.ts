@@ -61,6 +61,38 @@ function stripSourcePrefix(title: string): string {
   return title.replace(/^\[[^\]]+\]\s*/, "");
 }
 
+/**
+ * Detect a more accurate type (Manga/Manhwa/Manhua) from genre tags.
+ * ManhuaTo hosts all types but files end up in the Manhua/ directory.
+ * Genre tags like "Manga", "Manhwa", "Manhua", "Comics" indicate the real type.
+ */
+function detectTypeFromGenres(genres: string | null, fallback: string): string {
+  if (!genres) return fallback;
+  const lower = genres.toLowerCase();
+  // Split on commas and check each genre tag
+  const tags = lower.split(",").map((g) => g.trim());
+  // Exact match priority: "manga" > "manhwa" > "manhua"
+  if (tags.includes("manga")) return "Manga";
+  if (tags.includes("manhwa")) return "Manhwa";
+  if (tags.includes("manhua")) return "Manhua";
+  return fallback;
+}
+
+/**
+ * Sanitize author/artist values that are obviously garbage from scraping.
+ * Examples: "s:", "s", single chars, just punctuation, etc.
+ */
+function sanitizePersonName(name: string | null | undefined): string | null {
+  if (!name) return null;
+  // Strip leading/trailing whitespace
+  const trimmed = name.trim();
+  // Reject if too short (single char + optional punctuation)
+  if (trimmed.length <= 2) return null;
+  // Reject if it's just punctuation/symbols
+  if (/^[\W_]+$/.test(trimmed)) return null;
+  return trimmed;
+}
+
 const TYPE_DIRS: Record<string, string> = {
   Manga: "Manga",
   Manhwa: "Manhwa",
@@ -322,6 +354,22 @@ async function scanSeries(
     series.title = seriesTitle;
   }
 
+  // Detect accurate type from genre tags (e.g. ManhuaTo puts everything in Manhua/ but
+  // genres contain "Manga", "Manhwa" etc. to indicate the real type)
+  const genreStr = comicInfo?.Genre || series?.genres || null;
+  const detectedType = detectTypeFromGenres(genreStr, type);
+
+  // Sanitize author/artist from metadata (scraper sometimes produces garbage like "s:")
+  const cleanAuthor = sanitizePersonName(comicInfo?.Writer);
+  const cleanArtist = sanitizePersonName(comicInfo?.Penciller);
+
+  // Normalize the publisher/source tag
+  const normalizedPublisher = sourceTag
+    ? normalizeSource(sourceTag)
+    : comicInfo?.Publisher
+      ? normalizeSource(comicInfo.Publisher)
+      : null;
+
   if (!series) {
     // Brand new series — create it
     const cleanMetaTitle = comicInfo?.Series ? stripSourcePrefix(comicInfo.Series) : null;
@@ -330,17 +378,17 @@ async function scanSeries(
         title: cleanMetaTitle || seriesTitle,
         slug: seriesSlug,
         description: comicInfo?.Summary || null,
-        author: comicInfo?.Writer || null,
-        artist: comicInfo?.Penciller || null,
+        author: cleanAuthor,
+        artist: cleanArtist,
         status: parseStatus(comicInfo?.Notes),
-        type,
+        type: detectedType,
         genres: comicInfo?.Genre || null,
         rating: comicInfo?.CommunityRating
           ? parseFloat(comicInfo.CommunityRating)
           : null,
         coverPath,
         libraryPath: seriesDirPath,
-        publisher: sourceTag || comicInfo?.Publisher || null,
+        publisher: normalizedPublisher,
         ageRating: comicInfo?.AgeRating || null,
         chapterCount: bookFiles.length,
         lastChapterAt: new Date(),
@@ -348,42 +396,55 @@ async function scanSeries(
       include: { chapters: true },
     });
     result.seriesAdded++;
-  } else if (hasNewChapters || needsMetadataRead) {
-    // Backfill lastChapterAt for series that existed before this field was added
-    let backfillLastChapter = undefined;
-    if (!series.lastChapterAt) {
-      try {
-        const lastBook = join(seriesDirPath, bookFiles[bookFiles.length - 1]);
-        const lastStat = await stat(lastBook);
-        backfillLastChapter = lastStat.mtime;
-      } catch {}
+  } else {
+    // Existing series — build correction fields that always apply
+    const corrections: Record<string, unknown> = {};
+
+    // Force-correct type if genre tags indicate a different type
+    // (e.g. series is in Manhua/ dir but genres say "Manga")
+    if (detectedType !== series.type) {
+      corrections.type = detectedType;
     }
 
-    // Update series metadata (don't change libraryPath — keep the primary one)
-    await prisma.series.update({
-      where: { id: series.id },
-      data: {
-        title: seriesTitle,
-        coverPath: coverPath || series.coverPath,
-        ...(sourceTag && !series.publisher
-          ? { publisher: sourceTag }
-          : {}),
-        ...(comicInfo?.Summary && !series.description
-          ? { description: comicInfo.Summary }
-          : {}),
-        ...(comicInfo?.Writer && !series.author
-          ? { author: comicInfo.Writer }
-          : {}),
-        ...(comicInfo?.Penciller && !series.artist
-          ? { artist: comicInfo.Penciller }
-          : {}),
-        ...(comicInfo?.Genre && !series.genres
-          ? { genres: comicInfo.Genre }
-          : {}),
-        ...(backfillLastChapter ? { lastChapterAt: backfillLastChapter } : {}),
-      },
-    });
-    result.seriesUpdated++;
+    // Force-normalize publisher if stale casing (e.g. "Manhuato" → "ManhuaTo")
+    if (normalizedPublisher && series.publisher !== normalizedPublisher) {
+      corrections.publisher = normalizedPublisher;
+    }
+
+    // Fix garbage author/artist (e.g. "s:", single chars) — replace with clean value or null
+    if (!sanitizePersonName(series.author)) {
+      corrections.author = cleanAuthor;
+    }
+    if (!sanitizePersonName(series.artist)) {
+      corrections.artist = cleanArtist;
+    }
+
+    if (hasNewChapters || needsMetadataRead) {
+      // Backfill lastChapterAt for series that existed before this field was added
+      if (!series.lastChapterAt) {
+        try {
+          const lastBook = join(seriesDirPath, bookFiles[bookFiles.length - 1]);
+          const lastStat = await stat(lastBook);
+          corrections.lastChapterAt = lastStat.mtime;
+        } catch {}
+      }
+
+      // Backfill missing metadata from ComicInfo
+      if (comicInfo?.Summary && !series.description) corrections.description = comicInfo.Summary;
+      if (comicInfo?.Genre && !series.genres) corrections.genres = comicInfo.Genre;
+
+      corrections.title = seriesTitle;
+      corrections.coverPath = coverPath || series.coverPath;
+    }
+
+    // Only write to DB if there are actual corrections
+    if (Object.keys(corrections).length > 0) {
+      await prisma.series.update({
+        where: { id: series.id },
+        data: corrections,
+      });
+      result.seriesUpdated++;
+    }
   }
 
   // Track this directory as a source path for the series
