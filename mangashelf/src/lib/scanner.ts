@@ -401,12 +401,27 @@ async function scanSeries(
     },
   });
 
+  // Clean up chapters whose files no longer exist on disk
+  const diskFiles = new Set(bookFiles.map((f) => join(seriesDirPath, f)));
+  const staleChapters = series.chapters.filter(
+    (c) => c.filePath.startsWith(seriesDirPath) && !diskFiles.has(c.filePath)
+  );
+  if (staleChapters.length > 0) {
+    const staleIds = staleChapters.map((c) => c.id);
+    // Delete read progress first (foreign key constraint)
+    await prisma.readProgress.deleteMany({ where: { chapterId: { in: staleIds } } });
+    await prisma.chapter.deleteMany({ where: { id: { in: staleIds } } });
+    console.log(
+      `Removed ${staleChapters.length} chapters with missing files from "${seriesTitle}": ${staleChapters.map((c) => `Ch.${c.number}`).join(", ")}`
+    );
+  }
+
   // If no new chapters from this directory, skip the per-chapter loop
-  if (!hasNewChapters) return;
+  if (!hasNewChapters && staleChapters.length === 0) return;
 
   // Scan chapters — only match by filePath (not by number)
   // This allows same chapter number from different sources to coexist
-  const existingPaths = new Set(series.chapters.map((c) => c.filePath));
+  const existingPaths = new Set(series.chapters.filter((c) => !staleChapters.includes(c)).map((c) => c.filePath));
   let seriesChaptersAdded = 0;
 
   for (const bookFile of bookFiles) {
@@ -495,7 +510,7 @@ async function scanSeries(
   }
 
   // Update chapterCount to reflect total chapters across ALL source directories
-  if (seriesChaptersAdded > 0) {
+  if (seriesChaptersAdded > 0 || staleChapters.length > 0) {
     const totalChapters = await prisma.chapter.count({
       where: { seriesId: series.id },
     });

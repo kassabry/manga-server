@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { access } from "fs/promises";
 import { prisma } from "@/lib/db";
 import { getPageList, extractPage } from "@/lib/cbz";
 import { getEpubChapterList, extractEpubChapter } from "@/lib/epub";
@@ -17,6 +18,16 @@ export async function GET(
   const chapter = await prisma.chapter.findUnique({ where: { id } });
   if (!chapter) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
+  // Check if the file exists on disk
+  try {
+    await access(chapter.filePath);
+  } catch {
+    return NextResponse.json(
+      { error: "Chapter file missing from disk" },
+      { status: 410 }
+    );
   }
 
   if (isEpubFile(chapter.filePath)) {

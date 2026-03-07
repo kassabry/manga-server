@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { dirname } from "path";
+import { access } from "fs/promises";
 import { prisma } from "@/lib/db";
 import { getPageList } from "@/lib/cbz";
 import { getEpubChapterList } from "@/lib/epub";
@@ -27,19 +28,38 @@ export async function GET(
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
+  // Check if the file actually exists on disk
+  try {
+    await access(chapter.filePath);
+  } catch {
+    return NextResponse.json(
+      { error: "Chapter file missing from disk", filePath: chapter.filePath },
+      { status: 410 }
+    );
+  }
+
   // Determine this chapter's source directory for same-source navigation
   const chapterDir = dirname(chapter.filePath);
   const epub = isEpubFile(chapter.filePath);
 
   // Get page/chapter list based on file type
-  const [pages, allChapters] = await Promise.all([
-    epub ? getEpubChapterList(chapter.filePath) : getPageList(chapter.filePath),
-    prisma.chapter.findMany({
-      where: { seriesId: chapter.seriesId },
-      orderBy: { number: "asc" },
-      select: { id: true, number: true, title: true, source: true, filePath: true },
-    }),
-  ]);
+  let pages: string[];
+  try {
+    pages = epub
+      ? await getEpubChapterList(chapter.filePath)
+      : await getPageList(chapter.filePath);
+  } catch {
+    return NextResponse.json(
+      { error: "Failed to read chapter file" },
+      { status: 500 }
+    );
+  }
+
+  const allChapters = await prisma.chapter.findMany({
+    where: { seriesId: chapter.seriesId },
+    orderBy: { number: "asc" },
+    select: { id: true, number: true, title: true, source: true, filePath: true },
+  });
 
   // Find prev/next chapters, preferring same source directory
   const prevChapter = findAdjacentChapter(allChapters, chapter.number, chapterDir, "prev");
