@@ -58,6 +58,113 @@ export async function extractComicInfo(
   }
 }
 
+/**
+ * Read image width from the raw file header bytes (no external deps needed).
+ * Supports PNG, JPEG, WebP, GIF.
+ */
+function getImageWidth(buf: Buffer): number {
+  if (buf.length < 30) return 0;
+
+  // PNG: bytes 16-19 = width (big-endian)
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return buf.readUInt32BE(16);
+  }
+
+  // GIF: bytes 6-7 = width (little-endian)
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) {
+    return buf.readUInt16LE(6);
+  }
+
+  // WebP: RIFF....WEBP
+  if (
+    buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+    buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+  ) {
+    // VP8 (lossy)
+    if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x20) {
+      if (buf.length > 27) return buf.readUInt16LE(26) & 0x3fff;
+    }
+    // VP8L (lossless)
+    if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x4c) {
+      if (buf.length > 24) {
+        const bits = buf.readUInt32LE(21);
+        return (bits & 0x3fff) + 1;
+      }
+    }
+    // VP8X (extended)
+    if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x58) {
+      if (buf.length > 26) return (buf[24] | (buf[25] << 8) | (buf[26] << 16)) + 1;
+    }
+  }
+
+  // JPEG: scan for SOF marker
+  if (buf[0] === 0xff && buf[1] === 0xd8) {
+    let offset = 2;
+    while (offset < buf.length - 8) {
+      if (buf[offset] !== 0xff) { offset++; continue; }
+      const marker = buf[offset + 1];
+      // SOF markers (0xC0-0xCF except 0xC4 DHT and 0xCC DAC)
+      if (
+        marker >= 0xc0 && marker <= 0xcf &&
+        marker !== 0xc4 && marker !== 0xcc
+      ) {
+        return buf.readUInt16BE(offset + 7);
+      }
+      if (marker === 0xd9) break; // EOI
+      if (marker === 0xda) break; // SOS — no SOF found before scan data
+      const segLen = buf.readUInt16BE(offset + 2);
+      offset += 2 + segLen;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Filter out promotional/cover images from other series that got scraped
+ * alongside chapter pages. Works by comparing image widths — chapter pages
+ * share a consistent width, while promo covers are typically different.
+ * Only runs when 5+ images exist (needs enough to detect outliers).
+ */
+async function filterOutlierImages(
+  zip: JSZip,
+  pages: string[]
+): Promise<string[]> {
+  if (pages.length < 5) return pages;
+
+  // Read width of each image from its header bytes
+  const entries: { name: string; width: number }[] = [];
+  for (const page of pages) {
+    const file = zip.file(page);
+    if (!file) continue;
+    const buf = Buffer.from(await file.async("arraybuffer"));
+    entries.push({ name: page, width: getImageWidth(buf) });
+  }
+
+  const validWidths = entries
+    .map((e) => e.width)
+    .filter((w) => w > 0)
+    .sort((a, b) => a - b);
+
+  if (validWidths.length < 5) return pages;
+
+  const medianWidth = validWidths[Math.floor(validWidths.length / 2)];
+
+  // Keep images within 30% of the median width
+  const filtered = entries
+    .filter((e) => e.width === 0 || Math.abs(e.width - medianWidth) / medianWidth <= 0.3)
+    .map((e) => e.name);
+
+  const removed = pages.length - filtered.length;
+  if (removed > 0) {
+    console.log(
+      `CBZ outlier filter: removed ${removed}/${pages.length} images with non-matching widths (median ${medianWidth}px)`
+    );
+  }
+
+  return filtered;
+}
+
 export async function getPageList(cbzPath: string): Promise<string[]> {
   const cached = pageListCache.get(cbzPath);
   if (cached) return cached;
@@ -79,12 +186,13 @@ export async function getPageList(cbzPath: string): Promise<string[]> {
     }
   });
 
-  const sorted = pages.sort((a, b) =>
-    a.localeCompare(b, undefined, { numeric: true })
-  );
+  pages.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 
-  pageListCache.set(cbzPath, sorted);
-  return sorted;
+  // Filter outlier images by dimension (removes promo covers from other series)
+  const filtered = await filterOutlierImages(zip, pages);
+
+  pageListCache.set(cbzPath, filtered);
+  return filtered;
 }
 
 export async function extractPage(
