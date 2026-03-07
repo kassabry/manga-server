@@ -109,25 +109,15 @@ export default function MyListPage() {
     fetchEntries();
   }, [session]);
 
-  // Fetch followed series
+  // Fetch followed series directly from Follow records (not from updates/chapters)
   useEffect(() => {
     if (!session?.user) return;
-    fetch("/api/user/updates?limit=100&grouped=true")
+    fetch("/api/user/follows")
       .then((r) => r.json())
       .then((data) => {
-        const updates = data.updates || [];
-        const seen = new Set<string>();
-        const followList: FollowEntry[] = [];
-        for (const u of updates) {
-          if (!seen.has(u.series.id)) {
-            seen.add(u.series.id);
-            followList.push({
-              seriesId: u.series.id,
-              series: u.series,
-            });
-          }
+        if (Array.isArray(data)) {
+          setFollows(data);
         }
-        setFollows(followList);
       });
   }, [session]);
 

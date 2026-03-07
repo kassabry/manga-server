@@ -62,19 +62,37 @@ function stripSourcePrefix(title: string): string {
 }
 
 /**
- * Detect a more accurate type (Manga/Manhwa/Manhua) from genre tags.
- * ManhuaTo hosts all types but files end up in the Manhua/ directory.
- * Genre tags like "Manga", "Manhwa", "Manhua", "Comics" indicate the real type.
+ * Detect a more accurate type (Manga/Manhwa/Manhua) from genre tags
+ * and/or the series description. ManhuaTo hosts all types but files
+ * end up in the Manhua/ directory.
+ *
+ * Checks in order:
+ * 1. Genre tags (explicit type labels like "Manga", "Manhwa")
+ * 2. Description text (e.g. "Dungeon Odyssey Manhwa The descendants...")
  */
-function detectTypeFromGenres(genres: string | null, fallback: string): string {
-  if (!genres) return fallback;
-  const lower = genres.toLowerCase();
-  // Split on commas and check each genre tag
-  const tags = lower.split(",").map((g) => g.trim());
-  // Exact match priority: "manga" > "manhwa" > "manhua"
-  if (tags.includes("manga")) return "Manga";
-  if (tags.includes("manhwa")) return "Manhwa";
-  if (tags.includes("manhua")) return "Manhua";
+function detectTypeFromMetadata(
+  genres: string | null,
+  description: string | null,
+  fallback: string
+): string {
+  // Check genre tags first (most reliable)
+  if (genres) {
+    const tags = genres.toLowerCase().split(",").map((g) => g.trim());
+    if (tags.includes("manga")) return "Manga";
+    if (tags.includes("manhwa")) return "Manhwa";
+    if (tags.includes("manhua")) return "Manhua";
+  }
+
+  // Check description text for type keywords near the start
+  // Many ManhuaTo descriptions begin with "{Title} Manhwa ..." or "{Title} Manga ..."
+  if (description) {
+    const descStart = description.slice(0, 200).toLowerCase();
+    // Look for standalone type words (word boundary match)
+    if (/\bmanhwa\b/.test(descStart)) return "Manhwa";
+    if (/\bmanga\b/.test(descStart)) return "Manga";
+    if (/\bmanhua\b/.test(descStart)) return "Manhua";
+  }
+
   return fallback;
 }
 
@@ -354,10 +372,11 @@ async function scanSeries(
     series.title = seriesTitle;
   }
 
-  // Detect accurate type from genre tags (e.g. ManhuaTo puts everything in Manhua/ but
-  // genres contain "Manga", "Manhwa" etc. to indicate the real type)
+  // Detect accurate type from genre tags and description (e.g. ManhuaTo puts
+  // everything in Manhua/ but genres or description may say "Manga" or "Manhwa")
   const genreStr = comicInfo?.Genre || series?.genres || null;
-  const detectedType = detectTypeFromGenres(genreStr, type);
+  const descStr = comicInfo?.Summary || series?.description || null;
+  const detectedType = detectTypeFromMetadata(genreStr, descStr, type);
 
   // Sanitize author/artist from metadata (scraper sometimes produces garbage like "s:")
   const cleanAuthor = sanitizePersonName(comicInfo?.Writer);
