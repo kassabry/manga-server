@@ -26,8 +26,12 @@ sqlite3 "$DB_PATH" "ALTER TABLE \"Series\" ADD COLUMN \"lastChapterAt\" DATETIME
 sqlite3 "$DB_PATH" "ALTER TABLE \"Chapter\" ADD COLUMN \"source\" TEXT;" 2>/dev/null || true
 sqlite3 "$DB_PATH" "ALTER TABLE \"Chapter\" ADD COLUMN \"sourceUrl\" TEXT;" 2>/dev/null || true
 
-# Ensure DB is writable by nextjs
-chown nextjs:nodejs "$DB_PATH" 2>/dev/null || true
+# Enable WAL mode for better concurrency (allows reads during writes)
+# Also set a 10-second busy timeout so queries wait instead of immediately failing
+sqlite3 "$DB_PATH" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;" 2>/dev/null || true
+
+# Ensure DB files are writable by nextjs (WAL mode creates -wal and -shm files)
+chown nextjs:nodejs "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" 2>/dev/null || true
 
 echo "Database ready"
 

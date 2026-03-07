@@ -123,15 +123,12 @@ function getImageWidth(buf: Buffer): number {
 /**
  * Filter out promotional/cover images from other series that got scraped
  * alongside chapter pages. Works by comparing image widths — chapter pages
- * share a consistent width, while promo covers are typically different.
+ * share a consistent width, while promo covers have varied different widths.
  *
- * Safety rules:
- *  - Only runs when 5+ images exist (needs enough to detect outliers)
- *  - The dominant width group must account for ≥60% of images (otherwise
- *    the chapter genuinely has mixed-width content and we skip filtering)
- *  - Never removes more than 20% of total images (prevents over-filtering
- *    on chapters that legitimately have some double-page spreads or title
- *    pages with different widths)
+ * Safety: only filters when there's a clear dominant width group (≥5 images
+ * and at least 2x the size of the next-largest group). This ensures we only
+ * act when there's strong evidence of a single "chapter width", and avoids
+ * filtering chapters that genuinely have mixed-width content.
  */
 async function filterOutlierImages(
   zip: JSZip,
@@ -139,7 +136,7 @@ async function filterOutlierImages(
 ): Promise<string[]> {
   if (pages.length < 5) return pages;
 
-  // Read width of each image from its header bytes (only first 512 bytes needed)
+  // Read width of each image from its header bytes
   const entries: { name: string; width: number }[] = [];
   for (const page of pages) {
     const file = zip.file(page);
@@ -152,53 +149,39 @@ async function filterOutlierImages(
   if (validEntries.length < 5) return pages;
 
   // Group images by width (±5% tolerance buckets)
-  const widthGroups = new Map<number, number>(); // representative width → count
+  const widthGroups: { rep: number; count: number }[] = [];
   for (const e of validEntries) {
-    let matched = false;
-    for (const [rep, count] of widthGroups) {
-      if (Math.abs(e.width - rep) / rep <= 0.05) {
-        widthGroups.set(rep, count + 1);
-        matched = true;
-        break;
-      }
-    }
-    if (!matched) widthGroups.set(e.width, 1);
-  }
-
-  // Find the dominant width group
-  let dominantWidth = 0;
-  let dominantCount = 0;
-  for (const [width, count] of widthGroups) {
-    if (count > dominantCount) {
-      dominantCount = count;
-      dominantWidth = width;
+    const match = widthGroups.find((g) => Math.abs(e.width - g.rep) / g.rep <= 0.05);
+    if (match) {
+      match.count++;
+    } else {
+      widthGroups.push({ rep: e.width, count: 1 });
     }
   }
 
-  // Safety: if the dominant group is less than 60% of valid images, the chapter
-  // has genuinely mixed-width content — skip filtering entirely
-  if (dominantCount / validEntries.length < 0.6) {
+  // Sort groups by count descending
+  widthGroups.sort((a, b) => b.count - a.count);
+
+  const dominant = widthGroups[0];
+  const secondLargest = widthGroups[1]?.count ?? 0;
+
+  // Safety: require the dominant group to have ≥5 images AND be at least 2x
+  // the next-largest group. This means chapter pages clearly cluster around
+  // one width while promo covers are scattered across many different widths.
+  // If two width groups are similarly sized, skip (genuinely mixed content).
+  if (dominant.count < 5 || dominant.count < secondLargest * 2) {
     return pages;
   }
 
   // Keep images within 30% of the dominant width (or those we couldn't read)
   const filtered = entries
-    .filter((e) => e.width === 0 || Math.abs(e.width - dominantWidth) / dominantWidth <= 0.3)
+    .filter((e) => e.width === 0 || Math.abs(e.width - dominant.rep) / dominant.rep <= 0.3)
     .map((e) => e.name);
 
   const removed = pages.length - filtered.length;
-
-  // Safety cap: never remove more than 20% of total images
-  if (removed > pages.length * 0.2) {
-    console.log(
-      `CBZ outlier filter: would remove ${removed}/${pages.length} images (${Math.round(removed / pages.length * 100)}%) — too aggressive, skipping (dominant ${dominantWidth}px)`
-    );
-    return pages;
-  }
-
   if (removed > 0) {
     console.log(
-      `CBZ outlier filter: removed ${removed}/${pages.length} images with non-matching widths (dominant ${dominantWidth}px)`
+      `CBZ outlier filter: removed ${removed}/${pages.length} images (dominant ${dominant.rep}px, ${dominant.count} pages)`
     );
   }
 
