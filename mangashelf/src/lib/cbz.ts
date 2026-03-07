@@ -72,19 +72,16 @@ export async function getPageList(cbzPath: string): Promise<string[]> {
     if (
       imageExtensions.includes(ext) &&
       !relativePath.startsWith("__MACOSX") &&
-      !relativePath.includes("ComicInfo")
+      !relativePath.includes("ComicInfo") &&
+      !relativePath.toLowerCase().includes("cover")
     ) {
       pages.push(relativePath);
     }
   });
 
-  const sorted = pages.sort((a, b) => {
-    const aIsCover = a.toLowerCase().includes("cover");
-    const bIsCover = b.toLowerCase().includes("cover");
-    if (aIsCover && !bIsCover) return -1;
-    if (!aIsCover && bIsCover) return 1;
-    return a.localeCompare(b, undefined, { numeric: true });
-  });
+  const sorted = pages.sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true })
+  );
 
   pageListCache.set(cbzPath, sorted);
   return sorted;
@@ -118,7 +115,7 @@ export async function extractPage(
 export async function getPageCount(cbzPath: string): Promise<number> {
   try {
     const pages = await getPageList(cbzPath);
-    return pages.filter((p) => !p.toLowerCase().includes("cover")).length;
+    return pages.length;
   } catch {
     return 0;
   }

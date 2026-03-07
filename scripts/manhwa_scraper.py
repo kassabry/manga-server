@@ -1192,7 +1192,11 @@ class BaseSiteScraper:
             if success_count == 0:
                 logger.error(f"No images downloaded for chapter {chapter.number}")
                 return False
-            
+
+            # Post-download: remove outlier images by dimension
+            # Promotional covers have different aspect ratios than chapter pages
+            self._filter_outlier_images_by_dimension(temp_dir)
+
             # Create CBZ with metadata
             self._create_cbz(temp_dir, cbz_path, series, chapter)
             
@@ -1735,8 +1739,9 @@ class AsuraFullScraper(BaseSiteScraper):
         sorted_gaps = sorted(gaps)
         median_gap = sorted_gaps[len(sorted_gaps) // 2]
 
-        # Threshold: if a gap is >50x the median AND >100, it's a cluster break
-        threshold = max(median_gap * 50, 100)
+        # Threshold: if a gap is >10x the median AND >30, it's a cluster break
+        # (tighter than before to catch promo images with nearby media IDs)
+        threshold = max(median_gap * 10, 30)
 
         # Find the largest contiguous cluster
         clusters = [[ids[0]]]
@@ -1758,6 +1763,68 @@ class AsuraFullScraper(BaseSiteScraper):
 
         return [url for _, url in filtered]
 
+    @staticmethod
+    def _filter_outlier_images_by_dimension(temp_dir: Path):
+        """Remove downloaded images with outlier dimensions (likely promotional covers).
+
+        Chapter pages share similar widths. Promo covers from other series are
+        typically a different size. If 5+ images exist, remove any whose width
+        differs significantly from the majority.
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            return  # Pillow not available, skip
+
+        img_files = sorted([
+            f for f in temp_dir.iterdir()
+            if f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.gif')
+        ])
+
+        if len(img_files) < 5:
+            return  # Too few to reliably detect outliers
+
+        # Get widths of all images
+        widths = []
+        for f in img_files:
+            try:
+                with Image.open(f) as img:
+                    widths.append((f, img.width))
+            except Exception:
+                widths.append((f, 0))
+
+        # Find the most common width (mode) — chapter pages should cluster around it
+        width_values = [w for _, w in widths if w > 0]
+        if not width_values:
+            return
+
+        # Use the median width as reference
+        sorted_widths = sorted(width_values)
+        median_width = sorted_widths[len(sorted_widths) // 2]
+
+        # Remove images whose width differs by more than 30% from the median
+        removed = 0
+        for f, w in widths:
+            if w == 0:
+                continue
+            if abs(w - median_width) / median_width > 0.30:
+                logger.info(f"Removing outlier image {f.name} (width {w} vs median {median_width})")
+                f.unlink()
+                removed += 1
+
+        if removed:
+            logger.info(f"Removed {removed} outlier image(s) by dimension")
+
+    @staticmethod
+    def _is_chapter_page_url(url: str) -> bool:
+        """Check if a URL looks like a chapter page image (numbered filename).
+
+        Chapter pages:  /conversions/01-optimized.webp, /conversions/2-optimized.webp
+        Promo covers:   /conversions/poster-optimized.webp, /conversions/cover-optimized.webp
+        """
+        m = re.search(r'/conversions/(\d+)', url)
+        return m is not None
+
     def _extract_asura_images(self, html: str) -> List[str]:
         """Extract chapter image URLs from Asura HTML (Next.js data or img tags).
 
@@ -1778,6 +1845,9 @@ class AsuraFullScraper(BaseSiteScraper):
             # Skip sidebar cover thumbnails (thumb-small, thumb-medium)
             if '-thumb-' in url:
                 continue
+            # Skip promotional cover images (non-numeric filenames like poster-optimized.webp)
+            if not self._is_chapter_page_url(url):
+                continue
             if url not in seen:
                 seen.add(url)
                 pages.append(url)
@@ -1785,7 +1855,7 @@ class AsuraFullScraper(BaseSiteScraper):
         if pages:
             # Sort by the media ID to get correct page order
             pages.sort(key=lambda u: self._get_media_id(u))
-            # Filter out sidebar/cover images
+            # Filter out sidebar/cover images by media ID clustering
             pages = self._filter_outlier_images(pages)
             if pages:
                 logger.info(f"Found {len(pages)} chapter images from Next.js data")
@@ -1802,7 +1872,11 @@ class AsuraFullScraper(BaseSiteScraper):
                 continue
             if '/profile_images/' in src or '/profile/' in src:
                 continue
-            if '/conversions/' in src and '-thumb-' not in src and src not in pages:
+            if '/conversions/' not in src or '-thumb-' in src:
+                continue
+            if not self._is_chapter_page_url(src):
+                continue
+            if src not in pages:
                 pages.append(src)
 
         if pages:
