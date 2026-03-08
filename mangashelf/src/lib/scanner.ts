@@ -452,8 +452,10 @@ async function scanSeries(
       if (comicInfo?.Summary && !series.description) corrections.description = comicInfo.Summary;
       if (comicInfo?.Genre && !series.genres) corrections.genres = comicInfo.Genre;
 
-      corrections.title = seriesTitle;
-      corrections.coverPath = coverPath || series.coverPath;
+      // Only update title/cover if actually changed (avoid unnecessary writes)
+      if (series.title !== seriesTitle) corrections.title = seriesTitle;
+      const effectiveCover = coverPath || series.coverPath;
+      if (effectiveCover !== series.coverPath) corrections.coverPath = effectiveCover;
     }
 
     // Only write to DB if there are actual corrections
