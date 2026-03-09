@@ -181,11 +181,17 @@ export async function scanLibrary(
   }
 
   // Remove series/paths from DB that no longer exist on disk
-  const cleanup = await cleanupDeletedSeries(validLibraryPaths);
-  if (cleanup.seriesRemoved > 0 || cleanup.pathsRemoved > 0) {
-    console.log(
-      `Cleanup: removed ${cleanup.pathsRemoved} paths, ${cleanup.seriesRemoved} series (${cleanup.chaptersRemoved} chapters) no longer on disk`
-    );
+  // SAFETY: skip cleanup entirely if the library appears empty — this likely means
+  // the mount is temporarily unavailable, not that all series were deleted
+  if (validLibraryPaths.size === 0) {
+    console.log("[scan] WARNING: Library appears empty — skipping cleanup (mount may be unavailable)");
+  } else {
+    const cleanup = await cleanupDeletedSeries(validLibraryPaths);
+    if (cleanup.seriesRemoved > 0 || cleanup.pathsRemoved > 0) {
+      console.log(
+        `Cleanup: removed ${cleanup.pathsRemoved} paths, ${cleanup.seriesRemoved} series (${cleanup.chaptersRemoved} chapters) no longer on disk`
+      );
+    }
   }
 
   return result;
