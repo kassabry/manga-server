@@ -35,5 +35,6 @@ next-env.d.ts
 /prisma/*.db-journal
 
 # data
-/data/
+/data/*
+!/data/.gitkeep
 /public/covers/

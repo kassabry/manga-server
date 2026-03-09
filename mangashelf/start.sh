@@ -33,7 +33,13 @@ sqlite3 "$DB_PATH" "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;" 2>/dev/
 # Ensure DB files are writable by nextjs (WAL mode creates -wal and -shm files)
 chown nextjs:nodejs "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" 2>/dev/null || true
 
-echo "Database ready"
+# Sanity check: warn if database has no users (data may have been lost)
+USER_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM \"User\";" 2>/dev/null || echo "0")
+if [ "$USER_COUNT" = "0" ]; then
+  echo "WARNING: Database has 0 users — visit /setup to create an admin account"
+else
+  echo "Database ready ($USER_COUNT user(s))"
+fi
 
 # Drop privileges and start server
 exec su-exec nextjs node server.js
