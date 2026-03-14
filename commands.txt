@@ -6,9 +6,13 @@
 ---------------------------------------------------------------
   DOCKER - Start / Stop / Status
 ---------------------------------------------------------------
+# Remove all the images stored on the device
+docker system prune -f
 
 # Start everything
-docker compose up -d
+DOCKER_BUILDKIT=0 docker compose build orvault
+
+docker compose up -d --build
 
 # Stop everything
 docker compose down
@@ -104,6 +108,9 @@ docker exec -it manhwa-downloader python3 scripts/fix_cbz_metadata.py ./library/
 
 # Shell into the scraper container
 docker exec -it manhwa-downloader /bin/bash
+
+# See the output
+docker logs -f --tail 0 manhwa-downloader
 
 # Check if VPN is working (from inside scraper)
 docker exec manhwa-downloader curl -s https://am.i.mullvad.net/connected

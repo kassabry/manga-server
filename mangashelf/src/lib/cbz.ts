@@ -59,20 +59,21 @@ export async function extractComicInfo(
 }
 
 /**
- * Read image width from the raw file header bytes (no external deps needed).
+ * Read image dimensions from raw file header bytes (no external deps needed).
  * Supports PNG, JPEG, WebP, GIF.
  */
-function getImageWidth(buf: Buffer): number {
-  if (buf.length < 30) return 0;
+function getImageDimensions(buf: Buffer): { width: number; height: number } {
+  const zero = { width: 0, height: 0 };
+  if (buf.length < 30) return zero;
 
-  // PNG: bytes 16-19 = width (big-endian)
+  // PNG: bytes 16-19 = width (BE), 20-23 = height (BE)
   if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
-    return buf.readUInt32BE(16);
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
   }
 
-  // GIF: bytes 6-7 = width (little-endian)
+  // GIF: bytes 6-7 = width (LE), 8-9 = height (LE)
   if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) {
-    return buf.readUInt16LE(6);
+    return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
   }
 
   // WebP: RIFF....WEBP
@@ -82,18 +83,24 @@ function getImageWidth(buf: Buffer): number {
   ) {
     // VP8 (lossy)
     if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x20) {
-      if (buf.length > 27) return buf.readUInt16LE(26) & 0x3fff;
+      if (buf.length > 29) return {
+        width: (buf.readUInt16LE(26) & 0x3fff) + 1,
+        height: (buf.readUInt16LE(28) & 0x3fff) + 1,
+      };
     }
     // VP8L (lossless)
     if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x4c) {
       if (buf.length > 24) {
         const bits = buf.readUInt32LE(21);
-        return (bits & 0x3fff) + 1;
+        return { width: (bits & 0x3fff) + 1, height: ((bits >> 14) & 0x3fff) + 1 };
       }
     }
     // VP8X (extended)
     if (buf[12] === 0x56 && buf[13] === 0x50 && buf[14] === 0x38 && buf[15] === 0x58) {
-      if (buf.length > 26) return (buf[24] | (buf[25] << 8) | (buf[26] << 16)) + 1;
+      if (buf.length > 29) return {
+        width: (buf[24] | (buf[25] << 8) | (buf[26] << 16)) + 1,
+        height: (buf[27] | (buf[28] << 8) | (buf[29] << 16)) + 1,
+      };
     }
   }
 
@@ -104,20 +111,16 @@ function getImageWidth(buf: Buffer): number {
       if (buf[offset] !== 0xff) { offset++; continue; }
       const marker = buf[offset + 1];
       // SOF markers (0xC0-0xCF except 0xC4 DHT and 0xCC DAC)
-      if (
-        marker >= 0xc0 && marker <= 0xcf &&
-        marker !== 0xc4 && marker !== 0xcc
-      ) {
-        return buf.readUInt16BE(offset + 7);
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xcc) {
+        return { width: buf.readUInt16BE(offset + 7), height: buf.readUInt16BE(offset + 5) };
       }
-      if (marker === 0xd9) break; // EOI
-      if (marker === 0xda) break; // SOS — no SOF found before scan data
+      if (marker === 0xd9 || marker === 0xda) break;
       const segLen = buf.readUInt16BE(offset + 2);
       offset += 2 + segLen;
     }
   }
 
-  return 0;
+  return zero;
 }
 
 /**
@@ -136,44 +139,64 @@ async function filterOutlierImages(
 ): Promise<string[]> {
   if (pages.length < 5) return pages;
 
-  // Read width of each image from its header bytes
-  const entries: { name: string; width: number }[] = [];
+  // Read dimensions of each image from its header bytes
+  const entries: { name: string; width: number; height: number }[] = [];
   for (const page of pages) {
     const file = zip.file(page);
     if (!file) continue;
     const buf = Buffer.from(await file.async("arraybuffer"));
-    entries.push({ name: page, width: getImageWidth(buf) });
+    const { width, height } = getImageDimensions(buf);
+    entries.push({ name: page, width, height });
   }
 
   const validEntries = entries.filter((e) => e.width > 0);
   if (validEntries.length < 5) return pages;
 
-  // Group images by width (±5% tolerance buckets)
-  const widthGroups: { rep: number; count: number }[] = [];
+  // Group images by width (±5% tolerance buckets), tracking count and total aspect ratio
+  const widthGroups: { rep: number; count: number; totalAspect: number }[] = [];
   for (const e of validEntries) {
     const match = widthGroups.find((g) => Math.abs(e.width - g.rep) / g.rep <= 0.05);
     if (match) {
       match.count++;
+      match.totalAspect += e.height / e.width;
     } else {
-      widthGroups.push({ rep: e.width, count: 1 });
+      widthGroups.push({ rep: e.width, count: 1, totalAspect: e.height / e.width });
     }
   }
 
-  // Sort groups by count descending
   widthGroups.sort((a, b) => b.count - a.count);
+
+  const avgAspect = (g: { count: number; totalAspect: number }) => g.totalAspect / g.count;
 
   const dominant = widthGroups[0];
   const secondLargest = widthGroups[1]?.count ?? 0;
 
-  // Safety: require the dominant group to have ≥5 images AND be at least 2x
-  // the next-largest group. This means chapter pages clearly cluster around
-  // one width while promo covers are scattered across many different widths.
-  // If two width groups are similarly sized, skip (genuinely mixed content).
+  // Webtoon strip detection: if a non-dominant group has avg aspect ratio ≥ 5:1
+  // (tall vertical strips) and the dominant group is ≤ 3:1 (promo covers / manga pages),
+  // prefer the tall-strip group even though it has fewer images.
+  // This handles: 4 webtoon strips (800px × 15000px) vs 9 promo covers (2000px × 2800px).
+  const webtoonGroup = widthGroups.find((g) => g !== dominant && avgAspect(g) >= 5.0);
+  if (webtoonGroup && avgAspect(dominant) < 3.0) {
+    const filtered = entries
+      .filter((e) => e.width === 0 || Math.abs(e.width - webtoonGroup.rep) / webtoonGroup.rep <= 0.3)
+      .map((e) => e.name);
+    const removed = pages.length - filtered.length;
+    if (removed > 0) {
+      console.log(
+        `CBZ outlier filter: removed ${removed}/${pages.length} images ` +
+        `(webtoon strips ${webtoonGroup.rep}px avg ${avgAspect(webtoonGroup).toFixed(1)}:1 ` +
+        `preferred over ${dominant.rep}px avg ${avgAspect(dominant).toFixed(1)}:1)`
+      );
+    }
+    return filtered;
+  }
+
+  // Normal case: keep the dominant width group if clearly dominant
+  // (≥5 images AND at least 2× the next-largest group)
   if (dominant.count < 5 || dominant.count < secondLargest * 2) {
     return pages;
   }
 
-  // Keep images within 30% of the dominant width (or those we couldn't read)
   const filtered = entries
     .filter((e) => e.width === 0 || Math.abs(e.width - dominant.rep) / dominant.rep <= 0.3)
     .map((e) => e.name);

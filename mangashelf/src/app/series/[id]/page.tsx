@@ -112,6 +112,12 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
     : series.chapters.filter((ch: Chapter) => ch.source === sourceFilter);
   const chapters = sortDesc ? [...filteredChapters].reverse() : filteredChapters;
 
+  // When showing all sources, display the max chapter count from any single source
+  // rather than the total sum across all sources (avoids inflated counts for multi-source series)
+  const displayChapterCount = (sourceFilter === "all" && uniqueSources.length > 1)
+    ? Math.max(...uniqueSources.map((s) => series.chapters.filter((ch: Chapter) => ch.source === s).length))
+    : filteredChapters.length;
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -220,7 +226,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       <section>
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-lg font-semibold">
-            Chapters ({filteredChapters.length})
+            Chapters ({displayChapterCount})
           </h2>
           <button
             onClick={() => setSortDesc(!sortDesc)}

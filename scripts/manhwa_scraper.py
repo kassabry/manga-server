@@ -158,10 +158,11 @@ class BaseSiteScraper:
     # Cloudflare-protected sites that benefit from FlareSolverr
     CLOUDFLARE_SITE = False
 
-    def __init__(self, headless: bool = True, limit: int = None):
+    def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None):
         self.headless = headless
         self.driver = None
         self.limit = limit  # Stop after finding this many series
+        self.max_pages = max_pages  # Max pages to browse per category (None = unlimited)
         self._use_flaresolverr = False
         self._fs_cookies_applied = False
         self.session = requests.Session()
@@ -1667,11 +1668,11 @@ class AsuraFullScraper(BaseSiteScraper):
                 
                 page += 1
                 
-                # Safety limit
-                if page > 200:
-                    logger.warning("Reached page limit (200)")
+                # Page limit (user-specified or safety cap)
+                if page > (self.max_pages or 200):
+                    logger.warning(f"Reached page limit ({self.max_pages or 200})")
                     break
-                
+
                 time.sleep(1)  # Be nice to the server
                     
             except Exception as e:
@@ -1962,8 +1963,8 @@ class FlameFullScraper(BaseSiteScraper):
             # Scroll to load more content
             last_height = 0
             scroll_attempts = 0
-            max_scrolls = 20
-            
+            max_scrolls = self.max_pages or 20
+
             while scroll_attempts < max_scrolls:
                 # Scroll down
                 self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -2114,10 +2115,14 @@ class FlameFullScraper(BaseSiteScraper):
         # Look for links that match the series pattern
         for link in soup.select('a[href]'):
             href = link.get('href', '').strip()
-            text = link.get_text(strip=True)
 
             if not href:
                 continue
+
+            # Use separator=' ' so adjacent inline elements don't merge digits.
+            # e.g. <a>Chapter 1<span>3 years ago</span></a> becomes
+            # "Chapter 1 3 years ago" instead of "Chapter 13 years ago".
+            text = link.get_text(separator=' ', strip=True)
 
             # Match Flame chapter URL pattern: /series/ID/HASH
             is_chapter = False
@@ -2140,18 +2145,24 @@ class FlameFullScraper(BaseSiteScraper):
             # Skip if already seen or is a series-level link (no hash)
             if full_url in seen_urls:
                 continue
-            # Skip "First Chapter" and "Latest Chapter" meta-links (handle them by content)
+            # Skip "First Chapter" and "Latest Chapter" meta-links
             if text.lower() in ('first chapter', 'latest chapter'):
                 continue
             seen_urls.add(full_url)
 
-            # Extract chapter number from text like "Chapter 192"
-            # Text may have trailing timestamps like "4 years ago6" so be careful
+            # Try specific chapter-number element first to avoid timestamp bleed
+            num_elem = link.select_one(
+                '[class*="chapter-num"], [class*="chapternum"], [class*="chapter_num"], '
+                '.chap-num, .ch-name, .epxs'
+            )
+            if num_elem:
+                text = num_elem.get_text(separator=' ', strip=True)
+
+            # Extract chapter number
             match = re.search(r'chapter\s*(\d+(?:\.\d+)?)', text, re.I)
             if not match:
                 match = re.search(r'chapter[/\- ]?(\d+(?:\.\d+)?)', href, re.I)
             if not match:
-                # Try just a leading number
                 match = re.match(r'(\d+(?:\.\d+)?)', text.strip())
 
             if match:
@@ -2208,8 +2219,8 @@ class WebtoonScraper(BaseSiteScraper):
         'sports', 'historical', 'heartwarming', 'horror', 'informative'
     ]
     
-    def __init__(self, headless: bool = True, canvas: bool = False, limit: int = None):
-        super().__init__(headless, limit=limit)
+    def __init__(self, headless: bool = True, canvas: bool = False, limit: int = None, max_pages: int = None):
+        super().__init__(headless, limit=limit, max_pages=max_pages)
         self.canvas = canvas  # If True, scrape CANVAS instead of ORIGINALS
         # Webtoon requires specific headers
         self.session.headers.update({
@@ -2505,11 +2516,12 @@ class WebtoonScraper(BaseSiteScraper):
                 
                 if not found_new:
                     break
-                    
+
                 page += 1
-                
-                # Safety limit
-                if page > 200:
+
+                # Page limit (user-specified or safety cap)
+                if page > (self.max_pages or 200):
+                    logger.warning(f"Reached page limit ({self.max_pages or 200})")
                     break
                     
             except Exception as e:
@@ -2752,9 +2764,9 @@ class ManhuaToScraper(BaseSiteScraper):
                     
                     page += 1
                     
-                    # Safety limit per type
-                    if page > 200:
-                        logger.warning(f"Reached page limit for {category}")
+                    # Page limit (user-specified or safety cap)
+                    if page > (self.max_pages or 200):
+                        logger.warning(f"Reached page limit ({self.max_pages or 200}) for {category}")
                         break
                     
                     time.sleep(0.5)  # Be nice to server
@@ -2992,8 +3004,8 @@ class DrakeFullScraper(BaseSiteScraper):
     SITE_NAME = "drake"
     CLOUDFLARE_SITE = True
 
-    def __init__(self, headless: bool = True, limit: int = None):
-        super().__init__(headless=headless, limit=limit)
+    def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None):
+        super().__init__(headless=headless, limit=limit, max_pages=max_pages)
         if not self._is_arm() and not self._use_flaresolverr:
             # On x86, force non-headless for UC Cloudflare bypass
             if headless:
@@ -3078,15 +3090,23 @@ class DrakeFullScraper(BaseSiteScraper):
             try:
                 soup = self._get_soup(url)
                 
-                # Find series containers - div.bs contains each series
-                items = soup.select('div.bs')
-                
+                # Find series containers — try multiple WP manga theme selectors
+                items = (
+                    soup.select('div.bs') or           # Madara theme
+                    soup.select('div.bsx') or           # Madara variant
+                    soup.select('.listupd .bs') or
+                    soup.select('.listupd article') or
+                    soup.select('article.item') or
+                    soup.select('div.utao') or
+                    soup.select('li.el') or
+                    # Last resort: any link to a /manga/ series page
+                    soup.select('a[href*="/manga/"]:not([href*="chapter"])')
+                )
+
                 if not items:
-                    # Fallback to links
-                    items = soup.select('div.bsx a[href*="/manga/"]')
-                
-                if not items:
-                    logger.info(f"No more series found on page {page}")
+                    logger.info(f"No series found on page {page} — dumping selectors for debug")
+                    logger.debug(f"Page title: {soup.title.string if soup.title else 'none'}")
+                    logger.debug(f"Body classes: {soup.body.get('class', []) if soup.body else []}")
                     break
                 
                 found_count = 0
@@ -3161,12 +3181,13 @@ class DrakeFullScraper(BaseSiteScraper):
                     break
                     
                 page += 1
-                if page > 200:
-                    logger.warning("Reached page limit (200)")
+                # Page limit (user-specified or safety cap)
+                if page > (self.max_pages or 200):
+                    logger.warning(f"Reached page limit ({self.max_pages or 200})")
                     break
-                
+
                 time.sleep(1)
-                    
+
             except Exception as e:
                 logger.error(f"Error on page {page}: {e}")
                 break
@@ -3287,16 +3308,16 @@ PRIMARY_SITES = {
 }
 
 
-def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None) -> BaseSiteScraper:
+def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None, max_pages: int = None) -> BaseSiteScraper:
     """Get scraper instance by site name"""
     site_lower = site.lower()
-    
+
     for key, scraper_class in SCRAPERS.items():
         if key in site_lower:
             # Special handling for Webtoon canvas option
             if scraper_class == WebtoonScraper:
-                return scraper_class(headless=headless, canvas=canvas, limit=limit)
-            return scraper_class(headless=headless, limit=limit)
+                return scraper_class(headless=headless, canvas=canvas, limit=limit, max_pages=max_pages)
+            return scraper_class(headless=headless, limit=limit, max_pages=max_pages)
     
     raise ValueError(f"Unknown site: {site}. Available: {list(SCRAPERS.keys())}")
 
@@ -3619,6 +3640,7 @@ Examples:
     parser.add_argument('--visible', action='store_true', help='Show browser window')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--limit', type=int, help='Limit number of series to process')
+    parser.add_argument('--pages', type=int, help='Max browse pages per category (all paginated sites; Flame: max scroll rounds)')
     parser.add_argument('--canvas', action='store_true', help='For Webtoon: scrape CANVAS instead of ORIGINALS')
     parser.add_argument('--source-prefix', action='store_true', help='Prefix series folders with [Source] for multi-source comparison')
     
@@ -3651,8 +3673,8 @@ Examples:
                 logger.error("Could not auto-detect site from URL. Please specify with --site")
                 return
         
-        scraper = get_scraper(args.site, headless)
-        
+        scraper = get_scraper(args.site, headless, max_pages=getattr(args, 'pages', None))
+
         # Create series object from URL
         series = Series(
             title="Unknown",  # Will be updated from page
@@ -3788,7 +3810,7 @@ Examples:
             return
         
         # Single site mode
-        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit)
+        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit, max_pages=getattr(args, 'pages', None))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         if isinstance(scraper, ManhuaToScraper) and filter_terms:
             series_list = scraper.get_all_series(genre_filter=filter_terms)
@@ -3930,7 +3952,7 @@ Examples:
             return
         
         # Single site mode
-        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit)
+        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit, max_pages=getattr(args, 'pages', None))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         if isinstance(scraper, ManhuaToScraper) and filter_terms:
             series_list = scraper.get_all_series(genre_filter=filter_terms)
@@ -4023,7 +4045,7 @@ Examples:
             by_source.setdefault(s.source, []).append(s)
         
         for source, series in by_source.items():
-            scraper = get_scraper(source, headless)
+            scraper = get_scraper(source, headless, max_pages=getattr(args, 'pages', None))
             
             for i, s in enumerate(series, 1):
                 logger.info(f"[{i}/{len(series)}] Processing: {s.title}")
