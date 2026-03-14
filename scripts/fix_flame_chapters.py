@@ -92,12 +92,37 @@ def patch_comic_info(cbz_path: Path, new_number: int, new_title: str) -> bool:
         return False
 
 
+def _is_type_dir(path: Path) -> bool:
+    """Return True if path looks like a type directory (Manga/, Manhwa/, etc.)
+    that contains series subdirectories, rather than a root library directory
+    that contains type subdirectories.
+
+    Heuristic: if any immediate child directory itself contains *.cbz files,
+    this directory is already at the series level — it IS a type directory.
+    """
+    for child in path.iterdir():
+        if child.is_dir() and list(child.glob('*.cbz')):
+            return True
+    return False
+
+
 def find_flame_dirs(library_path: Path):
-    """Return all series directories that contain Flame Comics CBZ files."""
+    """Return all series directories that contain Flame Comics CBZ files.
+
+    Accepts either:
+      - A root library path (contains Manga/, Manhwa/, etc. as subdirs), or
+      - A type directory (contains series dirs directly, e.g. library/Manhwa/).
+    """
+    # Determine candidate series directories
+    if _is_type_dir(library_path):
+        # Given path is already a type directory — series dirs are direct children
+        type_dirs = [library_path]
+    else:
+        # Given path is the root library — type dirs are direct children
+        type_dirs = [d for d in sorted(library_path.iterdir()) if d.is_dir()]
+
     flame_dirs = []
-    for type_dir in sorted(library_path.iterdir()):
-        if not type_dir.is_dir():
-            continue
+    for type_dir in type_dirs:
         for series_dir in sorted(type_dir.iterdir()):
             if not series_dir.is_dir():
                 continue
@@ -136,17 +161,33 @@ def fix_series(
     db_conn,
 ) -> dict:
     """Plan (and optionally apply) sequential renumbering for one series."""
-    cbzs = sorted(
+    all_cbzs = sorted(
         series_dir.glob('*.cbz'),
         key=lambda f: parse_chapter_number(f.name),
     )
-    if not cbzs:
+    if not all_cbzs:
         return {'renames': 0}
 
     print(f"\n{'─' * 70}")
-    print(f"  {series_dir.name}  ({len(cbzs)} files)")
+    print(f"  {series_dir.name}  ({len(all_cbzs)} files)")
 
-    # Build rename plan: sort order → new sequential number
+    # Split into "special" chapters that must be preserved as-is, and plain
+    # positive-integer chapters that need sequential renumbering.
+    # "Special" = fractional (0.5, 1.5 …) OR zero/negative (Chapter 0 prologue).
+    def is_special(f):
+        n = parse_chapter_number(f.name)
+        return not n.is_integer() or n <= 0
+
+    special_cbzs = [f for f in all_cbzs if is_special(f)]
+    integer_cbzs = [f for f in all_cbzs if not is_special(f)]
+
+    if special_cbzs:
+        print(f"  Skipping {len(special_cbzs)} special chapter(s) (already correct):")
+        for f in special_cbzs:
+            print(f"    {f.name}")
+
+    # Build rename plan: sort order → new sequential number (integers only)
+    cbzs = integer_cbzs
     plan = []   # list of (old_path, new_path, new_num)
     for new_num, cbz in enumerate(cbzs, start=1):
         new_stem = replace_chapter_number_in_name(cbz.stem, new_num)

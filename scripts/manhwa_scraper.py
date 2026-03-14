@@ -1572,8 +1572,9 @@ class AsuraFullScraper(BaseSiteScraper):
                     img = item.select_one('img')
                     if img:
                         alt = img.get('alt', '').strip()
-                        # Skip if alt is just a type badge
-                        if alt and len(alt) > 3 and alt.upper() not in ['MANHWA', 'MANHUA', 'MANGA', 'WEBTOON']:
+                        # Skip generic alt values that are not real titles
+                        _SKIP_ALTS = {'MANHWA', 'MANHUA', 'MANGA', 'WEBTOON', 'POSTER', 'COVER', 'THUMBNAIL', 'IMAGE'}
+                        if alt and len(alt) > 3 and alt.upper() not in _SKIP_ALTS:
                             title = alt
                         # Grab cover image URL from the listing card
                         raw_src = img.get('src') or img.get('data-src') or ''
@@ -1691,8 +1692,24 @@ class AsuraFullScraper(BaseSiteScraper):
         chapters = []
         seen_urls = set()
 
-        # Look for chapter links - on Asura they're typically in a list
-        for link in soup.select('a[href*="chapter"]'):
+        # Derive the series slug path so we only collect chapters that belong to
+        # THIS series (e.g. "/series/swords-master-youngest-son-abc123/").
+        # Asura pages show a "Latest Chapters" sidebar with links from OTHER
+        # series — using a broad `a[href*="chapter"]` would pick those up too.
+        from urllib.parse import urlparse
+        parsed_series = urlparse(series.url)
+        # series path: e.g. "/series/swords-master-youngest-son-abc123"
+        series_path = parsed_series.path.rstrip('/')
+
+        # First try: scope to the scrollable chapter list container
+        chapter_container = (
+            soup.select_one('div[class*="scrollbar"]') or
+            soup.select_one('div[class*="chapter-list"]') or
+            soup.select_one('div[class*="chapters"]')
+        )
+        search_root = chapter_container if chapter_container else soup
+
+        for link in search_root.select('a[href*="chapter"]'):
             href = link.get('href', '').strip()
 
             if not href:
@@ -1706,6 +1723,12 @@ class AsuraFullScraper(BaseSiteScraper):
             else:
                 # Relative path like "series-name/chapter/1" needs /series/ prefix
                 full_url = self.BASE_URL + '/series/' + href
+
+            # Skip chapters that belong to a different series.
+            # If we found a scrollbar container, skip this check (already scoped).
+            if not chapter_container:
+                if series_path not in urlparse(full_url).path:
+                    continue
 
             # Skip duplicates
             if full_url in seen_urls:
