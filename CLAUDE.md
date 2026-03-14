@@ -37,9 +37,18 @@
 - `--pages N` caps browse pages per category for Asura, ManhuaTo, Drake; caps scroll rounds for Flame
 - `BaseSiteScraper.__init__` params: `headless`, `limit` (series count cap), `max_pages` (page cap)
 - `get_scraper(site, headless, canvas, limit, max_pages)` — always pass all relevant params
+- `max_pages` is fully wired through the codebase — new sites just need `if page > (self.max_pages or 200):` in their loop
 - BeautifulSoup: always use `get_text(separator=' ', strip=True)` — without separator, `Chapter 1<span>3 years ago</span>` becomes `"Chapter 13 years ago"` and regex captures the wrong number
 - Drake debug: if 0 series returned, check page title and body classes logged at DEBUG level (`--debug` flag)
 - ManhuaTo uses FlareSolverr on ARM; `_fs_cookies_applied` caches session cookies after first solve
+
+## Maintenance Scripts
+- `scripts/fix_flame_chapters.py` — fixes wrong chapter numbers in already-downloaded Flame CBZs by sorting numerically and renumbering 1, 2, 3… Dry-run by default; use `--apply [--db path/to/mangashelf.db]`
+- Run after any FlameComics re-scrape where chapter numbers look wrong (e.g. Ch.14 instead of Ch.1)
+
+## Front-end Patterns (`mangashelf/src/`)
+- Series page chapter count uses `displayChapterCount` — shows `max(chapters per source)` when "All Sources" is active, not the sum, to avoid inflated counts for multi-source series
+- Python type hints `list[X]` / `X | Y` require Python 3.10+; Pi may run older — use `List[X]` from `typing` and avoid union shorthand in scripts
 
 ## Git Workflow
 - Commit from `manga-server-full/` (the git root), not from `mangashelf/`
