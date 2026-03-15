@@ -611,9 +611,12 @@ class BaseSiteScraper:
         try:
             soup = self._get_soup(series.url, use_selenium=True)
             
-            # Get title if not set or is "Unknown"
-            if not series.title or series.title == "Unknown":
-                series.title = self._extract_title_from_soup(soup) or series.title
+            # Always prefer the detail page title — it is more authoritative
+            # than the listing page title, which may be shortened, use an
+            # alternate translation, or come from a generic link attribute.
+            detail_title = self._extract_title_from_soup(soup)
+            if detail_title:
+                series.title = detail_title
             
             # Get status
             if not series.status or series.status in ['', 'Unknown']:
@@ -3178,6 +3181,45 @@ class DrakeFullScraper(BaseSiteScraper):
         html = self.driver.page_source
         return BeautifulSoup(html, 'html.parser')
 
+    def _extract_title_from_soup(self, soup) -> str:
+        """Drake-specific title extraction.
+
+        Drake uses the Madara / WP-manga WordPress theme.  The series title is
+        in 'div.post-title h1' or 'h1.entry-title'.  og:title often contains a
+        different (or alternate) translation and always has the site suffix, so
+        we prefer the on-page H1 first, then fall back to the base class.
+        """
+        for selector in ('div.post-title h1', 'h1.entry-title',
+                         '.manga-title h1', '.seriestuheader h1'):
+            elem = soup.select_one(selector)
+            if elem:
+                text = elem.get_text(separator=' ', strip=True)
+                if text and len(text) > 2:
+                    return text
+        # Fall back to base class (tries og:title, then other h1 selectors)
+        return super()._extract_title_from_soup(soup)
+
+    def _extract_cover_from_soup(self, soup) -> str:
+        """Drake-specific cover extraction.
+
+        Drake's og:image is a promotional banner that includes their site
+        branding header, not a clean cover thumbnail.  Use the Madara theme
+        cover selectors directly instead; only fall back to og:image if no
+        thumbnail is found.
+        """
+        for selector in ('.summary_image img', '.seriestuimg img',
+                         '.thumb img', '[class*="thumb"] img',
+                         '.manga-thumb img', '.comic-thumb img'):
+            elem = soup.select_one(selector)
+            if elem:
+                raw = (elem.get('data-src') or elem.get('data-lazy-src')
+                       or elem.get('src', ''))
+                url = raw.strip()
+                if url and url.startswith('http') and not url.endswith('.gif'):
+                    return url
+        # Fall back to base class (includes og:image as last resort)
+        return super()._extract_cover_from_soup(soup)
+
     def get_all_series(self) -> List[Series]:
         """Get all series from Drake Comics"""
         logger.info("Fetching all series from Drake Comics...")
@@ -4143,8 +4185,11 @@ Examples:
             logger.info(f"[{i}/{len(series_list)}] Processing: {series.title}")
             
             try:
-                # Fetch full details for metadata if not already done
-                if series.rating == 0.0 and not series.description:
+                # Fetch full details if cover is missing or if we have no
+                # description/rating yet.  cover_url is never populated by
+                # get_all_series() on Drake (and some other scrapers), so we
+                # must always hit the detail page at least once to get it.
+                if not series.cover_url or (series.rating == 0.0 and not series.description):
                     series = scraper.get_series_details(series)
                 
                 chapters = scraper.get_chapters(series)
