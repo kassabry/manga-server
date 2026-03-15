@@ -509,7 +509,12 @@ class BaseSiteScraper:
                 return BeautifulSoup(html, 'html.parser')
             except Exception as e:
                 logger.warning(f"FlareSolverr failed for {url}: {e}")
-                # Fall through to Selenium if available
+                # Fall through to Selenium if available — but only if a driver
+                # can actually be created.  Sites that run in pure-FlareSolverr
+                # mode (e.g. DrakeFullScraper on ARM) never init self.driver, so
+                # attempting driver.get() here would raise AttributeError.
+                if not self.driver:
+                    return BeautifulSoup("", 'html.parser')
 
         if use_selenium:
             self._init_driver()
@@ -3342,26 +3347,30 @@ class DrakeFullScraper(BaseSiteScraper):
         return pages
 
     def get_pages(self, chapter: Chapter) -> List[str]:
-        # _get_soup handles FlareSolverr vs Selenium internally.
-        # Madara theme stores image URLs in data-src attributes in the static
-        # HTML, so the cached-session fast path usually works.  If no images
-        # are found on the first attempt (e.g. stale cookies returned a page
-        # without the reader area), force a fresh FlareSolverr solve and retry.
-        soup = self._get_soup(chapter.url, use_selenium=True)
-
-        # Sync Cloudflare cookies so image downloads work
-        self._sync_cookies_from_driver()
+        # Drake chapter pages render images via JavaScript (wp-manga-reader.js
+        # populates <img src> after page load).  A plain HTTP request — even
+        # with valid Cloudflare clearance cookies — returns the shell HTML
+        # without any image tags, so the cached-session fast path always fails.
+        # Skip it entirely and go straight to FlareSolverr (full headless
+        # Chromium that executes the JS) on the first attempt.
+        if self._use_flaresolverr:
+            try:
+                html, cookies, user_agent = self._flaresolverr_get(chapter.url)
+                self._apply_flaresolverr_cookies(cookies, user_agent)
+                self._fs_cookies_applied = True
+                soup = BeautifulSoup(html, 'html.parser')
+            except Exception as e:
+                logger.warning(f"FlareSolverr failed for {chapter.url}: {e}")
+                return []
+        else:
+            # Non-ARM path: use Selenium with undetected-chromedriver
+            soup = self._get_soup(chapter.url, use_selenium=True)
+            self._sync_cookies_from_driver()
 
         pages = self._extract_drake_pages(soup)
 
-        # Retry once via FlareSolverr if the cached-session HTML had no images
-        if not pages and self._use_flaresolverr and self._fs_cookies_applied:
-            logger.warning(
-                f"No images from cached session for {chapter.url} — retrying via FlareSolverr"
-            )
-            self._fs_cookies_applied = False
-            soup = self._get_soup(chapter.url, use_selenium=True)
-            pages = self._extract_drake_pages(soup)
+        if not pages:
+            logger.warning(f"No pages found for {chapter.url} even after FlareSolverr")
 
         return pages
 
