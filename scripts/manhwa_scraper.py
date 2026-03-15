@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
 from datetime import datetime
-import pickle
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -114,26 +114,44 @@ class Series:
 
 class ProgressTracker:
     """Track download progress to allow resuming"""
-    
+
     def __init__(self, cache_file: Path):
-        self.cache_file = cache_file
+        # Use a JSON file alongside the legacy pkl name for safe storage
+        self.cache_file = cache_file.with_suffix('.json')
+        self._legacy_file = cache_file  # old .pkl path for one-time migration
         self.downloaded: Set[str] = set()
         self.load()
-    
+
     def load(self):
+        # Try JSON cache first
         if self.cache_file.exists():
             try:
-                with open(self.cache_file, 'rb') as f:
-                    self.downloaded = pickle.load(f)
+                import json as _json
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    self.downloaded = set(_json.load(f))
                 logger.info(f"Loaded progress: {len(self.downloaded)} chapters already downloaded")
+                return
             except Exception as e:
                 logger.warning(f"Could not load progress cache: {e}")
                 self.downloaded = set()
-    
+        # One-time migration: read old pickle file if it exists, then convert
+        if self._legacy_file.exists():
+            try:
+                import pickle as _pickle
+                with open(self._legacy_file, 'rb') as f:
+                    self.downloaded = _pickle.load(f)
+                logger.info(f"Migrated {len(self.downloaded)} entries from legacy pickle cache")
+                self.save()  # persist as JSON immediately
+                self._legacy_file.unlink(missing_ok=True)  # remove old pkl
+            except Exception as e:
+                logger.warning(f"Could not migrate legacy progress cache: {e}")
+                self.downloaded = set()
+
     def save(self):
         try:
-            with open(self.cache_file, 'wb') as f:
-                pickle.dump(self.downloaded, f)
+            import json as _json
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                _json.dump(list(self.downloaded), f)
         except Exception as e:
             logger.warning(f"Could not save progress cache: {e}")
     
@@ -197,7 +215,7 @@ class BaseSiteScraper:
             version, _ = winreg.QueryValueEx(key, "version")
             winreg.CloseKey(key)
             return int(version.split('.')[0])
-        except:
+        except Exception:
             pass
         # Linux - try multiple browser names
         for browser in ['google-chrome', 'chromium-browser', 'chromium']:
@@ -206,7 +224,7 @@ class BaseSiteScraper:
                 match = regex.search(r'(\d+)\.', result.stdout)
                 if match:
                     return int(match.group(1))
-            except:
+            except Exception:
                 pass
         return None
 
@@ -281,16 +299,22 @@ class BaseSiteScraper:
         return html, cookies, user_agent
 
     def _apply_flaresolverr_cookies(self, cookies: list, user_agent: str = ""):
-        """Apply cookies from FlareSolverr to the requests session"""
+        """Apply cookies from FlareSolverr to the requests session."""
+        applied = 0
         for c in cookies:
+            domain = c.get("domain", "").strip()
+            if not domain:
+                logger.debug(f"Skipping cookie '{c.get('name', '?')}' with empty domain")
+                continue
             self.session.cookies.set(
                 c["name"], c["value"],
-                domain=c.get("domain", ""),
+                domain=domain,
                 path=c.get("path", "/"),
             )
+            applied += 1
         if user_agent:
             self.session.headers["User-Agent"] = user_agent
-        logger.debug(f"Applied {len(cookies)} FlareSolverr cookies to session")
+        logger.debug(f"Applied {applied}/{len(cookies)} FlareSolverr cookies to session")
 
     def _inject_ad_blocker(self):
         """Inject JavaScript to block ads, popups, and redirects"""
@@ -324,7 +348,7 @@ class BaseSiteScraper:
                     };
                 """
             })
-        except:
+        except Exception:
             pass
 
     def _init_driver(self):
@@ -422,7 +446,7 @@ class BaseSiteScraper:
             self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
             })
-        except:
+        except Exception:
             pass
         
         self.driver.implicitly_wait(10)
@@ -506,7 +530,7 @@ class BaseSiteScraper:
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="series/"]'))
                 )
                 time.sleep(1)  # Extra time for all content to render
-            except:
+            except Exception:
                 pass  # Continue even if wait fails
 
             html = self.driver.page_source
@@ -559,7 +583,7 @@ class BaseSiteScraper:
                             return 'Hiatus'
                         elif 'dropped' in text or 'cancelled' in text or 'canceled' in text:
                             return 'Dropped'
-                except:
+                except Exception:
                     continue
             
             # Try searching all text for status keywords
@@ -618,7 +642,7 @@ class BaseSiteScraper:
                 try:
                     chapters = self.get_chapters(series)
                     series.chapters_count = len(chapters)
-                except:
+                except Exception:
                     pass
             
             return series
@@ -662,7 +686,7 @@ class BaseSiteScraper:
                             'BETA SITE' not in text.upper() and
                             'SUBSCRIBE' not in text.upper()):
                         return text
-            except:
+            except Exception:
                 continue
         return ""
     
@@ -686,7 +710,7 @@ class BaseSiteScraper:
                         return 'Hiatus'
                     elif 'dropped' in text:
                         return 'Dropped'
-            except:
+            except Exception:
                 continue
         return 'Unknown'
     
@@ -711,7 +735,7 @@ class BaseSiteScraper:
                         if rating > 5.0:
                             rating = rating / 2.0  # Assume 10-point scale
                         return round(min(rating, 5.0), 2)
-            except:
+            except Exception:
                 continue
         return 0.0
     
@@ -732,7 +756,7 @@ class BaseSiteScraper:
                         # Clean up the text
                         text = re.sub(r'\s+', ' ', text)
                         return text[:2000]  # Limit length
-            except:
+            except Exception:
                 continue
         return ""
     
@@ -752,7 +776,7 @@ class BaseSiteScraper:
                     text = re.sub(r'^(Authors?|Writers?|By)[:\s]*', '', text, flags=re.I)
                     if text and len(text) > 1 and len(text) < 100:
                         return text
-            except:
+            except Exception:
                 continue
         return ""
 
@@ -771,7 +795,7 @@ class BaseSiteScraper:
                     text = re.sub(r'^(Artists?|Illustrators?)[:\s]*', '', text, flags=re.I)
                     if text and len(text) > 1 and len(text) < 100:
                         return text
-            except:
+            except Exception:
                 continue
         return ""
     
@@ -918,7 +942,7 @@ class BaseSiteScraper:
                     url = _clean_url(raw)
                     if url and len(url) > 10 and not url.endswith('.gif'):
                         return url
-            except:
+            except Exception:
                 continue
 
         # 3. Next.js sites: find img tags with /_next/image src containing 'series'
@@ -1175,6 +1199,12 @@ class BaseSiteScraper:
         safe_chapter = self._sanitize_filename(chapter.number)
 
         series_dir = output_dir / safe_title
+        # Guard against path traversal: series_dir must stay inside output_dir
+        try:
+            series_dir.resolve().relative_to(output_dir.resolve())
+        except ValueError:
+            logger.error(f"Path traversal detected for title '{series_title}' — skipping")
+            return False
         cbz_name = f"{safe_title} - Chapter {safe_chapter}.cbz"
         cbz_path = series_dir / cbz_name
 
@@ -1318,22 +1348,33 @@ class BaseSiteScraper:
     
     @staticmethod
     def _sanitize_filename(name: str) -> str:
-        """Sanitize filename for filesystem"""
+        """Sanitize filename for filesystem, preventing path traversal."""
+        # Remove null bytes and control characters
+        name = name.replace('\x00', '')
+        # Remove filesystem-invalid characters
         name = re.sub(r'[<>:"/\\|?*]', '', name)
+        # Collapse whitespace
         name = re.sub(r'\s+', ' ', name)
         name = name.strip()
+        # Remove leading dots to prevent hidden-file or traversal tricks (e.g. "..", ".")
+        # Strip again after removing dots to catch ".. evil" -> " evil" -> "evil"
+        name = name.lstrip('.').strip()
+        if not name:
+            name = '_unnamed'
         return name[:200]
-    
+
     @staticmethod
     def _get_extension(url: str) -> str:
-        """Get file extension from URL"""
-        url_lower = url.lower()
-        if '.png' in url_lower:
-            return '.png'
-        elif '.webp' in url_lower:
-            return '.webp'
-        elif '.gif' in url_lower:
-            return '.gif'
+        """Get file extension from the URL path (not query string or fragment)."""
+        from urllib.parse import urlparse
+        from pathlib import PurePosixPath
+        try:
+            path = PurePosixPath(urlparse(url).path)
+            ext = path.suffix.lower()
+            if ext in ('.png', '.webp', '.gif', '.jpg', '.jpeg'):
+                return ext
+        except Exception:
+            pass
         return '.jpg'
 
 
@@ -1638,7 +1679,7 @@ class AsuraFullScraper(BaseSiteScraper):
                                 rating = float(rating_match.group(1))
                                 if rating > 5:
                                     rating = rating / 2  # Normalize 10-point to 5-point
-                        except:
+                        except Exception:
                             pass
                     
                     series = Series(
@@ -2705,7 +2746,7 @@ class ManhuaToScraper(BaseSiteScraper):
                                 EC.presence_of_element_located((By.CSS_SELECTOR, 'div.visual, div.manga-cover, div.list_wrap'))
                             )
                             time.sleep(1)
-                        except:
+                        except Exception:
                             pass
 
                         soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -2871,20 +2912,21 @@ class ManhuaToScraper(BaseSiteScraper):
                 self._init_driver()
 
                 # Load saved cookies if available
-                try:
-                    import pickle
-                    with open("manhuato_cookies.pkl", 'rb') as f:
-                        cookies = pickle.load(f)
-                    self.driver.get("https://manhuato.com")
-                    time.sleep(1)
-                    for c in cookies:
-                        try:
-                            self.driver.add_cookie(c)
-                        except:
-                            pass
-                    logger.info(f"Loaded {len(cookies)} saved cookies")
-                except:
-                    pass
+                cookie_file = Path("manhuato_cookies.json")
+                if cookie_file.exists():
+                    try:
+                        with open(cookie_file, 'r', encoding='utf-8') as f:
+                            cookies = json.load(f)
+                        self.driver.get("https://manhuato.com")
+                        time.sleep(1)
+                        for c in cookies:
+                            try:
+                                self.driver.add_cookie(c)
+                            except Exception:
+                                pass
+                        logger.info(f"Loaded {len(cookies)} saved cookies")
+                    except Exception as e:
+                        logger.debug(f"Could not load saved cookies: {e}")
 
                 # Try to load the page with MANY retries (ads cause redirects)
                 max_retries = 15
@@ -2922,7 +2964,7 @@ class ManhuaToScraper(BaseSiteScraper):
                             }
                         });
                     """)
-                except:
+                except Exception:
                     pass
 
                 soup = BeautifulSoup(self.driver.page_source, 'html.parser')
@@ -2980,13 +3022,14 @@ class ManhuaToScraper(BaseSiteScraper):
                         'Referer': chapter_url,
                     })
                     
-                    # Find all images by enumeration
+                    # Find all images by enumeration (rate-limited to avoid CDN bans)
                     consecutive_failures = 0
                     current_num = 0
-                    
+                    ENUM_DELAY = 0.3  # seconds between probes
+
                     while consecutive_failures < 5 and current_num < 300:
                         test_url = f"{base_url}{current_num}{extension}"
-                        
+
                         if test_url not in pages:
                             try:
                                 resp = session.get(test_url, timeout=10, stream=True)
@@ -2997,11 +3040,12 @@ class ManhuaToScraper(BaseSiteScraper):
                                 else:
                                     consecutive_failures += 1
                                 resp.close()
-                            except:
+                            except Exception:
                                 consecutive_failures += 1
+                            time.sleep(ENUM_DELAY)
                         else:
                             consecutive_failures = 0
-                        
+
                         current_num += 1
                     
                     # Sort by number
@@ -3220,23 +3264,31 @@ class DrakeFullScraper(BaseSiteScraper):
     
     def get_chapters(self, series: Series) -> List[Chapter]:
         soup = self._get_soup(series.url, use_selenium=True)
-        
+
         chapters = []
+        # Prefer specific Madara list containers; fall back to the broad
+        # a[href*="chapter"] selector only as a last resort.  The '{' guard
+        # below filters the JS template placeholder links (e.g.
+        # /chapter/{{number}}/) that Drake injects for pagination scaffolding.
         for link in soup.select('#chapterlist li a, .eplister li a, a[href*="chapter"]'):
             href = link.get('href', '').strip()
             if not href:
                 continue
-            
+
+            # Skip JS template placeholder URLs (e.g. /chapter/{{number}}/)
+            if '{' in href:
+                continue
+
             num_elem = link.select_one('.chapternum, .epl-num, .epxs')
-            text = num_elem.get_text(strip=True) if num_elem else link.get_text(strip=True)
-            
+            text = num_elem.get_text(separator=' ', strip=True) if num_elem else link.get_text(separator=' ', strip=True)
+
             match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
             if not match:
                 match = re.search(r'(\d+(?:\.\d+)?)', text)
             num = match.group(1) if match else text
-            
+
             full_url = href if href.startswith('http') else self.BASE_URL + href
-            
+
             # Avoid duplicates
             if not any(c.url == full_url for c in chapters):
                 chapters.append(Chapter(
@@ -3244,7 +3296,7 @@ class DrakeFullScraper(BaseSiteScraper):
                     title=text or f"Chapter {num}",
                     url=full_url
                 ))
-        
+
         chapters.reverse()
         return chapters
     
@@ -3265,20 +3317,51 @@ class DrakeFullScraper(BaseSiteScraper):
                 pass
             logger.debug("Synced cookies and UA from browser to requests session")
 
+    def _extract_drake_pages(self, soup: BeautifulSoup) -> List[str]:
+        """Extract chapter image URLs from a parsed Drake chapter page."""
+        pages = []
+        # Madara/WP-manga theme: images live in .reading-content .page-break img.
+        # Try selectors in specificity order; stop at the first one that yields.
+        selectors = (
+            '.reading-content .page-break img',
+            '.reading-content img',
+            '#readerarea img',
+            '.chapter-content img',
+            'img.ts-main-image',
+            'img.wp-manga-chapter-img',
+        )
+        for selector in selectors:
+            for img in soup.select(selector):
+                src = img.get('data-src') or img.get('data-lazy-src') or img.get('src', '')
+                src = src.strip()
+                if src and 'logo' not in src.lower() and 'icon' not in src.lower():
+                    if src not in pages:
+                        pages.append(src)
+            if pages:
+                break
+        return pages
+
     def get_pages(self, chapter: Chapter) -> List[str]:
-        # _get_soup handles FlareSolverr vs Selenium internally
+        # _get_soup handles FlareSolverr vs Selenium internally.
+        # Madara theme stores image URLs in data-src attributes in the static
+        # HTML, so the cached-session fast path usually works.  If no images
+        # are found on the first attempt (e.g. stale cookies returned a page
+        # without the reader area), force a fresh FlareSolverr solve and retry.
         soup = self._get_soup(chapter.url, use_selenium=True)
 
         # Sync Cloudflare cookies so image downloads work
         self._sync_cookies_from_driver()
 
-        pages = []
-        for img in soup.select('#readerarea img, .chapter-content img, img.ts-main-image'):
-            src = img.get('data-src') or img.get('src', '')
-            src = src.strip()
-            if src and 'logo' not in src.lower() and 'icon' not in src.lower():
-                if src not in pages:
-                    pages.append(src)
+        pages = self._extract_drake_pages(soup)
+
+        # Retry once via FlareSolverr if the cached-session HTML had no images
+        if not pages and self._use_flaresolverr and self._fs_cookies_applied:
+            logger.warning(
+                f"No images from cached session for {chapter.url} — retrying via FlareSolverr"
+            )
+            self._fs_cookies_applied = False
+            soup = self._get_soup(chapter.url, use_selenium=True)
+            pages = self._extract_drake_pages(soup)
 
         return pages
 

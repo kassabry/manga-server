@@ -203,30 +203,32 @@ def patch_file(filepath):
                         'Referer': chapter_url,
                     })
                     
-                    # Find all images by enumeration starting from 0
+                    # Find all images by enumeration starting from 0 (rate-limited)
                     consecutive_failures = 0
                     current_num = 0
-                    
+                    ENUM_DELAY = 0.3  # seconds between probes
+
                     while consecutive_failures < 5 and current_num < 300:
                         test_url = f"{base_url}{current_num}{extension}"
-                        
+
                         if test_url not in pages:
                             try:
                                 resp = session.get(test_url, timeout=10, stream=True)
                                 content_type = resp.headers.get('Content-Type', '')
-                                
+
                                 if resp.status_code == 200 and 'image' in content_type:
                                     pages.append(test_url)
                                     consecutive_failures = 0
                                 else:
                                     consecutive_failures += 1
-                                
+
                                 resp.close()
-                            except:
+                            except Exception:
                                 consecutive_failures += 1
+                            time.sleep(ENUM_DELAY)
                         else:
                             consecutive_failures = 0
-                        
+
                         current_num += 1
                     
                     # Sort by number

@@ -133,8 +133,14 @@ class BaseScraper:
         """Download a chapter and create CBZ"""
         safe_title = self._sanitize_filename(series_title)
         safe_chapter = self._sanitize_filename(chapter.number)
-        
+
         series_dir = output_dir / safe_title
+        # Guard against path traversal: series_dir must stay inside output_dir
+        try:
+            series_dir.resolve().relative_to(output_dir.resolve())
+        except ValueError:
+            logger.error(f"Path traversal detected for title '{series_title}' — skipping")
+            return False
         series_dir.mkdir(parents=True, exist_ok=True)
         
         cbz_name = f"{safe_title} - Chapter {safe_chapter}.cbz"
@@ -157,40 +163,81 @@ class BaseScraper:
             temp_dir.mkdir(exist_ok=True)
             
             # Download images
+            success_count = 0
             for i, page_url in enumerate(pages, 1):
                 ext = self._get_extension(page_url)
                 img_path = temp_dir / f"{i:03d}{ext}"
-                
+
                 if not self._download_image(page_url, img_path, chapter.url):
                     logger.warning(f"Failed to download page {i}")
                     continue
-            
+                success_count += 1
+
+            if success_count == 0:
+                logger.error(f"No images downloaded for chapter {chapter.number} — skipping CBZ creation")
+                for f in temp_dir.iterdir():
+                    f.unlink()
+                temp_dir.rmdir()
+                return False
+
             # Create CBZ
             self._create_cbz(temp_dir, cbz_path)
-            
+
             # Cleanup
             for f in temp_dir.iterdir():
                 f.unlink()
             temp_dir.rmdir()
-            
-            logger.info(f"Created: {cbz_name}")
+
+            logger.info(f"Created: {cbz_name} ({success_count} pages)")
             return True
             
         except Exception as e:
             logger.error(f"Error downloading chapter: {e}")
             return False
     
+    # Allowlisted CDN/image domains — only images from these are downloaded
+    _ALLOWED_IMAGE_DOMAINS = (
+        'asuracomic.net', 'asura.gg', 'asuratoon.com',
+        'flamecomics.xyz', 'flamecomics.me',
+        'drakecomic.org',
+        'manhuato.com', 'cdn.manhuato.com',
+        'webtoons.com', 'webtoon.com',
+        'imgur.com', 'i.imgur.com',
+        'cloudflare.com', 'cdnjs.cloudflare.com',
+    )
+
+    def _is_allowed_image_url(self, url: str) -> bool:
+        """Return True only if the URL's host is in the allowed-domains list."""
+        from urllib.parse import urlparse
+        try:
+            host = urlparse(url).hostname or ''
+            return any(host == d or host.endswith('.' + d) for d in self._ALLOWED_IMAGE_DOMAINS)
+        except Exception:
+            return False
+
     def _download_image(self, url: str, path: Path, referer: str) -> bool:
-        """Download an image file"""
+        """Download an image file from an allowed domain only."""
+        if not self._is_allowed_image_url(url):
+            logger.warning(f"Blocked image download from untrusted host: {url}")
+            return False
         try:
             headers = {
                 'Referer': referer,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
-            response = self.session.get(url, headers=headers, timeout=30)
+            response = self.session.get(url, headers=headers, timeout=30, stream=True)
             response.raise_for_status()
-            
-            path.write_bytes(response.content)
+            # Enforce a 50 MB per-image size cap to prevent disk exhaustion
+            max_bytes = 50 * 1024 * 1024
+            data = b''
+            for chunk in response.iter_content(65536):
+                data += chunk
+                if len(data) > max_bytes:
+                    logger.warning(f"Image too large (>{max_bytes // 1024 // 1024} MB), skipping: {url}")
+                    return False
+            if len(data) < 512:
+                return False
+            path.write_bytes(data)
             return True
         except Exception as e:
             logger.error(f"Failed to download {url}: {e}")
@@ -205,26 +252,33 @@ class BaseScraper:
     
     @staticmethod
     def _sanitize_filename(name: str) -> str:
-        """Sanitize filename for filesystem"""
-        # Remove invalid characters
+        """Sanitize filename for filesystem, preventing path traversal."""
+        # Remove null bytes and control characters
+        name = name.replace('\x00', '')
+        # Remove filesystem-invalid characters
         name = re.sub(r'[<>:"/\\|?*]', '', name)
-        # Replace multiple spaces with single space
+        # Collapse whitespace
         name = re.sub(r'\s+', ' ', name)
-        # Trim
         name = name.strip()
-        # Limit length
+        # Remove leading dots to prevent hidden-file or traversal tricks (e.g. "..", ".")
+        # Strip again after removing dots to catch ".. evil" -> " evil" -> "evil"
+        name = name.lstrip('.').strip()
+        if not name:
+            name = '_unnamed'
         return name[:200]
     
     @staticmethod
     def _get_extension(url: str) -> str:
-        """Get file extension from URL"""
-        url_lower = url.lower()
-        if '.png' in url_lower:
-            return '.png'
-        elif '.webp' in url_lower:
-            return '.webp'
-        elif '.gif' in url_lower:
-            return '.gif'
+        """Get file extension from the URL path (not query string or fragment)."""
+        from urllib.parse import urlparse
+        from pathlib import PurePosixPath
+        try:
+            path = PurePosixPath(urlparse(url).path)
+            ext = path.suffix.lower()
+            if ext in ('.png', '.webp', '.gif', '.jpg', '.jpeg'):
+                return ext
+        except Exception:
+            pass
         return '.jpg'
 
 
@@ -425,17 +479,24 @@ def get_scraper(source: str, headless: bool = True) -> BaseScraper:
 
 def download_from_url(url: str, output_dir: Path, headless: bool = True):
     """Download all chapters from a series URL"""
+    from urllib.parse import urlparse
     scraper = get_scraper(url, headless)
-    
+
     # Create a series object from the URL
-    series = Series(title="Unknown", url=url, source="auto")
-    
+    series = Series(title="", url=url, source="auto")
+
     # Get series info
     soup = scraper._get_soup(url, use_selenium=True)
     title_elem = soup.select_one('h1, .entry-title, .post-title')
     if title_elem:
-        series.title = title_elem.get_text(strip=True)
-    
+        series.title = title_elem.get_text(strip=True).strip()
+
+    # Fall back to the last path segment of the URL so we never collide on "Unknown"
+    if not series.title:
+        path_parts = [p for p in urlparse(url).path.rstrip('/').split('/') if p]
+        series.title = path_parts[-1].replace('-', ' ').title() if path_parts else 'Unknown'
+        logger.warning(f"Could not detect series title, using URL slug: {series.title}")
+
     logger.info(f"Found series: {series.title}")
     
     # Get chapters

@@ -110,13 +110,14 @@ NEW_GET_PAGES = '''    def get_pages(self, chapter: Chapter) -> List[str]:
                         'Referer': 'https://manhuato.com/',
                     })
                     
-                    # Find all images by enumeration
+                    # Find all images by enumeration (rate-limited to avoid CDN bans)
                     consecutive_failures = 0
                     current_num = 0
-                    
+                    ENUM_DELAY = 0.3  # seconds between probes
+
                     while consecutive_failures < 3 and current_num < 200:
                         test_url = f"{base_url}{current_num}{extension}"
-                        
+
                         if test_url not in pages:
                             try:
                                 resp = session.head(test_url, timeout=5)
@@ -125,11 +126,12 @@ NEW_GET_PAGES = '''    def get_pages(self, chapter: Chapter) -> List[str]:
                                     consecutive_failures = 0
                                 else:
                                     consecutive_failures += 1
-                            except:
+                            except Exception:
                                 consecutive_failures += 1
+                            time.sleep(ENUM_DELAY)
                         else:
                             consecutive_failures = 0
-                        
+
                         current_num += 1
                     
                     # Sort by number

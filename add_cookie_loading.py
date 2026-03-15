@@ -13,20 +13,20 @@ from pathlib import Path
 COOKIE_LOADING_CODE = '''
     def _load_manhuato_cookies(self):
         """Load saved ManhuaTo cookies to bypass verification"""
-        import pickle
-        cookie_file = Path("manhuato_cookies.pkl")
+        import json as _json
+        cookie_file = Path("manhuato_cookies.json")
         if not cookie_file.exists():
             return False
         try:
-            with open(cookie_file, 'rb') as f:
-                cookies = pickle.load(f)
+            with open(cookie_file, 'r', encoding='utf-8') as f:
+                cookies = _json.load(f)
             # Navigate to domain first
             self.driver.get("https://manhuato.com")
             time.sleep(1)
             for cookie in cookies:
                 try:
                     self.driver.add_cookie(cookie)
-                except:
+                except Exception:
                     pass
             logger.info(f"Loaded {len(cookies)} ManhuaTo cookies")
             return True

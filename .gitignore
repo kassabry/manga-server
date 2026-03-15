@@ -9,6 +9,7 @@ test/
 # Logs
 # ===========================================
 logs/
+*.logs
 
 # ===========================================
 # Python
@@ -27,6 +28,7 @@ venv/
 *.env
 .env*
 manhuato_cookies.pkl
+manhuato_cookies.json
 
 # ===========================================
 # Config (may contain user-specific data)
