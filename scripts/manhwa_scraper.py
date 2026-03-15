@@ -1195,10 +1195,31 @@ class BaseSiteScraper:
         if removed:
             logger.info(f"Removed {removed} outlier image(s) by dimension")
 
+    def _scan_series_dir(self, series_title: str, output_dir: Path) -> set:
+        """Return the set of CBZ filenames already present in the series directory.
+
+        Called once per series before the chapter loop so that per-chapter
+        existence checks can be done as O(1) set lookups rather than individual
+        stat() syscalls — critical on NFS/network mounts where each stat can
+        take hundreds of milliseconds.
+        """
+        safe_title = self._sanitize_filename(series_title)
+        series_dir = output_dir / safe_title
+        try:
+            return {f.name for f in series_dir.iterdir() if f.suffix == '.cbz'}
+        except (FileNotFoundError, PermissionError):
+            return set()
+
     def download_chapter(self, chapter: Chapter, series_title: str,
                         output_dir: Path, tracker: ProgressTracker,
-                        series: Series = None) -> bool:
-        """Download a chapter and create CBZ with metadata"""
+                        series: Series = None,
+                        existing_cbzs: set = None) -> bool:
+        """Download a chapter and create CBZ with metadata.
+
+        existing_cbzs: optional set of CBZ filenames already on disk for this
+        series, pre-scanned by _scan_series_dir().  When provided, all
+        existence checks use O(1) set membership instead of stat() syscalls.
+        """
 
         safe_title = self._sanitize_filename(series_title)
         safe_chapter = self._sanitize_filename(chapter.number)
@@ -1213,10 +1234,16 @@ class BaseSiteScraper:
         cbz_name = f"{safe_title} - Chapter {safe_chapter}.cbz"
         cbz_path = series_dir / cbz_name
 
+        # Helper: O(1) set lookup when pre-scan is available, stat() fallback otherwise.
+        def _exists():
+            if existing_cbzs is not None:
+                return cbz_name in existing_cbzs
+            return cbz_path.exists()
+
         # Check if already downloaded — but only trust the cache if the CBZ file
         # actually exists on disk.  If the file was deleted, re-download it.
         if tracker.is_downloaded(chapter.url):
-            if cbz_path.exists():
+            if _exists():
                 logger.debug(f"Skipping (already downloaded): {series_title} Ch.{chapter.number}")
                 return True
             else:
@@ -1233,7 +1260,7 @@ class BaseSiteScraper:
             if not existing_covers:
                 self._download_cover(series.cover_url, series_dir, referer=series.url)
 
-        if cbz_path.exists():
+        if _exists():
             tracker.mark_downloaded(chapter.url)
             logger.info(f"Already exists: {cbz_name}")
             return True
@@ -1293,9 +1320,12 @@ class BaseSiteScraper:
                 f.unlink()
             temp_dir.rmdir()
             
-            # Mark as downloaded
+            # Mark as downloaded and update the in-memory set so the rest of
+            # this run's chapter loop doesn't re-check a file we just wrote.
             tracker.mark_downloaded(chapter.url)
-            
+            if existing_cbzs is not None:
+                existing_cbzs.add(cbz_name)
+
             logger.info(f"Created: {cbz_name} ({success_count} pages)")
             return True
             
@@ -4130,8 +4160,12 @@ Examples:
                     series_for_meta = copy.copy(series)
                     series_for_meta.title = display_title
                 
+                # Scan the series directory once so per-chapter checks are O(1)
+                # set lookups instead of individual stat() calls on the NFS mount.
+                existing_cbzs = scraper._scan_series_dir(display_title, output_path)
+
                 for chapter in chapters:
-                    scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta)
+                    scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
                     
             except Exception as e:
                 logger.error(f"  Error processing {series.title}: {e}")
@@ -4171,8 +4205,9 @@ Examples:
                         s = scraper.get_series_details(s)
                     
                     chapters = scraper.get_chapters(s)
+                    existing_cbzs = scraper._scan_series_dir(s.title, output_path)
                     for chapter in chapters:
-                        scraper.download_chapter(chapter, s.title, output_path, tracker, s)
+                        scraper.download_chapter(chapter, s.title, output_path, tracker, s, existing_cbzs=existing_cbzs)
                 except Exception as e:
                     logger.error(f"Error: {e}")
             
