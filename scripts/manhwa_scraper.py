@@ -183,6 +183,9 @@ class BaseSiteScraper:
         self.max_pages = max_pages  # Max pages to browse per category (None = unlimited)
         self._use_flaresolverr = False
         self._fs_cookies_applied = False
+        # Track cover URLs that have already failed so we don't spam a 403
+        # warning on every chapter of a series when the cover is unavailable.
+        self._failed_cover_urls: set = set()
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -981,9 +984,12 @@ class BaseSiteScraper:
             return None
 
         try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            }
+            # Do NOT set User-Agent here — Cloudflare-protected sites (Drake,
+            # ManhuaTo) validate that the UA matches the one used during the
+            # CF challenge.  FlareSolverr already stored the correct UA in
+            # self.session.headers; overriding it with a generic string causes
+            # a 403 even when the cf_clearance cookie is valid.
+            headers = {}
             if referer:
                 headers['Referer'] = referer
 
@@ -1257,11 +1263,15 @@ class BaseSiteScraper:
 
         series_dir.mkdir(parents=True, exist_ok=True)
 
-        # Download series cover image once (if not already present)
-        if series and series.cover_url:
+        # Download series cover image once (if not already present).
+        # Skip if we already tried and failed for this URL — avoids a 403
+        # warning on every chapter when the cover host blocks direct fetches.
+        if series and series.cover_url and series.cover_url not in self._failed_cover_urls:
             existing_covers = list(series_dir.glob('cover.*'))
             if not existing_covers:
-                self._download_cover(series.cover_url, series_dir, referer=series.url)
+                result = self._download_cover(series.cover_url, series_dir, referer=series.url)
+                if result is None:
+                    self._failed_cover_urls.add(series.cover_url)
 
         if _exists():
             tracker.mark_downloaded(chapter.url)
