@@ -4219,6 +4219,20 @@ Examples:
                 # set lookups instead of individual stat() calls on the NFS mount.
                 existing_cbzs = scraper._scan_series_dir(display_title, output_path)
 
+                # Backfill missing cover — do this before the chapter loop so
+                # it runs even when every chapter is already in the tracker
+                # (download_chapter() returns early in that case and never
+                # reaches the cover-download code).
+                if series_for_meta.cover_url and series_for_meta.cover_url not in scraper._failed_cover_urls:
+                    safe_title = scraper._sanitize_filename(display_title)
+                    series_dir = output_path / safe_title
+                    if series_dir.exists() and not list(series_dir.glob('cover.*')):
+                        result = scraper._download_cover(
+                            series_for_meta.cover_url, series_dir,
+                            referer=series_for_meta.url)
+                        if result is None:
+                            scraper._failed_cover_urls.add(series_for_meta.cover_url)
+
                 for chapter in chapters:
                     scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
                     
