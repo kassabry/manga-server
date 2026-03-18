@@ -28,6 +28,7 @@ Usage:
 import argparse
 import io
 import re
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -159,20 +160,34 @@ def main():
     for series_dir in sorted(candidates):
         dir_name = series_dir.name
         new_dir_name = strip_suffix(dir_name)
+        new_dir = series_dir.with_name(new_dir_name)
+
         print(f"Series: {dir_name}")
         print(f"  → {new_dir_name}")
+
+        if new_dir.exists():
+            # CONFLICT: both "[Manhuato] X Manhwa" and "[Manhuato] X" already exist.
+            # The correctly-named directory is the canonical one; delete the suffix copy.
+            cbz_count = len(list(series_dir.glob('*.cbz')))
+            print(f"  CONFLICT: correct dir already exists — will DELETE suffix copy "
+                  f"({cbz_count} CBZs inside)")
+            if apply:
+                shutil.rmtree(series_dir)
+                print(f"  DELETED: {dir_name}")
+            else:
+                print(f"  WOULD DELETE: {dir_name}")
+            total_dirs += 1
+            total_files += cbz_count
+            print()
+            continue
 
         renamed = process_directory(series_dir, apply)
         total_files += renamed
 
         # Rename the directory itself last (after files are renamed inside it)
-        new_dir = series_dir.with_name(new_dir_name)
         if apply:
-            if new_dir.exists():
-                print(f"  WARNING: target directory already exists, skipping dir rename: {new_dir}")
-            else:
-                series_dir.rename(new_dir)
-                print(f"  RENAMED dir → {new_dir_name}")
+            series_dir.rename(new_dir)
+            print(f"  RENAMED dir → {new_dir_name}")
         else:
             print(f"  WOULD RENAME dir → {new_dir_name}")
 
