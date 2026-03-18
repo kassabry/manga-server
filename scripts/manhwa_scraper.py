@@ -2728,6 +2728,26 @@ class ManhuaToScraper(BaseSiteScraper):
             self._apply_flaresolverr_cookies(cookies, user_agent)
             return BeautifulSoup(html, 'html.parser')
 
+    @staticmethod
+    def _strip_type_suffix(title: str) -> str:
+        """Remove trailing type labels that ManhuaTo appends to titles.
+
+        ManhuaTo includes the content type as a suffix in img alt text and
+        og:title (e.g. "Return Of The Mad Demon Manhwa"). Stripping it keeps
+        filenames consistent with previously downloaded chapters and prevents
+        spurious re-downloads.
+        """
+        return re.sub(
+            r'\s+\b(Manhwa|Manhua|Manga|Comics)\b\s*$', '', title, flags=re.I
+        ).strip()
+
+    def _extract_title_from_soup(self, soup) -> str:
+        """ManhuaTo-specific title extraction — strips type suffix."""
+        title = super()._extract_title_from_soup(soup)
+        if title:
+            title = self._strip_type_suffix(title)
+        return title
+
     def get_all_series(self, content_type: str = None, genre_filter: List[str] = None) -> List[Series]:
         """Get all series from ManhuaTo.
 
@@ -2834,14 +2854,16 @@ class ManhuaToScraper(BaseSiteScraper):
                             img = item.select_one('img')
                             if img:
                                 title = img.get('alt', '')
-                            
+
                             if not title:
                                 title_elem = item.select_one('h3.title a, h3.title, h3 a')
                                 if title_elem:
                                     title = title_elem.get_text(strip=True)
-                            
+
                             if not title or len(title) < 2:
                                 continue
+
+                            title = self._strip_type_suffix(title)
                             
                             full_url = href if href.startswith('http') else self.BASE_URL + href
                             
