@@ -492,25 +492,36 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         }`}
       >
         <div className="flex items-center gap-2 overflow-hidden">
-          <Link href="/" className="shrink-0 text-sm text-white/70 hover:text-white" title="Home" onClick={(e) => {
-            e.stopPropagation();
-            const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
-            saveProgress(page, page >= chapter.pages.length - 1);
-          }}>
-            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4" />
-            </svg>
-          </Link>
-          <Link href={`/series/${chapter.series.id}`} className="shrink-0 text-sm text-white/70 hover:text-white" title="Series page" onClick={(e) => {
-            e.stopPropagation();
-            const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
-            saveProgress(page, page >= chapter.pages.length - 1);
-          }}>
+          {/* Prev chapter button */}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              if (chapter.prevChapter) {
+                const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
+                saveProgress(page, false);
+                router.push(`/read/${chapter.prevChapter.id}`);
+              }
+            }}
+            disabled={!chapter.prevChapter}
+            className="shrink-0 rounded p-1 text-white/70 hover:text-white disabled:opacity-30"
+            title={chapter.prevChapter ? `Previous chapter (${chapter.prevChapter.number})` : "No previous chapter"}
+          >
             <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
             </svg>
-          </Link>
-          <div className="min-w-0">
+          </button>
+
+          {/* Title — clicking navigates back to series page */}
+          <Link
+            href={`/series/${chapter.series.id}`}
+            className="min-w-0 hover:opacity-80"
+            title="Back to series"
+            onClick={(e) => {
+              e.stopPropagation();
+              const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
+              saveProgress(page, page >= chapter.pages.length - 1);
+            }}
+          >
             <div className="truncate text-sm font-medium text-white">
               {chapter.series.title}
             </div>
@@ -518,7 +529,26 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               Chapter {chapter.number}
               {chapter.title ? ` — ${chapter.title}` : ""}
             </div>
-          </div>
+          </Link>
+
+          {/* Next chapter button */}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              if (chapter.nextChapter) {
+                const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
+                saveProgress(page, true);
+                router.push(`/read/${chapter.nextChapter.id}`);
+              }
+            }}
+            disabled={!chapter.nextChapter}
+            className="shrink-0 rounded p-1 text-white/70 hover:text-white disabled:opacity-30"
+            title={chapter.nextChapter ? `Next chapter (${chapter.nextChapter.number})` : "No next chapter"}
+          >
+            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+            </svg>
+          </button>
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
