@@ -492,6 +492,17 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         }`}
       >
         <div className="flex items-center gap-2 overflow-hidden">
+          {/* Home button */}
+          <Link href="/" className="shrink-0 text-sm text-white/70 hover:text-white" title="Home" onClick={(e) => {
+            e.stopPropagation();
+            const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
+            saveProgress(page, page >= chapter.pages.length - 1);
+          }}>
+            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-4 0h4" />
+            </svg>
+          </Link>
+
           {/* Prev chapter button */}
           <button
             onClick={(e) => {
