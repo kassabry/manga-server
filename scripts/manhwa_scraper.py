@@ -2730,16 +2730,18 @@ class ManhuaToScraper(BaseSiteScraper):
 
     @staticmethod
     def _strip_type_suffix(title: str) -> str:
-        """Remove trailing type labels that ManhuaTo appends to titles.
+        """Remove trailing type labels and normalize to Title Case.
 
-        ManhuaTo includes the content type as a suffix in img alt text and
-        og:title (e.g. "Return Of The Mad Demon Manhwa"). Stripping it keeps
-        filenames consistent with previously downloaded chapters and prevents
-        spurious re-downloads.
+        ManhuaTo returns titles in inconsistent casing (e.g. "Return of the Mad
+        Demon Manhwa" from the detail page vs "Return Of The Mad Demon Manhwa"
+        from the listing page).  Stripping the suffix AND applying .title()
+        ensures both runs always produce the same directory/filename, preventing
+        spurious re-downloads due to case-variant paths.
         """
-        return re.sub(
+        stripped = re.sub(
             r'\s+\b(Manhwa|Manhua|Manga|Comics)\b\s*$', '', title, flags=re.I
         ).strip()
+        return stripped.title()
 
     def _extract_title_from_soup(self, soup) -> str:
         """ManhuaTo-specific title extraction — strips type suffix."""

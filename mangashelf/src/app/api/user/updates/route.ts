@@ -11,20 +11,34 @@ export async function GET(request: NextRequest) {
   const limit = parseInt(request.nextUrl.searchParams.get("limit") || "50");
   const grouped = request.nextUrl.searchParams.get("grouped") === "true";
 
-  // Get chapters from followed series, ordered by most recent
+  // Get chapters from followed series, ordered by most recent.
+  // Only chapters added AFTER the user followed the series are "new" —
+  // this prevents flooding the feed when following a series with many existing chapters.
   const follows = await prisma.follow.findMany({
     where: { userId: session.user.id },
-    select: { seriesId: true },
+    select: { seriesId: true, createdAt: true },
   });
 
   if (follows.length === 0) {
     return NextResponse.json({ updates: [], seriesGroups: [] });
   }
 
+  // Map seriesId -> the datetime the user followed it
+  const followedAtMap = new Map(follows.map((f) => [f.seriesId, f.createdAt]));
   const seriesIds = follows.map((f) => f.seriesId);
 
+  // Use the earliest follow date as a lower-bound so we can issue a single
+  // DB query, then filter per-series in memory.
+  const earliestFollow = follows.reduce(
+    (min, f) => (f.createdAt < min ? f.createdAt : min),
+    follows[0].createdAt
+  );
+
   const chapters = await prisma.chapter.findMany({
-    where: { seriesId: { in: seriesIds } },
+    where: {
+      seriesId: { in: seriesIds },
+      createdAt: { gte: earliestFollow },
+    },
     orderBy: { createdAt: "desc" },
     take: limit * 5,
     include: {
@@ -40,8 +54,16 @@ export async function GET(request: NextRequest) {
     },
   });
 
+  // Filter per-series: only keep chapters added after the user followed that series.
+  // A chapter is "new" if it was added to the library after the follow timestamp,
+  // so following an old series won't flood the feed with its entire back-catalogue.
+  const newChapters = chapters.filter((ch) => {
+    const followedAt = followedAtMap.get(ch.seriesId);
+    return followedAt ? ch.createdAt > followedAt : true;
+  });
+
   // Also get read progress for these chapters
-  const chapterIds = chapters.map((c) => c.id);
+  const chapterIds = newChapters.map((c) => c.id);
   const progress = await prisma.readProgress.findMany({
     where: {
       userId: session.user.id,
@@ -56,16 +78,16 @@ export async function GET(request: NextRequest) {
     const seriesMap = new Map<
       string,
       {
-        series: (typeof chapters)[0]["series"];
-        chapters: typeof chapters;
-        maxChapter: (typeof chapters)[0];
+        series: (typeof newChapters)[0]["series"];
+        chapters: typeof newChapters;
+        maxChapter: (typeof newChapters)[0];
         minChapter: number;
         maxChapterNum: number;
         latestDate: Date;
       }
     >();
 
-    for (const chapter of chapters) {
+    for (const chapter of newChapters) {
       const existing = seriesMap.get(chapter.seriesId);
       if (!existing) {
         seriesMap.set(chapter.seriesId, {
@@ -136,7 +158,7 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ updates, seriesGroups });
   }
 
-  const updates = chapters.slice(0, limit).map((chapter) => ({
+  const updates = newChapters.slice(0, limit).map((chapter) => ({
     ...chapter,
     readProgress: progressMap.get(chapter.id) || null,
     totalNewChapters: 1,
