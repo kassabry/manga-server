@@ -507,6 +507,11 @@ class BaseSiteScraper:
                 try:
                     resp = self.session.get(url, timeout=30)
                     resp.raise_for_status()
+                    # Force UTF-8 — modern manga sites always use UTF-8 regardless
+                    # of what the Content-Type header claims (often omits charset or
+                    # says iso-8859-1), which causes requests to misread curly quotes
+                    # and other non-ASCII chars as mojibake (e.g. â for â€™).
+                    resp.encoding = 'utf-8'
                     if len(resp.text) > 500:
                         # Check if we got a Cloudflare challenge instead of real content
                         if self._is_cloudflare_challenge(resp.text):
@@ -558,6 +563,8 @@ class BaseSiteScraper:
         else:
             response = self.session.get(url, timeout=30)
             response.raise_for_status()
+            # Force UTF-8 to prevent mojibake on sites that omit charset in headers
+            response.encoding = 'utf-8'
             html = response.text
 
         return BeautifulSoup(html, 'html.parser')
@@ -1913,7 +1920,16 @@ class AsuraFullScraper(BaseSiteScraper):
         If the initial fetch returns no images (e.g. stale cookies gave us a
         Cloudflare challenge page), we force a fresh FlareSolverr request and
         retry once before giving up.
+
+        The cached-session fast path (plain HTTP with cookies) does NOT execute
+        JavaScript, so it only sees images that are in the initial server-rendered
+        HTML — typically just 1-2 CDN URLs from og:image / preload hints rather
+        than the full chapter image list.  If we get fewer than 3 images we treat
+        that as an incomplete render and force a fresh FlareSolverr render.
         """
+        # Minimum plausible page count — anything below this on the first attempt
+        # means the cached session returned un-hydrated HTML; retry with full render.
+        MIN_PAGES = 3
         max_attempts = 2 if self._use_flaresolverr else 1
 
         for attempt in range(1, max_attempts + 1):
@@ -1922,16 +1938,29 @@ class AsuraFullScraper(BaseSiteScraper):
                 html = str(soup)
 
                 pages = self._extract_asura_images(html)
+
+                # Too few images almost certainly means the cached session path
+                # returned shell HTML without JS-rendered image list — force a
+                # full FlareSolverr render on the next attempt.
+                if pages and len(pages) < MIN_PAGES and attempt < max_attempts and self._use_flaresolverr:
+                    logger.warning(
+                        f"Only {len(pages)} image(s) found for {chapter.url} (attempt {attempt}), "
+                        f"forcing fresh FlareSolverr render for full image list..."
+                    )
+                    self._fs_cookies_applied = False
+                    self.session.cookies.clear()
+                    time.sleep(1)
+                    continue
+
                 if pages:
                     return pages
 
-                # No images found — on first attempt, force fresh FlareSolverr cookies
+                # No images at all — on first attempt, force fresh FlareSolverr cookies
                 if attempt < max_attempts and self._use_flaresolverr:
                     logger.warning(
                         f"No images found for {chapter.url} (attempt {attempt}), "
                         f"forcing fresh FlareSolverr request..."
                     )
-                    # Clear stale cookies so _get_soup() goes through FlareSolverr again
                     self._fs_cookies_applied = False
                     self.session.cookies.clear()
                     time.sleep(2)  # Brief pause before retry
