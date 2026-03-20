@@ -123,7 +123,9 @@ def merge_into(src: Path, dst: Path, new_title: str, update_xml: bool) -> None:
         new_stem = canonical_cbz_name(cbz.stem, new_title)
         dest_file = dst / f"{new_stem}.cbz"
         if dest_file.exists():
-            print(f"    SKIP (exists): {dest_file.name}")
+            # Destination already has this chapter — source is a true duplicate, delete it.
+            print(f"    DELETE duplicate: {cbz.name}")
+            cbz.unlink()
         else:
             print(f"    MOVE: {cbz.name}")
             print(f"       -> {dest_file.name}")

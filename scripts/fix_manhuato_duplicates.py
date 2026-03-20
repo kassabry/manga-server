@@ -188,7 +188,12 @@ def process_library_dir(lib_dir: Path, apply: bool, update_xml: bool) -> None:
                 dest = canon_dir / new_name
 
                 if dest.exists():
-                    print(f"    SKIP (exists): {new_name}")
+                    # Destination already has this chapter — the source is a
+                    # true duplicate. Delete it so the source dir becomes empty
+                    # and can be removed.
+                    print(f"    DELETE duplicate: {cbz.name}")
+                    if apply:
+                        cbz.unlink()
                     skipped += 1
                 else:
                     print(f"    MOVE: {cbz.name} -> {new_name}")
