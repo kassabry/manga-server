@@ -130,6 +130,7 @@ class ProgressTracker:
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
                     self.downloaded = set(_json.load(f))
                 logger.info(f"Loaded progress: {len(self.downloaded)} chapters already downloaded")
+                self._migrate_asura_urls()
                 return
             except Exception as e:
                 logger.warning(f"Could not load progress cache: {e}")
@@ -141,11 +142,23 @@ class ProgressTracker:
                 with open(self._legacy_file, 'rb') as f:
                     self.downloaded = _pickle.load(f)
                 logger.info(f"Migrated {len(self.downloaded)} entries from legacy pickle cache")
+                self._migrate_asura_urls()
                 self.save()  # persist as JSON immediately
                 self._legacy_file.unlink(missing_ok=True)  # remove old pkl
             except Exception as e:
                 logger.warning(f"Could not migrate legacy progress cache: {e}")
                 self.downloaded = set()
+
+    def _migrate_asura_urls(self):
+        """Rewrite old asuracomic.net/series/ tracker entries to new asurascans.com/comics/ format."""
+        old_urls = [u for u in self.downloaded if 'asuracomic.net/series/' in u]
+        if not old_urls:
+            return
+        for url in old_urls:
+            self.downloaded.discard(url)
+            self.downloaded.add(url.replace('asuracomic.net/series/', 'asurascans.com/comics/'))
+        logger.info(f"Migrated {len(old_urls)} Asura tracker URLs to new domain/path")
+        self.save()
 
     def save(self):
         try:
@@ -1280,17 +1293,17 @@ class BaseSiteScraper:
 
         logger.info(f"Downloading: {series_title} - Chapter {chapter.number}")
 
-        # Store cover media ID so get_pages() can exclude it from chapter images
+        # Cover media ID exclusion was specific to old asuracomic.net CDN structure;
+        # new asurascans.com CDN uses sequential page filenames so this is not needed.
         self._cover_media_ids = set()
-        if series and series.cover_url and 'asuracomic' in series.cover_url:
-            m = re.search(r'/media/(\d+)/', series.cover_url)
-            if m:
-                self._cover_media_ids.add(int(m.group(1)))
 
         try:
             pages = self.get_pages(chapter)
             if not pages:
-                logger.error(f"No pages found for chapter {chapter.number}")
+                # Drake paywalled chapters return 0 pages silently (logged at DEBUG
+                # in get_pages); other sites treat this as a real error.
+                if self.SITE_NAME != 'drake':
+                    logger.error(f"No pages found for chapter {chapter.number}")
                 return False
             
             # Create temp directory for images
@@ -1427,9 +1440,14 @@ class BaseSiteScraper:
 
 
 class AsuraFullScraper(BaseSiteScraper):
-    """Full site scraper for asuracomic.net"""
+    """Full site scraper for asurascans.com (formerly asuracomic.net).
 
-    BASE_URL = "https://asuracomic.net"
+    Site migrated to Astro framework; series at /comics/slug-id,
+    chapters at /comics/slug-id/chapter/N,
+    images at cdn.asurascans.com/asura-images/chapters/hash/chapter/001.webp
+    """
+
+    BASE_URL = "https://asurascans.com"
     SITE_NAME = "asura"
     CLOUDFLARE_SITE = True
     
@@ -1448,15 +1466,15 @@ class AsuraFullScraper(BaseSiteScraper):
 
             # --- Genres ---
             if not series.genres:
-                genre_links = soup.select('a[href*="/series?page=1&genres="]')
+                # New site: /browse?genres=action
+                genre_links = soup.select('a[href*="/browse?genres="], a[href*="&genres="]')
                 if genre_links:
                     genres = []
                     for link in genre_links:
                         text = link.get_text(strip=True).strip(',').strip()
-                        if text and text.lower() != 'genres':
+                        if text and text.lower() not in ('genres', ''):
                             genres.append(text)
                     if genres:
-                        # Deduplicate (page has desktop + mobile copies)
                         seen = set()
                         unique = []
                         for g in genres:
@@ -1467,38 +1485,28 @@ class AsuraFullScraper(BaseSiteScraper):
 
             # --- Synopsis ---
             if not series.description:
-                html = str(soup)
+                # Strategy 1: Astro site uses id="description-text"
+                desc_elem = soup.select_one('#description-text')
+                if desc_elem:
+                    text = desc_elem.get_text(separator=' ', strip=True)
+                    text = re.sub(r'^\s*\[.*?(?:brought you|studio).*?\]\s*', '', text, flags=re.I | re.S)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    if len(text) > 20:
+                        series.description = text[:2000]
 
-                # Strategy 1: Look for h3 containing "Synopsis" then grab next sibling's <p>
-                for h3 in soup.select('h3'):
-                    if 'Synopsis' in h3.get_text():
-                        sibling = h3.find_next_sibling('span')
-                        if sibling:
-                            p = sibling.find('p')
-                            text = (p or sibling).get_text(strip=True)
-                            # Strip Asura promo prefix like [By ... that brought you ...!]
-                            text = re.sub(r'^\s*\[.*?(?:brought you|studio).*?\]\s*', '', text, flags=re.I | re.S)
-                            text = text.strip()
-                            if len(text) > 20:
-                                series.description = re.sub(r'\s+', ' ', text)[:2000]
-                                break
-
-                # Strategy 2: Extract from Next.js serialized data
+                # Strategy 2: h3 "Synopsis" sibling (legacy fallback)
                 if not series.description:
-                    # Descriptions in Next.js data often appear as "description":"..."
-                    desc_matches = re.findall(
-                        r'"description"\s*:\s*"((?:[^"\\]|\\.){20,})"',
-                        html
-                    )
-                    for raw_desc in desc_matches:
-                        # Unescape JSON string
-                        text = raw_desc.replace('\\n', ' ').replace('\\"', '"').replace('\\\\', '\\')
-                        # Strip Asura promo prefix
-                        text = re.sub(r'^\s*\[.*?(?:brought you|studio).*?\]\s*', '', text, flags=re.I | re.S)
-                        text = re.sub(r'\s+', ' ', text).strip()
-                        if len(text) > 20:
-                            series.description = text[:2000]
-                            break
+                    for h3 in soup.select('h3'):
+                        if 'Synopsis' in h3.get_text():
+                            sibling = h3.find_next_sibling('span')
+                            if sibling:
+                                p = sibling.find('p')
+                                text = (p or sibling).get_text(strip=True)
+                                text = re.sub(r'^\s*\[.*?(?:brought you|studio).*?\]\s*', '', text, flags=re.I | re.S)
+                                text = text.strip()
+                                if len(text) > 20:
+                                    series.description = re.sub(r'\s+', ' ', text)[:2000]
+                                    break
 
             # --- Status ---
             if not series.status or series.status in ['', 'Unknown']:
@@ -1578,50 +1586,21 @@ class AsuraFullScraper(BaseSiteScraper):
         page = 1
         
         while True:
-            url = f"{self.BASE_URL}/series?page={page}"
+            # New site uses /browse?page=N for the series listing
+            url = f"{self.BASE_URL}/browse?page={page}"
             logger.info(f"Fetching page {page}...")
-            
+
             try:
-                # Use Selenium with extra wait time for dynamic content
-                self._init_driver()
-                self.driver.get(url)
-                
-                # Wait for grid to load - the series are in a grid container
-                time.sleep(4)  # Initial wait for JS to execute
-                
-                # Scroll down to trigger any lazy loading
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
-                time.sleep(1)
-                self.driver.execute_script("window.scrollTo(0, 0);")
-                time.sleep(1)
-                
-                # Get page source after JS has loaded
-                soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-                
+                soup = self._get_soup(url, use_selenium=True)
+
                 # Debug: log page title to confirm we're on the right page
                 page_title = soup.select_one('title')
                 logger.debug(f"Page title: {page_title.get_text() if page_title else 'No title'}")
-                
-                # Find the grid container first - specifically the main content grid, not sidebar
-                # The main grid has specific classes that distinguish it from the Popular sidebar
-                grid = soup.select_one('div.grid.grid-cols-2.sm\\:grid-cols-2.md\\:grid-cols-5')
-                if not grid:
-                    grid = soup.select_one('div[class*="grid-cols-5"]')
-                if not grid:
-                    grid = soup.select_one('div.grid[class*="grid-cols"]')
-                
-                items = []
-                if grid:
-                    # Find all series links within the grid only
-                    items = grid.select('a[href*="series/"]')
-                    logger.debug(f"Found {len(items)} items in grid")
-                
-                # Fallback: find all series links but be more selective
-                if not items:
-                    # Only get links that have the series slug pattern
-                    all_links = soup.select('a[href*="series/"]')
-                    items = [a for a in all_links if re.search(r'series/[\w-]+-[a-f0-9]+$', a.get('href', ''))]
-                    logger.debug(f"Fallback: found {len(items)} series links")
+
+                # New Astro site: series cards are <a href="/comics/slug-id"> links
+                all_links = soup.select('a[href*="/comics/"]')
+                items = [a for a in all_links if re.search(r'/comics/[\w-]+-[a-f0-9]+', a.get('href', ''))]
+                logger.debug(f"Found {len(items)} series links")
                 
                 if not items:
                     logger.info(f"No more series found on page {page}")
@@ -1631,20 +1610,22 @@ class AsuraFullScraper(BaseSiteScraper):
                 
                 for item in items:
                     href = item.get('href', '')
-                    
-                    # Skip if not a valid series link
-                    if not href or 'series/' not in href:
+
+                    # Skip if not a valid series link (must be /comics/slug-id pattern)
+                    if not href or '/comics/' not in href:
                         continue
-                    
+
+                    # Skip chapter links (e.g. /comics/slug/chapter/1)
+                    if '/chapter/' in href:
+                        continue
+
                     # Normalize URL for deduplication
-                    # Remove trailing slashes and query params
                     normalized_href = href.rstrip('/').split('?')[0]
-                    
-                    # Skip duplicates (check normalized version)
+
                     if normalized_href in seen_urls:
                         continue
                     seen_urls.add(normalized_href)
-                    
+
                     # Build full URL
                     if href.startswith('http'):
                         full_url = href
@@ -1687,7 +1668,7 @@ class AsuraFullScraper(BaseSiteScraper):
                     
                     # Method 3: Look for any text in nested link
                     if not title:
-                        nested_link = item.select_one('a[href*="series/"]')
+                        nested_link = item.select_one('a[href*="/comics/"]')
                         if nested_link:
                             # Get text that's not in a badge span
                             for child in nested_link.children:
@@ -1782,12 +1763,12 @@ class AsuraFullScraper(BaseSiteScraper):
         seen_urls = set()
 
         # Derive the series slug path so we only collect chapters that belong to
-        # THIS series (e.g. "/series/swords-master-youngest-son-abc123/").
+        # THIS series (e.g. "/comics/swords-master-youngest-son-abc123/").
         # Asura pages show a "Latest Chapters" sidebar with links from OTHER
         # series — using a broad `a[href*="chapter"]` would pick those up too.
         from urllib.parse import urlparse
         parsed_series = urlparse(series.url)
-        # series path: e.g. "/series/swords-master-youngest-son-abc123"
+        # series path: e.g. "/comics/swords-master-youngest-son-abc123"
         series_path = parsed_series.path.rstrip('/')
 
         # First try: scope to the scrollable chapter list container
@@ -1866,146 +1847,68 @@ class AsuraFullScraper(BaseSiteScraper):
         return int(m.group(1)) if m else 0
 
     def _filter_outlier_images(self, pages: List[str]) -> List[str]:
-        """Remove sidebar/cover images that don't belong to the chapter.
-
-        Chapter page images have sequential media IDs clustered together.
-        Sidebar covers have isolated media IDs far from the main cluster.
-        Also excludes any media IDs matching the known series cover.
+        """No-op on the new CDN — all chapter images share the same CDN path prefix
+        so there are no sidebar/cover outliers to remove.  Kept for API compatibility.
         """
-        if len(pages) <= 3:
-            return pages  # Too few to reliably detect outliers
-
-        # Get known cover media IDs to exclude
-        cover_ids = getattr(self, '_cover_media_ids', set())
-
-        # Extract media IDs and pair with URLs
-        id_url_pairs = [(self._get_media_id(url), url) for url in pages]
-
-        # First pass: exclude known cover media IDs
-        if cover_ids:
-            before = len(id_url_pairs)
-            id_url_pairs = [(mid, url) for mid, url in id_url_pairs if mid not in cover_ids]
-            removed = before - len(id_url_pairs)
-            if removed:
-                logger.info(f"Excluded {removed} image(s) matching series cover media ID")
-
-        if len(id_url_pairs) <= 3:
-            return [url for _, url in id_url_pairs]
-
-        # Second pass: outlier detection via clustering
-        # Chapter images have consecutive/close media IDs; sidebar images are far away
-        ids = sorted(mid for mid, _ in id_url_pairs)
-        gaps = [ids[i+1] - ids[i] for i in range(len(ids) - 1)]
-
-        if not gaps:
-            return [url for _, url in id_url_pairs]
-
-        # Median gap between consecutive chapter images (usually 1-5)
-        sorted_gaps = sorted(gaps)
-        median_gap = sorted_gaps[len(sorted_gaps) // 2]
-
-        # Threshold: if a gap is >10x the median AND >30, it's a cluster break
-        # (tighter than before to catch promo images with nearby media IDs)
-        threshold = max(median_gap * 10, 30)
-
-        # Find the largest contiguous cluster
-        clusters = [[ids[0]]]
-        for i, gap in enumerate(gaps):
-            if gap > threshold:
-                clusters.append([ids[i+1]])
-            else:
-                clusters[-1].append(ids[i+1])
-
-        # The main cluster is the one with the most IDs
-        main_cluster = max(clusters, key=len)
-        main_ids = set(main_cluster)
-
-        # Filter to only keep images in the main cluster
-        filtered = [(mid, url) for mid, url in id_url_pairs if mid in main_ids]
-        outliers_removed = len(id_url_pairs) - len(filtered)
-        if outliers_removed > 0:
-            logger.info(f"Removed {outliers_removed} outlier image(s) outside chapter media ID cluster")
 
         return [url for _, url in filtered]
 
     @staticmethod
     def _is_chapter_page_url(url: str) -> bool:
-        """Check if a URL looks like a chapter page image (numbered filename).
+        """Check if a URL is a chapter page image from the Asura CDN.
 
-        Chapter pages:  /conversions/01-optimized.webp, /conversions/2-optimized.webp
-        Promo covers:   /conversions/poster-optimized.webp, /conversions/cover-optimized.webp
+        Chapter pages: cdn.asurascans.com/asura-images/chapters/hash/chapter/001.webp
+        Covers:        cdn.asurascans.com/asura-images/covers/...
         """
-        m = re.search(r'/conversions/(\d+)', url)
-        return m is not None
+        return 'cdn.asurascans.com/asura-images/chapters/' in url
 
     def _extract_asura_images(self, html: str) -> List[str]:
-        """Extract chapter image URLs from Asura HTML (Next.js data or img tags).
+        """Extract chapter image URLs from Asura HTML.
 
-        Returns a sorted, deduplicated list of image URLs, or empty list if none found.
+        New Astro site serves images as standard <img> tags with src pointing to
+        cdn.asurascans.com/asura-images/chapters/HASH/CHAPTER/PAGE.webp
         """
-        # --- Strategy 1: extract from Next.js serialised data ---
-        # URLs look like: https://gg.asuracomic.net/storage/media/319264/conversions/01-optimized.webp
-        # They appear inside escaped JSON in <script> tags.
+        # --- Strategy 1: regex scan of raw HTML (catches both img tags and any
+        #     serialised data the Astro framework may embed in script blocks) ---
         raw_urls = re.findall(
-            r'https?://gg\.asuracomic\.net/storage/media/\d+/conversions/[^"\\]+\.(?:webp|jpg|png)',
+            r'https?://cdn\.asurascans\.com/asura-images/chapters/[^"\'\\>\s]+\.(?:webp|jpg|jpeg|png)',
             html
         )
 
-        # Deduplicate while preserving order
         seen = set()
         pages = []
         for url in raw_urls:
-            # Skip sidebar cover thumbnails (thumb-small, thumb-medium)
-            if '-thumb-' in url:
-                continue
-            # Skip promotional cover images (non-numeric filenames like poster-optimized.webp)
-            if not self._is_chapter_page_url(url):
-                continue
             if url not in seen:
                 seen.add(url)
                 pages.append(url)
 
         if pages:
-            # Sort by the media ID to get correct page order
-            pages.sort(key=lambda u: self._get_media_id(u))
-            # Filter out sidebar/cover images by media ID clustering
-            pages = self._filter_outlier_images(pages)
-            if pages:
-                logger.info(f"Found {len(pages)} chapter images from Next.js data")
-                return pages
+            # Sort by page number embedded in the filename (e.g. 001, 002 …)
+            def _page_num(u: str) -> int:
+                m = re.search(r'/(\d+)\.(?:webp|jpg|jpeg|png)$', u)
+                return int(m.group(1)) if m else 0
+            pages.sort(key=_page_num)
+            logger.info(f"Found {len(pages)} chapter images from CDN")
+            return pages
 
-        # --- Strategy 2: fallback to <img> tags (legacy / Selenium) ---
+        # --- Strategy 2: parse <img> tags explicitly ---
         soup = BeautifulSoup(html, 'html.parser')
         pages = []
         for img in soup.select('img'):
-            src = img.get('src', img.get('data-src', ''))
-            if not src:
-                continue
-            if 'gg.asuracomic.net/storage/media/' not in src:
-                continue
-            if '/profile_images/' in src or '/profile/' in src:
-                continue
-            if '/conversions/' not in src or '-thumb-' in src:
-                continue
-            if not self._is_chapter_page_url(src):
-                continue
-            if src not in pages:
+            src = img.get('src') or img.get('data-src') or ''
+            if self._is_chapter_page_url(src) and src not in pages:
                 pages.append(src)
 
         if pages:
-            pages = self._filter_outlier_images(pages)
-            if pages:
-                logger.info(f"Found {len(pages)} chapter images from img tags")
+            logger.info(f"Found {len(pages)} chapter images from img tags")
         return pages
 
     def get_pages(self, chapter: Chapter) -> List[str]:
         """Get image URLs for a chapter from Asura Scans.
 
-        Asura is a Next.js app — chapter images are NOT in <img> tags in the
-        initial HTML.  They're serialised inside self.__next_f.push() script
-        blocks.  A plain HTTP fetch (or FlareSolverr) returns the full HTML
-        including these scripts, so we can extract URLs with a regex instead
-        of needing Selenium to render the page.
+        New Astro site serves images as standard <img> tags from cdn.asurascans.com.
+        Selenium renders the page to ensure the Astro islands hydrate before we
+        grab the source.
 
         If the initial fetch returns no images (e.g. stale cookies gave us a
         Cloudflare challenge page), we force a fresh FlareSolverr request and
@@ -3416,15 +3319,23 @@ class DrakeFullScraper(BaseSiteScraper):
             if '{' in href:
                 continue
 
+            full_url = href if href.startswith('http') else self.BASE_URL + href
+
+            # Only accept URLs that belong to this site — filters out Twitter share
+            # buttons and other off-site links that contain "chapter" in their query params
+            if not full_url.startswith(self.BASE_URL):
+                continue
+
             num_elem = link.select_one('.chapternum, .epl-num, .epxs')
             text = num_elem.get_text(separator=' ', strip=True) if num_elem else link.get_text(separator=' ', strip=True)
 
             match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
             if not match:
                 match = re.search(r'(\d+(?:\.\d+)?)', text)
-            num = match.group(1) if match else text
-
-            full_url = href if href.startswith('http') else self.BASE_URL + href
+            if not match:
+                # Can't determine chapter number — skip (avoids "Chapter " blank entries)
+                continue
+            num = match.group(1)
 
             # Avoid duplicates
             if not any(c.url == full_url for c in chapters):
@@ -3502,7 +3413,7 @@ class DrakeFullScraper(BaseSiteScraper):
         pages = self._extract_drake_pages(soup)
 
         if not pages:
-            logger.warning(f"No pages found for {chapter.url} even after FlareSolverr")
+            logger.debug(f"No pages found for {chapter.url} (likely paywalled, will retry next run)")
 
         return pages
 

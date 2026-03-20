@@ -252,8 +252,14 @@ class BaseLightNovelScraper:
         options.add_argument('--window-size=1920,1080')
         options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
 
-        # On ARM (Raspberry Pi), use system-installed chromedriver directly
+        # On ARM (Raspberry Pi), use system-installed chromedriver directly.
+        # Docker containers on ARM have no display; force headless if DISPLAY is unset
+        # so Chrome doesn't immediately exit with "session not created".
         if self._is_arm():
+            import os as _os
+            if not self.headless and not _os.environ.get('DISPLAY'):
+                logger.info("ARM: no DISPLAY detected, overriding to headless mode")
+                options.add_argument('--headless=new')
             chromium_bin = self._find_chromium_binary()
             if chromium_bin:
                 logger.info(f"ARM detected - using Chromium binary: {chromium_bin}")
