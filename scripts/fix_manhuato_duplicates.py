@@ -43,6 +43,35 @@ from pathlib import Path
 _SUFFIX_RE = re.compile(r'\s+\b(Manhwa|Manhua|Manga|Comics)\b\s*$', re.IGNORECASE)
 _PREFIX = "[Manhuato] "
 
+# Words that stay lowercase in title case (unless they're the first word).
+_MINOR_WORDS = frozenset({
+    'a', 'an', 'the',
+    'and', 'but', 'or', 'nor', 'for', 'so', 'yet',
+    'as', 'at', 'by', 'in', 'of', 'on', 'to', 'up', 'via',
+    'with', 'from', 'into', 'onto', 'upon',
+})
+
+
+def _title_case(text: str) -> str:
+    """Title-case that skips minor words and never capitalises after apostrophes.
+
+    Python's built-in str.title() has two problems:
+      - "world's" → "World'S"  (capitalises the s after the apostrophe)
+      - "and", "a", "the" → "And", "A", "The"  (capitalises minor words)
+    This function fixes both while still capitalising the first word always.
+    """
+    words = text.split()
+    result = []
+    for i, word in enumerate(words):
+        lower = word.lower()
+        if i == 0 or lower not in _MINOR_WORDS:
+            # Capitalise only the very first character; leave the rest as-is
+            # so "world's" → "World's", not "World'S".
+            result.append(word[0].upper() + word[1:] if word else word)
+        else:
+            result.append(lower)
+    return ' '.join(result)
+
 
 def _strip_suffix(title: str) -> str:
     return _SUFFIX_RE.sub('', title).strip()
@@ -54,7 +83,7 @@ def canonical_dir_name(dir_name: str) -> str:
         raw_title = dir_name[len(_PREFIX):]
     else:
         raw_title = dir_name
-    return _PREFIX + _strip_suffix(raw_title).title()
+    return _PREFIX + _title_case(_strip_suffix(raw_title))
 
 
 def canonical_cbz_name(cbz_stem: str) -> str | None:

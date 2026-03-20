@@ -2728,20 +2728,46 @@ class ManhuaToScraper(BaseSiteScraper):
             self._apply_flaresolverr_cookies(cookies, user_agent)
             return BeautifulSoup(html, 'html.parser')
 
-    @staticmethod
-    def _strip_type_suffix(title: str) -> str:
-        """Remove trailing type labels and normalize to Title Case.
+    # Words that stay lowercase in title case (unless first word).
+    _MINOR_WORDS = frozenset({
+        'a', 'an', 'the',
+        'and', 'but', 'or', 'nor', 'for', 'so', 'yet',
+        'as', 'at', 'by', 'in', 'of', 'on', 'to', 'up', 'via',
+        'with', 'from', 'into', 'onto', 'upon',
+    })
+
+    @classmethod
+    def _title_case(cls, text: str) -> str:
+        """Title-case that skips minor words and never capitalises after apostrophes.
+
+        Python's str.title() has two bugs for our use case:
+          "world's" → "World'S"   (wrong — capitalises the s after apostrophe)
+          "and" / "a" → "And"/"A" (wrong — minor words should stay lowercase)
+        """
+        words = text.split()
+        result = []
+        for i, word in enumerate(words):
+            lower = word.lower()
+            if i == 0 or lower not in cls._MINOR_WORDS:
+                result.append(word[0].upper() + word[1:] if word else word)
+            else:
+                result.append(lower)
+        return ' '.join(result)
+
+    @classmethod
+    def _strip_type_suffix(cls, title: str) -> str:
+        """Remove trailing type labels and normalize to consistent title case.
 
         ManhuaTo returns titles in inconsistent casing (e.g. "Return of the Mad
         Demon Manhwa" from the detail page vs "Return Of The Mad Demon Manhwa"
-        from the listing page).  Stripping the suffix AND applying .title()
+        from the listing page).  Stripping the suffix AND normalising case
         ensures both runs always produce the same directory/filename, preventing
         spurious re-downloads due to case-variant paths.
         """
         stripped = re.sub(
             r'\s+\b(Manhwa|Manhua|Manga|Comics)\b\s*$', '', title, flags=re.I
         ).strip()
-        return stripped.title()
+        return cls._title_case(stripped)
 
     def _extract_title_from_soup(self, soup) -> str:
         """ManhuaTo-specific title extraction — strips type suffix."""

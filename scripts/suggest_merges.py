@@ -46,9 +46,30 @@ from pathlib import Path
 
 _SUFFIX_RE = re.compile(r'\s+\b(Manhwa|Manhua|Manga|Comics)\b\s*$', re.IGNORECASE)
 _PREFIX = "[Manhuato] "
-_STOP_WORDS = {'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for',
-               'and', 'or', 'but', 'with', 'by', 'from', 'as', 'is',
-               'was', 'are', 'were'}
+
+# Words that stay lowercase in title case (unless they're the first word).
+_MINOR_WORDS = frozenset({
+    'a', 'an', 'the',
+    'and', 'but', 'or', 'nor', 'for', 'so', 'yet',
+    'as', 'at', 'by', 'in', 'of', 'on', 'to', 'up', 'via',
+    'with', 'from', 'into', 'onto', 'upon',
+})
+
+# Additional stop-words used only for similarity comparison (not for naming).
+_STOP_WORDS = _MINOR_WORDS | {'is', 'was', 'are', 'were'}
+
+
+def _title_case(text: str) -> str:
+    """Title-case that skips minor words and never capitalises after apostrophes."""
+    words = text.split()
+    result = []
+    for i, word in enumerate(words):
+        lower = word.lower()
+        if i == 0 or lower not in _MINOR_WORDS:
+            result.append(word[0].upper() + word[1:] if word else word)
+        else:
+            result.append(lower)
+    return ' '.join(result)
 
 
 def _strip_suffix(title: str) -> str:
@@ -58,7 +79,7 @@ def _strip_suffix(title: str) -> str:
 def _bare_title(dir_name: str) -> str:
     """Extract the series title without the [Manhuato] prefix or type suffix."""
     t = dir_name[len(_PREFIX):] if dir_name.startswith(_PREFIX) else dir_name
-    return _strip_suffix(t).title()
+    return _title_case(_strip_suffix(t))
 
 
 def _compare_key(title: str) -> str:
