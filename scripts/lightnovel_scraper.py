@@ -905,13 +905,30 @@ class LightNovelPubScraper(BaseLightNovelScraper):
         try:
             soup = self._get_soup(chapter.url, use_selenium=True)
 
-            # Find content container - try multiple selectors
-            for sel in ['#chapter-content', '.chapter-content', '.chapter-body',
-                        '.content', 'article', '#chapter-container']:
+            # Ordered from most specific to least specific.
+            # LightNovelPub uses #chapter-content; other mirrors vary.
+            for sel in [
+                '#chapter-content',
+                '.chapter-content',
+                '.chapter-body',
+                '[class*="chapter-content"]',
+                '[id*="chapter-content"]',
+                '.reading-content',
+                '.text-left',
+                'article .content',
+                'article',
+                'main',
+            ]:
                 content_elem = soup.select_one(sel)
                 if content_elem and len(content_elem.get_text(strip=True)) > 50:
                     return str(content_elem)
 
+            # Nothing matched — log page title to help diagnose selector drift
+            title_tag = soup.find('title')
+            logger.debug(
+                f"No content selector matched for {chapter.url} "
+                f"(page title: {title_tag.get_text(strip=True) if title_tag else 'N/A'})"
+            )
             return ""
         except Exception as e:
             logger.error(f"Error getting chapter content: {e}")
@@ -1523,6 +1540,81 @@ Examples:
         export_novel_list(all_novels, output_path)
         return
     
+    # ---------------------------------------------------------------------------
+    # Helper: download one novel as volume-batched EPUBs
+    # ---------------------------------------------------------------------------
+    CHAPTERS_PER_VOLUME = 100
+
+    def _download_novel_volumes(scraper, novel, output_path, tracker,
+                                source_prefix=False, site_name=''):
+        """Fetch and write a novel as one EPUB per 100-chapter volume.
+
+        Writes each volume to disk immediately so a crash mid-novel only loses
+        the current volume's work, not the entire book.  Already-written volumes
+        are detected by file existence and skipped automatically (resume support).
+
+        Returns True if all volumes were written successfully.
+        """
+        if tracker.is_downloaded(novel.url):
+            return True
+
+        if not novel.description:
+            novel = scraper.get_novel_details(novel)
+
+        if source_prefix:
+            import copy
+            novel = copy.copy(novel)
+            source_name = novel.source.title() if novel.source else site_name.title()
+            novel.title = f"[{source_name}] {novel.title}"
+
+        chapters = scraper.get_chapters(novel)
+        logger.info(f"  Found {len(chapters)} chapters")
+
+        total_vols = max(1, (len(chapters) + CHAPTERS_PER_VOLUME - 1) // CHAPTERS_PER_VOLUME)
+        all_ok = True
+
+        for vol_num in range(1, total_vols + 1):
+            vol_start = (vol_num - 1) * CHAPTERS_PER_VOLUME
+            vol_chapters_meta = chapters[vol_start:vol_start + CHAPTERS_PER_VOLUME]
+
+            # Check if this volume EPUB already exists on disk
+            safe_title = scraper._sanitize_filename(novel.title)
+            epub_path = output_path / f"{safe_title} Vol. {vol_num}.epub"
+            if epub_path.exists():
+                logger.info(f"  Vol. {vol_num}/{total_vols} already exists — skipping")
+                continue
+
+            logger.info(f"  Fetching Vol. {vol_num}/{total_vols} "
+                        f"(chapters {vol_start + 1}–{vol_start + len(vol_chapters_meta)})")
+
+            # Fetch content for this volume only
+            vol_chapters = []
+            for j, chapter in enumerate(vol_chapters_meta, 1):
+                global_j = vol_start + j
+                logger.info(f"  [{global_j}/{len(chapters)}] Fetching: {chapter.title}")
+                chapter.content = scraper.get_chapter_content(chapter)
+                if not chapter.content:
+                    logger.warning(f"  [{global_j}/{len(chapters)}] Empty content — skipping: {chapter.title}")
+                else:
+                    vol_chapters.append(chapter)
+                time.sleep(0.5)
+
+            if not vol_chapters:
+                logger.warning(f"  Vol. {vol_num} has no content — skipping EPUB creation")
+                all_ok = False
+                continue
+
+            try:
+                ep = scraper.create_epub(novel, vol_chapters, output_path, volume_number=vol_num)
+                logger.info(f"  Created: {ep.name}")
+            except Exception as e:
+                logger.error(f"  Failed to create Vol. {vol_num}: {e}")
+                all_ok = False
+
+        if all_ok:
+            tracker.mark_downloaded(novel.url)
+        return all_ok
+
     # Mode 2: Download novels
     if args.download_all and args.site:
         output_path.mkdir(parents=True, exist_ok=True)
@@ -1569,35 +1661,12 @@ Examples:
                             continue
 
                         logger.info(f"[{i}/{len(novels)}] Downloading: {novel.title}")
-
                         try:
-                            # Get full details if not already
-                            if not novel.description:
-                                novel = scraper.get_novel_details(novel)
-
-                            # Apply source prefix
-                            if args.source_prefix:
-                                import copy
-                                novel = copy.copy(novel)
-                                source_name = novel.source.title() if novel.source else site_name.title()
-                                novel.title = f"[{source_name}] {novel.title}"
-
-                            # Get chapters
-                            chapters = scraper.get_chapters(novel)
-                            logger.info(f"  Found {len(chapters)} chapters")
-
-                            # Get content for each chapter
-                            for j, chapter in enumerate(chapters, 1):
-                                logger.info(f"  [{j}/{len(chapters)}] Fetching: {chapter.title}")
-                                chapter.content = scraper.get_chapter_content(chapter)
-                                time.sleep(0.5)
-
-                            # Create EPUB
-                            epub_path = scraper.create_epub(novel, chapters, output_path)
-                            logger.info(f"  Created: {epub_path.name}")
-
-                            tracker.mark_downloaded(novel.url)
-
+                            _download_novel_volumes(
+                                scraper, novel, output_path, tracker,
+                                source_prefix=args.source_prefix,
+                                site_name=site_name,
+                            )
                         except Exception as e:
                             logger.error(f"  Error: {e}")
                 
@@ -1640,31 +1709,12 @@ Examples:
                     continue
 
                 logger.info(f"[{i}/{len(novels)}] Downloading: {novel.title}")
-
                 try:
-                    if not novel.description:
-                        novel = scraper.get_novel_details(novel)
-
-                    # Apply source prefix
-                    if args.source_prefix:
-                        import copy
-                        novel = copy.copy(novel)
-                        source_name = novel.source.title() if novel.source else args.site.title()
-                        novel.title = f"[{source_name}] {novel.title}"
-
-                    chapters = scraper.get_chapters(novel)
-                    logger.info(f"  Found {len(chapters)} chapters")
-
-                    for j, chapter in enumerate(chapters, 1):
-                        logger.info(f"  [{j}/{len(chapters)}] Fetching: {chapter.title}")
-                        chapter.content = scraper.get_chapter_content(chapter)
-                        time.sleep(0.5)
-
-                    epub_path = scraper.create_epub(novel, chapters, output_path)
-                    logger.info(f"  Created: {epub_path.name}")
-
-                    tracker.mark_downloaded(novel.url)
-
+                    _download_novel_volumes(
+                        scraper, novel, output_path, tracker,
+                        source_prefix=args.source_prefix,
+                        site_name=args.site,
+                    )
                 except Exception as e:
                     logger.error(f"  Error: {e}")
 
