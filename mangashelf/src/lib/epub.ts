@@ -197,27 +197,40 @@ export async function getEpubChapterList(epubPath: string): Promise<string[]> {
     const manifest = pkg?.manifest?.item || [];
     const spine = pkg?.spine?.itemref || [];
 
-    // Build manifest lookup: id -> href
-    const manifestMap = new Map<string, string>();
+    // Build manifest lookup: id -> { href, properties }
+    const manifestMap = new Map<string, { href: string; properties: string }>();
     const items = Array.isArray(manifest) ? manifest : [manifest];
     const opfDir = opfPath.includes("/") ? opfPath.substring(0, opfPath.lastIndexOf("/") + 1) : "";
 
     for (const item of items) {
       const id = item?.["@_id"];
       const href = item?.["@_href"];
+      const properties = (item?.["@_properties"] || "") as string;
       if (id && href) {
         // Resolve relative to OPF directory
-        manifestMap.set(id, opfDir + href);
+        manifestMap.set(id, { href: opfDir + href, properties });
       }
     }
 
     // Follow spine order to get chapter files
+    // Skip navigation documents (properties="nav") and non-linear items (linear="no")
+    // These are TOC/cover pages that shouldn't appear as readable content
     const spineItems = Array.isArray(spine) ? spine : [spine];
     const chapters: string[] = [];
     for (const ref of spineItems) {
       const idref = ref?.["@_idref"];
-      const href = manifestMap.get(idref);
-      if (href && zip.file(href)) {
+      const linear = ref?.["@_linear"];
+      // Skip items explicitly marked as non-linear (cover pages, TOC)
+      if (linear === "no") continue;
+
+      const entry = manifestMap.get(idref);
+      if (!entry) continue;
+      const { href, properties } = entry;
+
+      // Skip EPUB3 navigation documents
+      if (properties.includes("nav")) continue;
+
+      if (zip.file(href)) {
         chapters.push(href);
       }
     }
