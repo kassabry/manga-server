@@ -1570,6 +1570,10 @@ Examples:
         chapters = scraper.get_chapters(novel)
         logger.info(f"  Found {len(chapters)} chapters")
 
+        safe_title = scraper._sanitize_filename(novel.title)
+        series_path = output_path / safe_title
+        series_path.mkdir(parents=True, exist_ok=True)
+
         total_vols = max(1, (len(chapters) + CHAPTERS_PER_VOLUME - 1) // CHAPTERS_PER_VOLUME)
         all_ok = True
 
@@ -1578,8 +1582,7 @@ Examples:
             vol_chapters_meta = chapters[vol_start:vol_start + CHAPTERS_PER_VOLUME]
 
             # Check if this volume EPUB already exists on disk
-            safe_title = scraper._sanitize_filename(novel.title)
-            epub_path = output_path / f"{safe_title} Vol. {vol_num}.epub"
+            epub_path = series_path / f"{safe_title} Vol. {vol_num}.epub"
             if epub_path.exists():
                 logger.info(f"  Vol. {vol_num}/{total_vols} already exists — skipping")
                 continue
@@ -1605,7 +1608,7 @@ Examples:
                 continue
 
             try:
-                ep = scraper.create_epub(novel, vol_chapters, output_path, volume_number=vol_num)
+                ep = scraper.create_epub(novel, vol_chapters, series_path, volume_number=vol_num)
                 logger.info(f"  Created: {ep.name}")
             except Exception as e:
                 logger.error(f"  Failed to create Vol. {vol_num}: {e}")
