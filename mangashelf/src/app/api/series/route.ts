@@ -17,14 +17,17 @@ export async function GET(request: NextRequest) {
   const andConditions: Record<string, unknown>[] = [];
 
   if (search) {
-    // Search across title, author, artist
-    andConditions.push({
-      OR: [
-        { title: { contains: search } },
-        { author: { contains: search } },
-        { artist: { contains: search } },
-      ],
-    });
+    // Split into tokens so "solo leveling" matches in any word order
+    const tokens = search.trim().split(/\s+/).filter(Boolean);
+    for (const token of tokens) {
+      andConditions.push({
+        OR: [
+          { title: { contains: token } },
+          { author: { contains: token } },
+          { artist: { contains: token } },
+        ],
+      });
+    }
   }
   if (type) {
     andConditions.push({ type });

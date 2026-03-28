@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, Suspense } from "react";
+import { useEffect, useState, useCallback, useRef, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { SeriesGrid } from "@/components/series/SeriesGrid";
 
@@ -21,16 +21,20 @@ interface FilterMeta {
   types: string[];
 }
 
+const PAGE_SIZE = 24;
+
 function BrowseContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const [series, setSeries] = useState<SeriesData[]>([]);
   const [total, setTotal] = useState(0);
-  const [loading, setLoading] = useState(true);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [filterMeta, setFilterMeta] = useState<FilterMeta | null>(null);
   const [showFilters, setShowFilters] = useState(false);
+  const [page, setPage] = useState(1);
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
-  const page = parseInt(searchParams.get("page") || "1");
   const search = searchParams.get("search") || "";
   const type = searchParams.get("type") || "";
   const genre = searchParams.get("genre") || "";
@@ -38,35 +42,66 @@ function BrowseContent() {
   const publisher = searchParams.get("publisher") || "";
   const sort = searchParams.get("sort") || "title";
 
-  // Fetch available filter options
+  // Fetch available filter options once
   useEffect(() => {
     fetch("/api/genres")
       .then((r) => r.json())
       .then(setFilterMeta);
   }, []);
 
-  const fetchSeries = useCallback(async () => {
-    setLoading(true);
-    const params = new URLSearchParams();
-    params.set("page", String(page));
-    params.set("limit", "24");
-    if (search) params.set("search", search);
-    if (type) params.set("type", type);
-    if (genre) params.set("genre", genre);
-    if (status) params.set("status", status);
-    if (publisher) params.set("publisher", publisher);
-    params.set("sort", sort);
+  const fetchPage = useCallback(async (pageNum: number) => {
+    setLoadingMore(true);
+    try {
+      const params = new URLSearchParams();
+      params.set("page", String(pageNum));
+      params.set("limit", String(PAGE_SIZE));
+      if (search) params.set("search", search);
+      if (type) params.set("type", type);
+      if (genre) params.set("genre", genre);
+      if (status) params.set("status", status);
+      if (publisher) params.set("publisher", publisher);
+      params.set("sort", sort);
 
-    const res = await fetch(`/api/series?${params}`);
-    const data = await res.json();
-    setSeries(data.series || []);
-    setTotal(data.total || 0);
-    setLoading(false);
-  }, [page, search, type, genre, status, publisher, sort]);
+      const res = await fetch(`/api/series?${params}`);
+      const data = await res.json();
+      const incoming: SeriesData[] = data.series || [];
+      setSeries((prev) => (pageNum === 1 ? incoming : [...prev, ...incoming]));
+      setTotal(data.total || 0);
+      setHasMore(incoming.length === PAGE_SIZE);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [search, type, genre, status, publisher, sort]);
 
+  // When filters change (fetchPage gets a new reference), reset and load page 1
   useEffect(() => {
-    fetchSeries();
-  }, [fetchSeries]);
+    setSeries([]);
+    setPage(1);
+    setHasMore(true);
+    fetchPage(1);
+  }, [fetchPage]);
+
+  // IntersectionObserver — load next page when sentinel scrolls into view
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasMore && !loadingMore) {
+          setPage((p) => {
+            const next = p + 1;
+            fetchPage(next);
+            return next;
+          });
+        }
+      },
+      { rootMargin: "200px" }
+    );
+
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [hasMore, loadingMore, fetchPage]);
 
   function updateParam(key: string, value: string) {
     const params = new URLSearchParams(searchParams.toString());
@@ -75,7 +110,6 @@ function BrowseContent() {
     } else {
       params.delete(key);
     }
-    params.delete("page");
     router.push(`/browse?${params}`);
   }
 
@@ -96,7 +130,6 @@ function BrowseContent() {
 
   const selectedGenres = genre.split(",").map((s) => s.trim()).filter(Boolean);
   const hasFilters = !!(search || type || genre || status || publisher);
-  const totalPages = Math.ceil(total / 24);
 
   return (
     <div className="space-y-6">
@@ -233,42 +266,24 @@ function BrowseContent() {
       )}
 
       {/* Results */}
-      {loading ? (
-        <div className="py-12 text-center text-text-secondary">Loading...</div>
+      {series.length === 0 && !loadingMore ? (
+        <div className="py-12 text-center text-text-secondary">No series found.</div>
       ) : (
         <SeriesGrid series={series} />
       )}
 
-      {/* Pagination */}
-      {totalPages > 1 && (
-        <div className="flex items-center justify-center gap-2">
-          <button
-            disabled={page <= 1}
-            onClick={() => {
-              const params = new URLSearchParams(searchParams.toString());
-              params.set("page", String(page - 1));
-              router.push(`/browse?${params}`);
-            }}
-            className="rounded-lg border border-border px-4 py-2 text-sm hover:bg-bg-hover disabled:opacity-40"
-          >
-            Previous
-          </button>
-          <span className="text-sm text-text-secondary">
-            Page {page} of {totalPages}
-          </span>
-          <button
-            disabled={page >= totalPages}
-            onClick={() => {
-              const params = new URLSearchParams(searchParams.toString());
-              params.set("page", String(page + 1));
-              router.push(`/browse?${params}`);
-            }}
-            className="rounded-lg border border-border px-4 py-2 text-sm hover:bg-bg-hover disabled:opacity-40"
-          >
-            Next
-          </button>
-        </div>
-      )}
+      {/* Sentinel — triggers next page load */}
+      <div ref={sentinelRef} className="flex justify-center py-4">
+        {loadingMore && (
+          <svg className="h-6 w-6 animate-spin text-accent" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+          </svg>
+        )}
+        {!hasMore && series.length > 0 && (
+          <p className="text-xs text-text-secondary">All {total} series loaded</p>
+        )}
+      </div>
     </div>
   );
 }
