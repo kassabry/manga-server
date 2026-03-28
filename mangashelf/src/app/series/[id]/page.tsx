@@ -63,6 +63,22 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
     return Array.from(sources);
   }, [series]);
 
+  const isGrouped = sourceFilter === "all" && uniqueSources.length > 1;
+
+  const groupedChapters: ChapterGroup[] = useMemo(() => {
+    if (!isGrouped || !series) return [];
+    const map = new Map<number, ChapterGroup>();
+    for (const ch of series.chapters) {
+      if (!map.has(ch.number)) {
+        map.set(ch.number, { number: ch.number, title: ch.title, pageCount: ch.pageCount, createdAt: ch.createdAt, sources: [] });
+      }
+      map.get(ch.number)!.sources.push(ch);
+    }
+    const groups = Array.from(map.values());
+    groups.sort((a, b) => a.number - b.number);
+    return sortDesc ? [...groups].reverse() : groups;
+  }, [isGrouped, series, sortDesc]);
+
   useEffect(() => {
     fetch(`/api/series/${id}`)
       .then((r) => r.json())
@@ -118,24 +134,6 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
   const filteredChapters = sourceFilter === "all"
     ? series.chapters
     : series.chapters.filter((ch: Chapter) => ch.source === sourceFilter);
-
-  // When showing all sources with multiple sources, group chapters by number
-  const isGrouped = sourceFilter === "all" && uniqueSources.length > 1;
-
-  // Build grouped chapter list: one entry per unique chapter number
-  const groupedChapters: ChapterGroup[] = useMemo(() => {
-    if (!isGrouped) return [];
-    const map = new Map<number, ChapterGroup>();
-    for (const ch of series.chapters) {
-      if (!map.has(ch.number)) {
-        map.set(ch.number, { number: ch.number, title: ch.title, pageCount: ch.pageCount, createdAt: ch.createdAt, sources: [] });
-      }
-      map.get(ch.number)!.sources.push(ch);
-    }
-    const groups = Array.from(map.values());
-    groups.sort((a, b) => a.number - b.number);
-    return sortDesc ? [...groups].reverse() : groups;
-  }, [isGrouped, series.chapters, sortDesc]);
 
   const chapters = isGrouped ? [] : (sortDesc ? [...filteredChapters].reverse() : filteredChapters);
 
