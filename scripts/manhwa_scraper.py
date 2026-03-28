@@ -1869,22 +1869,59 @@ class AsuraFullScraper(BaseSiteScraper):
         """
         return 'cdn.asurascans.com/asura-images/chapters/' in url
 
+    @staticmethod
+    def _unwrap_astro(obj):
+        """Recursively unwrap Astro's [typeIndex, value] serialisation format.
+
+        Astro serialises component props as nested [primitive, value] pairs.
+        A 2-element list whose first item is a non-collection primitive is
+        treated as [typeIndex, payload] — we discard the index and recurse
+        into the payload.  All other lists and dicts are traversed normally.
+        """
+        if isinstance(obj, list):
+            if len(obj) == 2 and not isinstance(obj[0], (list, dict)):
+                return AsuraFullScraper._unwrap_astro(obj[1])
+            return [AsuraFullScraper._unwrap_astro(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: AsuraFullScraper._unwrap_astro(v) for k, v in obj.items()}
+        return obj
+
     def _extract_asura_images(self, html: str) -> List[str]:
         """Extract chapter image URLs from Asura HTML.
 
-        Runs two strategies and merges results so that a few CDN preload URLs
-        in Strategy 1 don't suppress the full lazy-loaded list in Strategy 2.
+        The site was rebuilt from scratch in Feb 2026.  Chapter images are
+        now embedded as Astro component props — a 'props' attribute on an
+        island element containing a JSON-encoded page list — rather than
+        plain <img> tags or CDN URLs baked into the HTML.
 
-        Strategy 1 — regex over raw HTML:
-          Catches URLs embedded in script/JSON blocks.  Also handles JSON-encoded
-          forward slashes (\\/) that would otherwise break the character class.
+        Strategy 1 (new site): find the Astro island element whose 'props'
+          attribute contains "pages", parse and unwrap the JSON, and collect
+          the 'url' field from each page object.
 
-        Strategy 2 — BeautifulSoup img tag scan:
-          Picks up src, data-src, data-lazy-src, and srcset attributes used by
-          the various lazy-loading patterns (loading="lazy", Intersection­Observer,
-          swiper slides, etc.).
+        Strategy 2 (legacy fallback): regex + img-tag scan for the old
+          cdn.asurascans.com CDN URL pattern, for any page that may still
+          render the old way.
         """
-        MIN_PAGES = 3
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # --- Strategy 1: Astro props (new site, Feb 2026 rebuild) ---
+        # Mirrors Tachiyomi's extractAstroProp<PageListDto>("pages")
+        props_elem = soup.find(
+            lambda tag: tag.has_attr('props') and 'pages' in tag.get('props', '')
+        )
+        if props_elem:
+            try:
+                raw_props = json.loads(props_elem.get('props', ''))
+                unwrapped = self._unwrap_astro(raw_props)
+                pages_data = unwrapped.get('pages', []) if isinstance(unwrapped, dict) else []
+                urls = [p['url'] for p in pages_data if isinstance(p, dict) and p.get('url')]
+                if urls:
+                    logger.info(f"Found {len(urls)} chapter images from Astro props")
+                    return urls
+            except Exception as e:
+                logger.debug(f"Astro props extraction failed: {e}")
+
+        # --- Strategy 2: legacy CDN regex + img-tag scan ---
         seen: set = set()
         pages: List[str] = []
 
@@ -1894,7 +1931,6 @@ class AsuraFullScraper(BaseSiteScraper):
                 seen.add(url)
                 pages.append(url)
 
-        # --- Strategy 1: regex on raw HTML (unescape JSON \/ first) ---
         normalised = html.replace('\\/', '/')
         for url in re.findall(
             r'https?://cdn\.asurascans\.com/asura-images/chapters/[^\s"\'<>]+\.(?:webp|jpg|jpeg|png)',
@@ -1902,34 +1938,19 @@ class AsuraFullScraper(BaseSiteScraper):
         ):
             _add(url)
 
-        # --- Strategy 2: BeautifulSoup attribute scan ---
-        # Always run so that data-src / srcset lazy-load attributes are captured
-        # even when Strategy 1 found a handful of preload/og:image CDN URLs.
-        soup = BeautifulSoup(html, 'html.parser')
-        lazy_attrs = ('src', 'data-src', 'data-lazy-src', 'data-original')
         for img in soup.select('img'):
-            for attr in lazy_attrs:
-                val = img.get(attr, '')
-                if val:
-                    _add(val)
-            # srcset may contain multiple space-separated "url widthw" pairs
+            for attr in ('src', 'data-src', 'data-lazy-src', 'data-original'):
+                _add(img.get(attr, ''))
             for entry in img.get('srcset', '').split(','):
-                _add(entry.strip().split()[0]) if entry.strip() else None
+                _add(entry.strip().split()[0] if entry.strip() else '')
 
-        if not pages:
-            return []
+        if pages:
+            def _page_num(u: str) -> int:
+                m = re.search(r'/(\d+)\.(?:webp|jpg|jpeg|png)$', u)
+                return int(m.group(1)) if m else 0
+            pages.sort(key=_page_num)
+            logger.info(f"Found {len(pages)} chapter images from legacy CDN scan")
 
-        def _page_num(u: str) -> int:
-            m = re.search(r'/(\d+)\.(?:webp|jpg|jpeg|png)$', u)
-            return int(m.group(1)) if m else 0
-
-        pages.sort(key=_page_num)
-
-        # Log a hint when we suspect we still only have preload thumbnails
-        if len(pages) < MIN_PAGES:
-            logger.debug(f"Only {len(pages)} CDN URL(s) found — may be preloads only")
-        else:
-            logger.info(f"Found {len(pages)} chapter images")
         return pages
 
     def _get_pages_selenium_scroll(self, url: str) -> List[str]:
