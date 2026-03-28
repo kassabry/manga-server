@@ -1872,42 +1872,64 @@ class AsuraFullScraper(BaseSiteScraper):
     def _extract_asura_images(self, html: str) -> List[str]:
         """Extract chapter image URLs from Asura HTML.
 
-        New Astro site serves images as standard <img> tags with src pointing to
-        cdn.asurascans.com/asura-images/chapters/HASH/CHAPTER/PAGE.webp
-        """
-        # --- Strategy 1: regex scan of raw HTML (catches both img tags and any
-        #     serialised data the Astro framework may embed in script blocks) ---
-        raw_urls = re.findall(
-            r'https?://cdn\.asurascans\.com/asura-images/chapters/[^"\'\\>\s]+\.(?:webp|jpg|jpeg|png)',
-            html
-        )
+        Runs two strategies and merges results so that a few CDN preload URLs
+        in Strategy 1 don't suppress the full lazy-loaded list in Strategy 2.
 
-        seen = set()
-        pages = []
-        for url in raw_urls:
-            if url not in seen:
+        Strategy 1 — regex over raw HTML:
+          Catches URLs embedded in script/JSON blocks.  Also handles JSON-encoded
+          forward slashes (\\/) that would otherwise break the character class.
+
+        Strategy 2 — BeautifulSoup img tag scan:
+          Picks up src, data-src, data-lazy-src, and srcset attributes used by
+          the various lazy-loading patterns (loading="lazy", Intersection­Observer,
+          swiper slides, etc.).
+        """
+        MIN_PAGES = 3
+        seen: set = set()
+        pages: List[str] = []
+
+        def _add(url: str):
+            url = url.strip()
+            if url and url not in seen and self._is_chapter_page_url(url):
                 seen.add(url)
                 pages.append(url)
 
-        if pages:
-            # Sort by page number embedded in the filename (e.g. 001, 002 …)
-            def _page_num(u: str) -> int:
-                m = re.search(r'/(\d+)\.(?:webp|jpg|jpeg|png)$', u)
-                return int(m.group(1)) if m else 0
-            pages.sort(key=_page_num)
-            logger.info(f"Found {len(pages)} chapter images from CDN")
-            return pages
+        # --- Strategy 1: regex on raw HTML (unescape JSON \/ first) ---
+        normalised = html.replace('\\/', '/')
+        for url in re.findall(
+            r'https?://cdn\.asurascans\.com/asura-images/chapters/[^\s"\'<>]+\.(?:webp|jpg|jpeg|png)',
+            normalised,
+        ):
+            _add(url)
 
-        # --- Strategy 2: parse <img> tags explicitly ---
+        # --- Strategy 2: BeautifulSoup attribute scan ---
+        # Always run so that data-src / srcset lazy-load attributes are captured
+        # even when Strategy 1 found a handful of preload/og:image CDN URLs.
         soup = BeautifulSoup(html, 'html.parser')
-        pages = []
+        lazy_attrs = ('src', 'data-src', 'data-lazy-src', 'data-original')
         for img in soup.select('img'):
-            src = img.get('src') or img.get('data-src') or ''
-            if self._is_chapter_page_url(src) and src not in pages:
-                pages.append(src)
+            for attr in lazy_attrs:
+                val = img.get(attr, '')
+                if val:
+                    _add(val)
+            # srcset may contain multiple space-separated "url widthw" pairs
+            for entry in img.get('srcset', '').split(','):
+                _add(entry.strip().split()[0]) if entry.strip() else None
 
-        if pages:
-            logger.info(f"Found {len(pages)} chapter images from img tags")
+        if not pages:
+            return []
+
+        def _page_num(u: str) -> int:
+            m = re.search(r'/(\d+)\.(?:webp|jpg|jpeg|png)$', u)
+            return int(m.group(1)) if m else 0
+
+        pages.sort(key=_page_num)
+
+        # Log a hint when we suspect we still only have preload thumbnails
+        if len(pages) < MIN_PAGES:
+            logger.debug(f"Only {len(pages)} CDN URL(s) found — may be preloads only")
+        else:
+            logger.info(f"Found {len(pages)} chapter images")
         return pages
 
     def _get_pages_selenium_scroll(self, url: str) -> List[str]:
@@ -1985,19 +2007,27 @@ class AsuraFullScraper(BaseSiteScraper):
                     time.sleep(2)
                     continue
 
-        # FlareSolverr exhausted: the chapter viewer likely uses IntersectionObserver
-        # lazy loading that requires scrolling.  Fall back to Selenium+scroll.
-        logger.info(
-            f"FlareSolverr returned only {len(best_pages)} image(s) for {chapter.url}; "
-            f"falling back to Selenium+scroll to trigger lazy loading..."
-        )
-        try:
-            pages = self._get_pages_selenium_scroll(chapter.url)
-            if pages:
-                logger.info(f"Selenium+scroll found {len(pages)} images for {chapter.url}")
-                return pages
-        except Exception as e:
-            logger.warning(f"Selenium+scroll fallback failed for {chapter.url}: {e}")
+        # FlareSolverr exhausted with insufficient images.
+        # On ARM the scraper runs inside Docker with no host Chromium, so the
+        # Selenium+scroll fallback won't work there — skip it and return best.
+        # On x86 we can try headless Selenium with auto-scroll.
+        if not self._is_arm():
+            logger.info(
+                f"FlareSolverr returned only {len(best_pages)} image(s) for {chapter.url}; "
+                f"falling back to Selenium+scroll to trigger lazy loading..."
+            )
+            try:
+                pages = self._get_pages_selenium_scroll(chapter.url)
+                if pages:
+                    logger.info(f"Selenium+scroll found {len(pages)} images for {chapter.url}")
+                    return pages
+            except Exception as e:
+                logger.warning(f"Selenium+scroll fallback failed for {chapter.url}: {e}")
+        else:
+            logger.warning(
+                f"ARM: FlareSolverr returned only {len(best_pages)} image(s) for {chapter.url}; "
+                f"Selenium+scroll not available on ARM — chapter images may be incomplete."
+            )
 
         if best_pages:
             logger.warning(
