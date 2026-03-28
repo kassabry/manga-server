@@ -54,6 +54,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
   const [progress, setProgress] = useState<ProgressMap>({});
   const [sortDesc, setSortDesc] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<string>("all");
+  const [deduping, setDeduping] = useState(false);
 
   const uniqueSources = useMemo(() => {
     const sources = new Set<string>();
@@ -72,12 +73,33 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       if (!map.has(ch.number)) {
         map.set(ch.number, { number: ch.number, title: ch.title, pageCount: ch.pageCount, createdAt: ch.createdAt, sources: [] });
       }
-      map.get(ch.number)!.sources.push(ch);
+      const group = map.get(ch.number)!;
+      // Deduplicate by source: keep the entry with the most pages
+      const existingIdx = group.sources.findIndex((s) => s.source === ch.source);
+      if (existingIdx >= 0) {
+        if (ch.pageCount > group.sources[existingIdx].pageCount) {
+          group.sources[existingIdx] = ch;
+        }
+      } else {
+        group.sources.push(ch);
+      }
     }
     const groups = Array.from(map.values());
     groups.sort((a, b) => a.number - b.number);
     return sortDesc ? [...groups].reverse() : groups;
   }, [isGrouped, series, sortDesc]);
+
+  // Detect DB-level duplicates: same chapter number + same source appearing more than once
+  const hasDuplicates = useMemo(() => {
+    if (!series) return false;
+    const seen = new Set<string>();
+    for (const ch of series.chapters) {
+      const key = `${ch.number}:${ch.source}`;
+      if (seen.has(key)) return true;
+      seen.add(key);
+    }
+    return false;
+  }, [series]);
 
   useEffect(() => {
     fetch(`/api/series/${id}`)
@@ -137,10 +159,8 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
 
   const chapters = isGrouped ? [] : (sortDesc ? [...filteredChapters].reverse() : filteredChapters);
 
-  // When showing all sources, display the max chapter count from any single source
-  const displayChapterCount = isGrouped
-    ? Math.max(...uniqueSources.map((s) => series.chapters.filter((ch: Chapter) => ch.source === s).length))
-    : filteredChapters.length;
+  // Unique chapter count: number of grouped rows when multi-source, else filtered list length
+  const displayChapterCount = isGrouped ? groupedChapters.length : filteredChapters.length;
 
   return (
     <div className="space-y-6">
@@ -261,7 +281,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
         </div>
 
         {uniqueSources.length > 1 && (
-          <div className="flex items-center gap-2 mb-3">
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
             <span className="text-xs text-text-secondary">Source:</span>
             <select
               value={sourceFilter}
@@ -273,6 +293,30 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                 <option key={s} value={s}>{s}</option>
               ))}
             </select>
+            {hasDuplicates && (
+              <button
+                onClick={async () => {
+                  if (!confirm("Remove duplicate chapters from the database? This keeps the best copy (most pages) of each chapter per source.")) return;
+                  setDeduping(true);
+                  try {
+                    const res = await fetch(`/api/series/${id}/dedup`, { method: "POST" });
+                    const data = await res.json();
+                    if (res.ok) {
+                      // Reload series data
+                      const updated = await fetch(`/api/series/${id}`).then(r => r.json());
+                      setSeries(updated);
+                      alert(`Removed ${data.removed} duplicate chapter${data.removed !== 1 ? "s" : ""}.`);
+                    }
+                  } finally {
+                    setDeduping(false);
+                  }
+                }}
+                disabled={deduping}
+                className="rounded-lg border border-yellow-600/40 bg-yellow-900/20 px-2 py-1 text-xs text-yellow-400 hover:bg-yellow-900/40 disabled:opacity-50"
+              >
+                {deduping ? "Removing…" : `⚠ Remove Duplicates`}
+              </button>
+            )}
           </div>
         )}
 
