@@ -154,7 +154,61 @@ class BaseLightNovelScraper:
         self.headless = headless
         self.limit = limit
         self.driver = None
-    
+        self._use_flaresolverr = False
+        self._fs_cookies_applied = False
+
+    def _flaresolverr_url(self):
+        """Get FlareSolverr URL from env or default"""
+        return os.environ.get('FLARESOLVERR_URL', 'http://localhost:8191')
+
+    def _flaresolverr_available(self):
+        """Check if FlareSolverr is reachable"""
+        try:
+            resp = requests.get(self._flaresolverr_url(), timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _flaresolverr_get(self, url: str, max_timeout: int = 60000):
+        """Use FlareSolverr to fetch a URL, solving Cloudflare challenges.
+        Returns (html, cookies_list, user_agent) or raises on failure."""
+        payload = {
+            "cmd": "request.get",
+            "url": url,
+            "maxTimeout": max_timeout,
+        }
+        resp = requests.post(
+            f"{self._flaresolverr_url()}/v1",
+            json=payload,
+            timeout=max_timeout // 1000 + 30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status") != "ok":
+            raise RuntimeError(f"FlareSolverr error: {data.get('message', 'unknown')}")
+        solution = data["solution"]
+        html = solution["response"]
+        cookies = solution.get("cookies", [])
+        user_agent = solution.get("userAgent", "")
+        return html, cookies, user_agent
+
+    def _apply_flaresolverr_cookies(self, cookies: list, user_agent: str = ""):
+        """Apply cookies from FlareSolverr to the requests session."""
+        applied = 0
+        for c in cookies:
+            domain = c.get("domain", "").strip()
+            if domain.startswith("."):
+                domain = domain[1:]
+            self.session.cookies.set(
+                c["name"], c["value"],
+                domain=domain,
+                path=c.get("path", "/"),
+            )
+            applied += 1
+        if user_agent:
+            self.session.headers["User-Agent"] = user_agent
+        logger.debug(f"Applied {applied}/{len(cookies)} FlareSolverr cookies to session")
+
     def _detect_chrome_version(self) -> Optional[int]:
         """Detect installed Chrome version"""
         import subprocess
@@ -942,10 +996,22 @@ class NovelBinScraper(BaseLightNovelScraper):
     SITE_NAME = "novelbin"
 
     def __init__(self, headless: bool = True, limit: int = None):
-        # NovelBin chapter pages require non-headless for Cloudflare bypass
-        if headless:
-            logger.info("NovelBin requires non-headless mode for chapter content. Overriding to visible browser.")
+        # On ARM (Docker/no DISPLAY), FlareSolverr is the only reliable path.
+        # On x86, use non-headless Selenium for Cloudflare bypass.
         super().__init__(headless=False, limit=limit)
+        if self._is_arm():
+            if self._flaresolverr_available():
+                logger.info("ARM detected - using FlareSolverr for NovelBin")
+                self._use_flaresolverr = True
+            else:
+                logger.warning(
+                    "ARM detected but FlareSolverr is unavailable. "
+                    "NovelBin will likely fail Cloudflare challenges in headless mode. "
+                    "Start FlareSolverr (set FLARESOLVERR_URL or run on localhost:8191)."
+                )
+        else:
+            if headless:
+                logger.info("NovelBin requires non-headless mode for chapter content. Overriding to visible browser.")
 
     def _wait_for_cloudflare(self, timeout: int = 30):
         """Wait for Cloudflare challenge to resolve"""
@@ -964,7 +1030,24 @@ class NovelBinScraper(BaseLightNovelScraper):
         return False
 
     def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
-        """Override to handle Cloudflare on chapter pages"""
+        """Override to handle Cloudflare — FlareSolverr on ARM, Selenium otherwise"""
+        if self._use_flaresolverr:
+            if self._fs_cookies_applied:
+                try:
+                    resp = self.session.get(url, timeout=30)
+                    resp.raise_for_status()
+                    if len(resp.text) > 500 and 'just a moment' not in resp.text.lower():
+                        return BeautifulSoup(resp.text, 'html.parser')
+                except Exception:
+                    pass
+                self._fs_cookies_applied = False
+            try:
+                html, cookies, user_agent = self._flaresolverr_get(url)
+                self._apply_flaresolverr_cookies(cookies, user_agent)
+                self._fs_cookies_applied = True
+                return BeautifulSoup(html, 'html.parser')
+            except Exception as e:
+                logger.warning(f"FlareSolverr failed for {url}: {e}, falling back to Selenium")
         self._init_selenium()
         self.driver.get(url)
         self._wait_for_cloudflare()

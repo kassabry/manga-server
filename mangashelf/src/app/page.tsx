@@ -64,7 +64,7 @@ export default function HomePage() {
     setLoadingMore(true);
     try {
       const res = await fetch(
-        `/api/series?sort=recent&limit=${PAGE_SIZE}&page=${pageNum}`
+        `/api/series?sort=recent&limit=${PAGE_SIZE}&page=${pageNum}&excludeType=LightNovels`
       );
       const data = await res.json();
       const incoming: SeriesData[] = data.series || [];

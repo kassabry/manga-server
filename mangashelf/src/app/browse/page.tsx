@@ -11,6 +11,7 @@ interface SeriesData {
   type: string;
   status: string | null;
   chapterCount: number;
+  latestChapterNumber?: number | null;
 }
 
 interface FilterMeta {

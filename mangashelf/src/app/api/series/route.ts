@@ -11,6 +11,7 @@ export async function GET(request: NextRequest) {
   const status = searchParams.get("status") || "";
   const publisher = searchParams.get("publisher") || "";
   const sort = searchParams.get("sort") || "title";
+  const excludeType = searchParams.get("excludeType") || "";
 
   // Build AND conditions array for more complex filtering
   const andConditions: Record<string, unknown>[] = [];
@@ -40,6 +41,9 @@ export async function GET(request: NextRequest) {
   }
   if (publisher) {
     andConditions.push({ publisher });
+  }
+  if (excludeType) {
+    andConditions.push({ type: { not: excludeType } });
   }
 
   const where = andConditions.length > 0 ? { AND: andConditions } : {};

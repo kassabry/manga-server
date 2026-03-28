@@ -9,6 +9,7 @@ interface SeriesCardProps {
   type: string;
   status: string | null;
   chapterCount: number;
+  latestChapterNumber?: number | null;
 }
 
 export function SeriesCard({
@@ -18,6 +19,7 @@ export function SeriesCard({
   type,
   status,
   chapterCount,
+  latestChapterNumber,
 }: SeriesCardProps) {
   return (
     <Link href={`/series/${id}`} className="group block">
@@ -58,7 +60,7 @@ export function SeriesCard({
         {/* Chapter count badge */}
         <div className="absolute bottom-1 right-1">
           <span className="rounded bg-bg-secondary/90 px-1.5 py-0.5 text-[10px]">
-            {chapterCount} ch
+            {latestChapterNumber != null ? `${latestChapterNumber} ch` : `${chapterCount} ch`}
           </span>
         </div>
       </div>

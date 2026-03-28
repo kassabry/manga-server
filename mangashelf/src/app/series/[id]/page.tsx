@@ -37,6 +37,14 @@ interface ProgressMap {
   [chapterId: string]: { completed: boolean; page: number };
 }
 
+interface ChapterGroup {
+  number: number;
+  title: string | null;
+  pageCount: number;
+  createdAt: string;
+  sources: Chapter[];
+}
+
 export default function SeriesPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const { data: session } = useSession();
@@ -110,11 +118,29 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
   const filteredChapters = sourceFilter === "all"
     ? series.chapters
     : series.chapters.filter((ch: Chapter) => ch.source === sourceFilter);
-  const chapters = sortDesc ? [...filteredChapters].reverse() : filteredChapters;
+
+  // When showing all sources with multiple sources, group chapters by number
+  const isGrouped = sourceFilter === "all" && uniqueSources.length > 1;
+
+  // Build grouped chapter list: one entry per unique chapter number
+  const groupedChapters: ChapterGroup[] = useMemo(() => {
+    if (!isGrouped) return [];
+    const map = new Map<number, ChapterGroup>();
+    for (const ch of series.chapters) {
+      if (!map.has(ch.number)) {
+        map.set(ch.number, { number: ch.number, title: ch.title, pageCount: ch.pageCount, createdAt: ch.createdAt, sources: [] });
+      }
+      map.get(ch.number)!.sources.push(ch);
+    }
+    const groups = Array.from(map.values());
+    groups.sort((a, b) => a.number - b.number);
+    return sortDesc ? [...groups].reverse() : groups;
+  }, [isGrouped, series.chapters, sortDesc]);
+
+  const chapters = isGrouped ? [] : (sortDesc ? [...filteredChapters].reverse() : filteredChapters);
 
   // When showing all sources, display the max chapter count from any single source
-  // rather than the total sum across all sources (avoids inflated counts for multi-source series)
-  const displayChapterCount = (sourceFilter === "all" && uniqueSources.length > 1)
+  const displayChapterCount = isGrouped
     ? Math.max(...uniqueSources.map((s) => series.chapters.filter((ch: Chapter) => ch.source === s).length))
     : filteredChapters.length;
 
@@ -253,43 +279,78 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
         )}
 
         <div className="space-y-1">
-          {chapters.map((chapter) => {
-            const prog = progress[chapter.id];
-            return (
-              <Link
-                key={chapter.id}
-                href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
-                className={`flex items-center justify-between rounded-lg border border-border px-4 py-3 hover:border-accent ${
-                  prog?.completed ? "opacity-60" : ""
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  {prog?.completed && (
-                    <span className="text-green-500" title="Read">
-                      ✓
-                    </span>
-                  )}
-                  <span className="font-medium">
-                    Chapter {chapter.number}
-                  </span>
-                  {chapter.title && (
-                    <span className="text-text-secondary">
-                      — {chapter.title}
-                    </span>
-                  )}
-                  {uniqueSources.length > 1 && chapter.source && (
-                    <span className="rounded bg-bg-hover px-1.5 py-0.5 text-[10px] text-text-secondary">
-                      {chapter.source}
-                    </span>
-                  )}
-                </div>
-                <div className="flex items-center gap-4 text-xs text-text-secondary">
-                  <span>{chapter.pageCount} pages</span>
-                  <span>{new Date(chapter.createdAt).toLocaleDateString()}</span>
-                </div>
-              </Link>
-            );
-          })}
+          {isGrouped
+            ? groupedChapters.map((group) => {
+                const anyCompleted = group.sources.some((ch) => progress[ch.id]?.completed);
+                const defaultChapter = group.sources[0];
+                const defaultProg = progress[defaultChapter.id];
+                return (
+                  <div
+                    key={group.number}
+                    className={`flex items-center justify-between rounded-lg border border-border px-4 py-3 ${
+                      anyCompleted ? "opacity-60" : ""
+                    }`}
+                  >
+                    <div className="flex items-center gap-3 min-w-0">
+                      {anyCompleted && (
+                        <span className="text-green-500 shrink-0" title="Read">✓</span>
+                      )}
+                      <span className="font-medium shrink-0">Chapter {group.number}</span>
+                      {group.title && (
+                        <span className="text-text-secondary truncate">— {group.title}</span>
+                      )}
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {group.sources.map((ch) => {
+                          const prog = progress[ch.id];
+                          return (
+                            <Link
+                              key={ch.id}
+                              href={`/read/${ch.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
+                              className={`rounded px-2 py-0.5 text-[11px] font-medium border transition-colors hover:border-accent hover:text-accent ${
+                                prog?.completed
+                                  ? "border-green-700/40 bg-green-900/20 text-green-500"
+                                  : "border-border bg-bg-hover text-text-secondary"
+                              }`}
+                            >
+                              {ch.source ?? "Unknown"}
+                            </Link>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-4 text-xs text-text-secondary shrink-0">
+                      <span>{group.pageCount} pages</span>
+                      <span>{new Date(group.createdAt).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+                );
+              })
+            : chapters.map((chapter) => {
+                const prog = progress[chapter.id];
+                return (
+                  <Link
+                    key={chapter.id}
+                    href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
+                    className={`flex items-center justify-between rounded-lg border border-border px-4 py-3 hover:border-accent ${
+                      prog?.completed ? "opacity-60" : ""
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      {prog?.completed && (
+                        <span className="text-green-500" title="Read">✓</span>
+                      )}
+                      <span className="font-medium">Chapter {chapter.number}</span>
+                      {chapter.title && (
+                        <span className="text-text-secondary">— {chapter.title}</span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-4 text-xs text-text-secondary">
+                      <span>{chapter.pageCount} pages</span>
+                      <span>{new Date(chapter.createdAt).toLocaleDateString()}</span>
+                    </div>
+                  </Link>
+                );
+              })}
         </div>
       </section>
     </div>
