@@ -1910,65 +1910,72 @@ class AsuraFullScraper(BaseSiteScraper):
             logger.info(f"Found {len(pages)} chapter images from img tags")
         return pages
 
+    def _get_pages_selenium_scroll(self, url: str) -> List[str]:
+        """Fetch chapter images using Selenium with incremental scroll.
+
+        FlareSolverr only renders the initial viewport, so chapter images that
+        use IntersectionObserver-based lazy loading (below the fold) never get
+        their src resolved in FlareSolverr's HTML snapshot.  Headless Chromium
+        via Selenium actually scrolls through the page, triggering lazy loads.
+        """
+        self._init_driver()
+        self.driver.get(url)
+        time.sleep(4)  # Wait for initial JS hydration
+
+        # Scroll incrementally from top to bottom so IntersectionObserver fires
+        # for every image strip as it enters the viewport.
+        scroll_step = 400
+        position = 0
+        while True:
+            page_height = self.driver.execute_script("return document.body.scrollHeight")
+            if position >= page_height:
+                break
+            self.driver.execute_script(f"window.scrollTo(0, {position})")
+            position += scroll_step
+            time.sleep(0.15)
+        # Final pause to let the last batch of images finish loading
+        time.sleep(2)
+
+        return self._extract_asura_images(self.driver.page_source)
+
     def get_pages(self, chapter: Chapter) -> List[str]:
         """Get image URLs for a chapter from Asura Scans.
 
-        New Astro site serves images as standard <img> tags from cdn.asurascans.com.
-        Selenium renders the page to ensure the Astro islands hydrate before we
-        grab the source.
-
-        If the initial fetch returns no images (e.g. stale cookies gave us a
-        Cloudflare challenge page), we force a fresh FlareSolverr request and
-        retry once before giving up.
-
-        The cached-session fast path (plain HTTP with cookies) does NOT execute
-        JavaScript, so it only sees images that are in the initial server-rendered
-        HTML — typically just 1-2 CDN URLs from og:image / preload hints rather
-        than the full chapter image list.  If we get fewer than 3 images we treat
-        that as an incomplete render and force a fresh FlareSolverr render.
+        Strategy:
+        1. FlareSolverr (ARM) or Selenium (x86) renders the page.
+        2. If < MIN_PAGES found, the cached-session fast path likely returned
+           shell HTML (og:image preloads only) — retry with a fresh FlareSolverr
+           render.
+        3. If FlareSolverr still can't get enough images after retries (the Astro
+           chapter viewer lazy-loads images via IntersectionObserver and
+           FlareSolverr only renders the initial viewport), fall back to headless
+           Selenium with full-page auto-scroll to trigger all lazy loads.
         """
-        # Minimum plausible page count — anything below this on the first attempt
-        # means the cached session returned un-hydrated HTML; retry with full render.
         MIN_PAGES = 3
         max_attempts = 2 if self._use_flaresolverr else 1
+        best_pages: List[str] = []
 
         for attempt in range(1, max_attempts + 1):
             try:
                 soup = self._get_soup(chapter.url, use_selenium=True)
-                html = str(soup)
+                pages = self._extract_asura_images(str(soup))
 
-                pages = self._extract_asura_images(html)
+                if len(pages) > len(best_pages):
+                    best_pages = pages
 
-                # Too few images almost certainly means the cached session path
-                # returned shell HTML without JS-rendered image list — force a
-                # full FlareSolverr render on the next attempt.
-                if pages and len(pages) < MIN_PAGES and attempt < max_attempts and self._use_flaresolverr:
-                    logger.warning(
-                        f"Only {len(pages)} image(s) found for {chapter.url} (attempt {attempt}), "
-                        f"forcing fresh FlareSolverr render for full image list..."
-                    )
-                    self._fs_cookies_applied = False
-                    self.session.cookies.clear()
-                    time.sleep(1)
-                    continue
-
-                if pages:
+                if len(pages) >= MIN_PAGES:
                     return pages
 
-                # No images at all — on first attempt, force fresh FlareSolverr cookies
+                # Too few — retry with fresh FlareSolverr if attempts remain
                 if attempt < max_attempts and self._use_flaresolverr:
                     logger.warning(
-                        f"No images found for {chapter.url} (attempt {attempt}), "
-                        f"forcing fresh FlareSolverr request..."
+                        f"Only {len(pages)} image(s) for {chapter.url} (attempt {attempt}), "
+                        f"forcing fresh FlareSolverr render..."
                     )
                     self._fs_cookies_applied = False
                     self.session.cookies.clear()
-                    time.sleep(2)  # Brief pause before retry
+                    time.sleep(2)
                     continue
-
-                # Final attempt exhausted
-                logger.warning(f"No chapter images found for {chapter.url} after {attempt} attempt(s)")
-                return []
 
             except Exception as e:
                 logger.error(f"Error getting pages (attempt {attempt}): {e}")
@@ -1977,8 +1984,28 @@ class AsuraFullScraper(BaseSiteScraper):
                     self.session.cookies.clear()
                     time.sleep(2)
                     continue
-                return []
 
+        # FlareSolverr exhausted: the chapter viewer likely uses IntersectionObserver
+        # lazy loading that requires scrolling.  Fall back to Selenium+scroll.
+        logger.info(
+            f"FlareSolverr returned only {len(best_pages)} image(s) for {chapter.url}; "
+            f"falling back to Selenium+scroll to trigger lazy loading..."
+        )
+        try:
+            pages = self._get_pages_selenium_scroll(chapter.url)
+            if pages:
+                logger.info(f"Selenium+scroll found {len(pages)} images for {chapter.url}")
+                return pages
+        except Exception as e:
+            logger.warning(f"Selenium+scroll fallback failed for {chapter.url}: {e}")
+
+        if best_pages:
+            logger.warning(
+                f"Returning partial page list ({len(best_pages)} images) for {chapter.url}"
+            )
+            return best_pages
+
+        logger.warning(f"No chapter images found for {chapter.url}")
         return []
 
 
