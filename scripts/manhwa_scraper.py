@@ -3123,12 +3123,11 @@ class ManhuaToScraper(BaseSiteScraper):
                 
                 if base_url and extension and 'cdn.manhuato' in base_url.lower():
                     logger.info(f"Enumerating images from pattern: {base_url}[N]{extension}")
-                    
-                    session = req.Session()
-                    session.headers.update({
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'Referer': chapter_url,
-                    })
+
+                    # Use the scraper's own session so FlareSolverr cookies and
+                    # the matching User-Agent are sent to the CDN during probing.
+                    session = self.session
+                    session.headers.update({'Referer': chapter_url})
                     
                     # Find all images by enumeration (rate-limited to avoid CDN bans)
                     consecutive_failures = 0
@@ -3165,12 +3164,35 @@ class ManhuaToScraper(BaseSiteScraper):
             
             logger.info(f"Found {len(pages)} page images total")
             return pages
-            
+
         except Exception as e:
             logger.error(f"Error getting pages: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             return []
+
+    def _download_image(self, url: str, path: Path, referer: str) -> bool:
+        """Download image using the FlareSolverr session cookies and matching UA.
+
+        The base class hardcodes a generic User-Agent which cdn.manhuato.com
+        rejects when it doesn't match the UA used during the Cloudflare challenge.
+        We send only the Referer here and let the session supply the correct UA.
+        """
+        try:
+            headers = {
+                'Referer': referer,
+                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+            }
+            response = self.session.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            if len(response.content) < 1000:
+                return False
+            path.write_bytes(response.content)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to download {url}: {e}")
+            return False
+
 
 class DrakeFullScraper(BaseSiteScraper):
     """Full site scraper for drakecomic.org"""
