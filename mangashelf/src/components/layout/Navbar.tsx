@@ -201,26 +201,43 @@ export function Navbar() {
         </div>
       </nav>
 
-      {/* Bottom navigation (mobile) */}
-      <nav className="fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-bg-secondary/95 backdrop-blur sm:hidden">
-        <div className="flex items-center justify-around py-1">
-          <MobileNavItem href="/" icon="home" label="Home" active={pathname === "/"} />
-          <MobileNavItem href="/browse" icon="browse" label="Browse" active={pathname.startsWith("/browse")} />
-          {session?.user && (
-            <>
-              <MobileNavItem href="/updates" icon="updates" label="Updates" active={pathname === "/updates"} />
-              <MobileNavItem href="/my-list" icon="list" label="My List" active={pathname === "/my-list"} />
-            </>
-          )}
-          <MobileNavItem
-            href={session?.user ? "/settings" : "/login"}
-            icon="settings"
-            label={session?.user ? "More" : "Sign In"}
-            active={pathname === "/settings"}
-          />
-        </div>
-      </nav>
     </>
+  );
+}
+
+/**
+ * Mobile bottom navigation bar.
+ *
+ * Rendered as a plain block element at the bottom of the app shell's flex
+ * column (layout.tsx) rather than `position: fixed`.  This prevents the
+ * classic iOS Safari jump where `fixed; bottom: 0` repaints whenever the
+ * dynamic viewport height changes as the address bar shows / hides.
+ */
+export function BottomNav() {
+  const { data: session } = useSession();
+  const pathname = usePathname();
+
+  if (pathname.startsWith("/read/")) return null;
+
+  return (
+    <nav className="border-t border-border bg-bg-secondary/95 backdrop-blur sm:hidden shrink-0">
+      <div className="flex items-center justify-around py-1 pb-safe">
+        <MobileNavItem href="/" icon="home" label="Home" active={pathname === "/"} />
+        <MobileNavItem href="/browse" icon="browse" label="Browse" active={pathname.startsWith("/browse")} />
+        {session?.user && (
+          <>
+            <MobileNavItem href="/updates" icon="updates" label="Updates" active={pathname === "/updates"} />
+            <MobileNavItem href="/my-list" icon="list" label="My List" active={pathname === "/my-list"} />
+          </>
+        )}
+        <MobileNavItem
+          href={session?.user ? "/settings" : "/login"}
+          icon="settings"
+          label={session?.user ? "More" : "Sign In"}
+          active={pathname === "/settings"}
+        />
+      </div>
+    </nav>
   );
 }
 
