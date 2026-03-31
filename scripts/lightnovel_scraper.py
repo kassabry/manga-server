@@ -396,7 +396,8 @@ class BaseLightNovelScraper:
             logger.warning(f"Failed to download cover: {e}")
             return None
     
-    def create_epub(self, novel: Novel, chapters: List[Chapter], output_dir: Path, volume_number: int = 1) -> Path:
+    def create_epub(self, novel: Novel, chapters: List[Chapter], output_dir: Path,
+                    volume_number: int = 1, epub_filename: Optional[str] = None) -> Path:
         """Create EPUB file from novel and chapters with Kavita-compatible metadata.
 
         Kavita reads the following OPF metadata from EPUB files:
@@ -412,14 +413,16 @@ class BaseLightNovelScraper:
         - calibre:rating   -> Rating (0-5 scale)
         - belongs-to-collection (EPUB3) -> Collection grouping
 
-        IMPORTANT: Kavita requires 'Vol.' in the filename to parse EPUB files.
-        Without it, the scanner reports 'Unable to parse any meaningful information'.
+        epub_filename: override the output filename (e.g. for per-chapter mode)
         """
         if not HAS_EBOOKLIB:
             raise RuntimeError("ebooklib not installed. Install with: pip install ebooklib")
 
         safe_title = self._sanitize_filename(novel.title)
-        epub_path = output_dir / f"{safe_title} Vol. {volume_number}.epub"
+        if epub_filename:
+            epub_path = output_dir / epub_filename
+        else:
+            epub_path = output_dir / f"{safe_title} Vol. {volume_number}.epub"
 
         # Create EPUB book
         book = epub.EpubBook()
@@ -1624,19 +1627,21 @@ Examples:
         return
     
     # ---------------------------------------------------------------------------
-    # Helper: download one novel as volume-batched EPUBs
+    # Helper: download one novel as one EPUB per chapter
     # ---------------------------------------------------------------------------
-    CHAPTERS_PER_VOLUME = 100
 
     def _download_novel_volumes(scraper, novel, output_path, tracker,
                                 source_prefix=False, site_name=''):
-        """Fetch and write a novel as one EPUB per 100-chapter volume.
+        """Fetch and write a novel as one EPUB per chapter.
 
-        Writes each volume to disk immediately so a crash mid-novel only loses
-        the current volume's work, not the entire book.  Already-written volumes
-        are detected by file existence and skipped automatically (resume support).
+        Each chapter becomes its own EPUB file named
+        "{Title} - Chapter {number}.epub" so the scanner treats every
+        chapter as a separate entry (same pattern as manga CBZs).
 
-        Returns True if all volumes were written successfully.
+        Already-written chapters are detected by file existence and skipped
+        automatically (resume support).
+
+        Returns True if all chapters were written successfully.
         """
         if tracker.is_downloaded(novel.url):
             return True
@@ -1657,45 +1662,38 @@ Examples:
         series_path = output_path / safe_title
         series_path.mkdir(parents=True, exist_ok=True)
 
-        total_vols = max(1, (len(chapters) + CHAPTERS_PER_VOLUME - 1) // CHAPTERS_PER_VOLUME)
         all_ok = True
 
-        for vol_num in range(1, total_vols + 1):
-            vol_start = (vol_num - 1) * CHAPTERS_PER_VOLUME
-            vol_chapters_meta = chapters[vol_start:vol_start + CHAPTERS_PER_VOLUME]
+        for idx, chapter in enumerate(chapters, 1):
+            # Use the chapter's own number string for the filename so the
+            # scanner can parse it with parseChapterNumber("Chapter X").
+            ch_num = str(chapter.number).strip()
+            epub_filename = f"{safe_title} - Chapter {ch_num}.epub"
+            epub_path = series_path / epub_filename
 
-            # Check if this volume EPUB already exists on disk
-            epub_path = series_path / f"{safe_title} Vol. {vol_num}.epub"
             if epub_path.exists():
-                logger.info(f"  Vol. {vol_num}/{total_vols} already exists — skipping")
+                logger.debug(f"  [{idx}/{len(chapters)}] Already exists — skipping Ch.{ch_num}")
                 continue
 
-            logger.info(f"  Fetching Vol. {vol_num}/{total_vols} "
-                        f"(chapters {vol_start + 1}–{vol_start + len(vol_chapters_meta)})")
-
-            # Fetch content for this volume only
-            vol_chapters = []
-            for j, chapter in enumerate(vol_chapters_meta, 1):
-                global_j = vol_start + j
-                logger.info(f"  [{global_j}/{len(chapters)}] Fetching: {chapter.title}")
-                chapter.content = scraper.get_chapter_content(chapter)
-                if not chapter.content:
-                    logger.warning(f"  [{global_j}/{len(chapters)}] Empty content — skipping: {chapter.title}")
-                else:
-                    vol_chapters.append(chapter)
-                time.sleep(0.5)
-
-            if not vol_chapters:
-                logger.warning(f"  Vol. {vol_num} has no content — skipping EPUB creation")
+            logger.info(f"  [{idx}/{len(chapters)}] Fetching Ch.{ch_num}: {chapter.title}")
+            chapter.content = scraper.get_chapter_content(chapter)
+            if not chapter.content:
+                logger.warning(f"  [{idx}/{len(chapters)}] Empty content — skipping Ch.{ch_num}")
                 all_ok = False
                 continue
 
             try:
-                ep = scraper.create_epub(novel, vol_chapters, series_path, volume_number=vol_num)
+                ep = scraper.create_epub(
+                    novel, [chapter], series_path,
+                    volume_number=idx,
+                    epub_filename=epub_filename,
+                )
                 logger.info(f"  Created: {ep.name}")
             except Exception as e:
-                logger.error(f"  Failed to create Vol. {vol_num}: {e}")
+                logger.error(f"  Failed to create Ch.{ch_num}: {e}")
                 all_ok = False
+
+            time.sleep(0.5)
 
         if all_ok:
             tracker.mark_downloaded(novel.url)

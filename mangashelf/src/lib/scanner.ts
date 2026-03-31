@@ -168,7 +168,11 @@ export async function scanLibrary(
       const prefixMatch = entry.name.match(/^\[([^\]]+)\]\s*(.+)$/);
       const seriesTitle = prefixMatch ? prefixMatch[2] : entry.name;
       const dirSourceTag = prefixMatch ? normalizeSource(prefixMatch[1]) : null;
-      const seriesSlug = slugify(seriesTitle);
+      // LightNovels get a "-ln" suffix so they never merge with a same-titled
+      // manga/manhwa/manhua series that shares the same base slug.
+      const seriesSlug = type === "LightNovels"
+        ? slugify(seriesTitle) + "-ln"
+        : slugify(seriesTitle);
 
       try {
         await scanSeries(seriesDirPath, seriesTitle, seriesSlug, type, result, dirSourceTag);
@@ -471,6 +475,21 @@ async function scanSeries(
         data: corrections,
       });
       result.seriesUpdated++;
+    }
+  }
+
+  // For LightNovels: migrate any chapters from this directory that ended up
+  // under a different series (e.g. previously merged with a same-named manga).
+  if (type === "LightNovels") {
+    const migrated = await prisma.chapter.updateMany({
+      where: {
+        filePath: { startsWith: seriesDirPath },
+        NOT: { seriesId: series.id },
+      },
+      data: { seriesId: series.id },
+    });
+    if (migrated.count > 0) {
+      console.log(`Migrated ${migrated.count} LN chapters into "${seriesTitle}" (were under wrong series)`);
     }
   }
 
