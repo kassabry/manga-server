@@ -198,7 +198,67 @@ export async function scanLibrary(
     }
   }
 
+  // Final pass: fix any remaining cross-type chapter assignments and chapter counts.
+  // This catches cases where LN chapters ended up in a manga series before this
+  // fix was deployed, and the per-directory migration above didn't reach them
+  // (e.g. the LN directory wasn't re-scanned or had no new files to process).
+  await repairCrossTypeChapterCounts();
+
   return result;
+}
+
+/**
+ * Fix cross-type chapter assignments left over from before the type-isolation fix.
+ * Finds any non-LN series that contain chapters belonging to an LN series path
+ * (identified via SeriesPath entries) and moves those chapters to the correct LN series.
+ * Also recounts chapterCount on every affected series.
+ */
+async function repairCrossTypeChapterCounts(): Promise<void> {
+  // Get all LN series with their tracked library paths
+  const lnSeries = await prisma.series.findMany({
+    where: { type: "LightNovels" },
+    include: { libraryPaths: true },
+  });
+
+  for (const ln of lnSeries) {
+    // Build the full list of directories we know belong to this LN series
+    const lnDirs = [
+      ln.libraryPath,
+      ...ln.libraryPaths.map((p) => p.path),
+    ];
+
+    for (const dir of lnDirs) {
+      // Find chapters from this directory that are stored under a different series
+      const stray = await prisma.chapter.findMany({
+        where: {
+          filePath: { startsWith: dir },
+          NOT: { seriesId: ln.id },
+        },
+        select: { id: true, seriesId: true },
+      });
+
+      if (stray.length === 0) continue;
+
+      await prisma.chapter.updateMany({
+        where: { id: { in: stray.map((c) => c.id) } },
+        data: { seriesId: ln.id },
+      });
+
+      // Recount all affected series (including the LN series itself)
+      const affectedIds = [...new Set([ln.id, ...stray.map((c) => c.seriesId)])];
+      for (const sid of affectedIds) {
+        const count = await prisma.chapter.count({ where: { seriesId: sid } });
+        await prisma.series.update({
+          where: { id: sid },
+          data: { chapterCount: count },
+        });
+      }
+      console.log(
+        `[repair] Moved ${stray.length} LN chapters to "${ln.title}" ` +
+        `from ${[...new Set(stray.map((c) => c.seriesId))].length} other series`
+      );
+    }
+  }
 }
 
 async function cleanupDeletedSeries(
@@ -272,6 +332,18 @@ async function scanSeries(
     where: { slug: seriesSlug },
     include: { chapters: true },
   });
+
+  // Refuse to merge across incompatible types.
+  // LightNovels must never merge with Manga/Manhwa/Manhua and vice versa —
+  // they are different media even when the title is identical.
+  if (series) {
+    const incomingIsLN = type === "LightNovels";
+    const existingIsLN = series.type === "LightNovels";
+    if (incomingIsLN !== existingIsLN) {
+      // Type mismatch: drop the result so a proper separate series gets created.
+      series = null;
+    }
+  }
 
   // Fallback: look up by libraryPath for backward compatibility
   // Old DB entries may have slugs that include [Source] prefix (e.g. "asura-solo-leveling")
@@ -480,16 +552,35 @@ async function scanSeries(
 
   // For LightNovels: migrate any chapters from this directory that ended up
   // under a different series (e.g. previously merged with a same-named manga).
+  // Also update the chapter count on every source series that loses chapters.
   if (type === "LightNovels") {
-    const migrated = await prisma.chapter.updateMany({
+    const strayChapters = await prisma.chapter.findMany({
       where: {
         filePath: { startsWith: seriesDirPath },
         NOT: { seriesId: series.id },
       },
-      data: { seriesId: series.id },
+      select: { id: true, seriesId: true },
     });
-    if (migrated.count > 0) {
-      console.log(`Migrated ${migrated.count} LN chapters into "${seriesTitle}" (were under wrong series)`);
+
+    if (strayChapters.length > 0) {
+      await prisma.chapter.updateMany({
+        where: { id: { in: strayChapters.map((c) => c.id) } },
+        data: { seriesId: series.id },
+      });
+
+      // Recount chapters for every series that just lost some chapters
+      const affectedSeriesIds = [...new Set(strayChapters.map((c) => c.seriesId))];
+      for (const sid of affectedSeriesIds) {
+        const newCount = await prisma.chapter.count({ where: { seriesId: sid } });
+        await prisma.series.update({
+          where: { id: sid },
+          data: { chapterCount: newCount },
+        });
+      }
+      console.log(
+        `Migrated ${strayChapters.length} LN chapters into "${seriesTitle}" ` +
+        `(fixed count on ${affectedSeriesIds.length} series)`
+      );
     }
   }
 
