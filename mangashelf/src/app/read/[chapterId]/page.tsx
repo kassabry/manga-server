@@ -96,6 +96,9 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   const [showChapterPicker, setShowChapterPicker] = useState(false);
   const [autoHideTimer, setAutoHideTimer] = useState<ReturnType<typeof setTimeout> | null>(null);
   const [epubHtmlPages, setEpubHtmlPages] = useState<string[]>([]);
+  // Reload: incrementing forces a fresh fetch of all images (cache-busts error-cached URLs)
+  const [reloadKey, setReloadKey] = useState(0);
+  const [isReloading, setIsReloading] = useState(false);
 
   // Touch/swipe state
   const touchStartX = useRef(0);
@@ -189,20 +192,22 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       });
   }, [chapterId, initialPage]);
 
-  // Fetch EPUB HTML content when chapter is EPUB
+  // Fetch EPUB HTML content when chapter is EPUB (re-runs when reloadKey increments)
   useEffect(() => {
     if (!chapter?.isEpub || chapter.pages.length === 0) {
       setEpubHtmlPages([]);
       return;
     }
 
-    // Load all EPUB chapter pages as HTML
+    setEpubHtmlPages([]); // Show loading state while re-fetching
+    // Load all EPUB chapter pages as HTML; reloadKey forces a fresh fetch on reload
     Promise.all(
       chapter.pages.map((page) =>
-        fetch(page.url).then((r) => r.text())
+        fetch(pageUrl(page.url)).then((r) => r.text())
       )
     ).then(setEpubHtmlPages);
-  }, [chapter?.id, chapter?.isEpub, chapter?.pages]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chapter?.id, chapter?.isEpub, chapter?.pages, reloadKey]);
 
   // Restore saved progress if no page param in URL
   useEffect(() => {
@@ -262,6 +267,19 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     if (!showChapterPicker || !activeChapterBtnRef.current) return;
     activeChapterBtnRef.current.scrollIntoView({ block: "center", behavior: "instant" });
   }, [showChapterPicker]);
+
+  // Reload all chapter images (clears browser error-cache by appending ?r=N to every URL)
+  const reloadChapter = useCallback(() => {
+    setIsReloading(true);
+    setReloadKey((k) => k + 1);
+    setTimeout(() => setIsReloading(false), 1000);
+  }, []);
+
+  // Cache-bust helper: appends ?r=N when reloadKey > 0 so the browser re-fetches
+  const pageUrl = useCallback(
+    (url: string) => (reloadKey > 0 ? `${url}?r=${reloadKey}` : url),
+    [reloadKey]
+  );
 
   // Save settings when they change
   const updateSettings = useCallback((updates: Partial<ReaderSettings>) => {
@@ -620,6 +638,22 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               {currentPage + 1}/{totalPages}
             </span>
           )}
+          {/* Reload button — clears browser error-cached images */}
+          <button
+            onClick={(e) => { e.stopPropagation(); reloadChapter(); }}
+            className="rounded p-1.5 text-white/70 hover:bg-white/10 hover:text-white"
+            title="Reload images"
+          >
+            <svg
+              className={`h-5 w-5 transition-transform ${isReloading ? "animate-spin" : ""}`}
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5}
+                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+          </button>
           <button
             onClick={() => { setShowSettings(!showSettings); setShowChapterPicker(false); }}
             className="rounded p-1.5 text-white/70 hover:bg-white/10 hover:text-white"
@@ -916,7 +950,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             {chapter.pages.map((page) => (
               <img
                 key={page.index}
-                src={page.url}
+                src={pageUrl(page.url)}
                 alt={`Page ${page.index + 1}`}
                 className="w-full"
                 loading="lazy"
@@ -963,7 +997,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               <>
                 {rightPage && (
                   <img
-                    src={rightPage.url}
+                    src={pageUrl(rightPage.url)}
                     alt={`Page ${currentPage + 2}`}
                     className={getFitClass(settings.fit, true)}
                     draggable={false}
@@ -971,7 +1005,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 )}
                 {leftPage && (
                   <img
-                    src={leftPage.url}
+                    src={pageUrl(leftPage.url)}
                     alt={`Page ${currentPage + 1}`}
                     className={getFitClass(settings.fit, true)}
                     draggable={false}
@@ -982,7 +1016,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               <>
                 {leftPage && (
                   <img
-                    src={leftPage.url}
+                    src={pageUrl(leftPage.url)}
                     alt={`Page ${currentPage + 1}`}
                     className={getFitClass(settings.fit, true)}
                     draggable={false}
@@ -990,7 +1024,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 )}
                 {rightPage && (
                   <img
-                    src={rightPage.url}
+                    src={pageUrl(rightPage.url)}
                     alt={`Page ${currentPage + 2}`}
                     className={getFitClass(settings.fit, true)}
                     draggable={false}
@@ -1003,7 +1037,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
           <div className="flex h-full items-center justify-center">
             {chapter.pages[currentPage] && (
               <img
-                src={chapter.pages[currentPage].url}
+                src={pageUrl(chapter.pages[currentPage].url)}
                 alt={`Page ${currentPage + 1}`}
                 className={getFitClass(settings.fit, false)}
                 draggable={false}
