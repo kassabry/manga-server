@@ -110,6 +110,12 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   // Track the visible page in longstrip mode for accurate progress saving
   const longstripPageRef = useRef(0);
 
+  // Chapter picker: ref to the active chapter button for auto-scrolling
+  const activeChapterBtnRef = useRef<HTMLButtonElement>(null);
+
+  // Longstrip initial-scroll guard: only scroll to initialPage once per chapter load
+  const scrolledToInitialRef = useRef(false);
+
   // Load settings from localStorage first, then override from server
   useEffect(() => {
     const local = loadReaderSettings();
@@ -138,10 +144,11 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
   // Fetch chapter data
   useEffect(() => {
-    // Reset nav guard on chapter change
+    // Reset nav guard and initial-scroll flag on chapter change
     readyForNavRef.current = false;
     hasScrolledRef.current = false;
     scrollDistanceRef.current = 0;
+    scrolledToInitialRef.current = false;
 
     fetch(`/api/chapters/${chapterId}`)
       .then((r) => r.json())
@@ -220,6 +227,41 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       })
       .catch(() => {});
   }, [session, chapter]);
+
+  // Longstrip: when opening a chapter with ?page=X (e.g. from Continue Reading),
+  // scroll the container to that image. setCurrentPage alone doesn't move the
+  // scroll position because longstrip renders every page simultaneously.
+  useEffect(() => {
+    if (
+      !chapter ||
+      initialPage <= 0 ||
+      settings.layout !== "longstrip" ||
+      scrolledToInitialRef.current
+    ) return;
+
+    scrolledToInitialRef.current = true;
+    let attempts = 0;
+
+    const tryScroll = () => {
+      const target = containerRef.current?.querySelector<HTMLElement>(
+        `img[data-page-index="${initialPage}"]`
+      );
+      if (target) {
+        target.scrollIntoView({ behavior: "instant" });
+      } else if (attempts < 20) {
+        attempts++;
+        setTimeout(tryScroll, 150);
+      }
+    };
+    // Short initial delay so images can start rendering
+    setTimeout(tryScroll, 150);
+  }, [chapter, initialPage, settings.layout]);
+
+  // Chapter picker: scroll the active chapter into view when the panel opens
+  useEffect(() => {
+    if (!showChapterPicker || !activeChapterBtnRef.current) return;
+    activeChapterBtnRef.current.scrollIntoView({ block: "center", behavior: "instant" });
+  }, [showChapterPicker]);
 
   // Save settings when they change
   const updateSettings = useCallback((updates: Partial<ReaderSettings>) => {
@@ -602,6 +644,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               {chapter.allChapters.map((ch) => (
                 <button
                   key={ch.id}
+                  ref={ch.id === chapter.id ? activeChapterBtnRef : undefined}
                   onClick={() => {
                     setShowChapterPicker(false);
                     if (ch.id !== chapter.id) {
