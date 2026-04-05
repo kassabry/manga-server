@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, quote, urlunparse
 
 try:
     import requests
@@ -2717,6 +2718,22 @@ class ManhuaToScraper(BaseSiteScraper):
     # Content types
     TYPES = ['manhwa', 'manhua', 'manga', 'comics']
 
+    @staticmethod
+    def _encode_url(url: str) -> str:
+        """Percent-encode spaces and unsafe characters in a CDN URL path.
+
+        ManhuaTo HTML sometimes has raw spaces in img src attributes like:
+            https://cdn.manhuato.com/ My Series/chapter-1/1.jpg
+        Python requests does NOT auto-encode spaces, so the CDN returns errors.
+        This encodes only the path component, leaving scheme/host/query intact.
+        """
+        try:
+            p = urlparse(url)
+            encoded_path = quote(p.path, safe='/:@!$&()*+,;=~')
+            return urlunparse(p._replace(path=encoded_path))
+        except Exception:
+            return url
+
     def _get_soup_fs(self, url: str) -> BeautifulSoup:
         """Fetch a page using FlareSolverr or cached session cookies"""
         if not self._fs_cookies_applied:
@@ -3085,18 +3102,22 @@ class ManhuaToScraper(BaseSiteScraper):
                 
                 if not src or src.startswith('data:') or len(src) < 10:
                     continue
-                
+
                 src = src.strip()
-                
+
                 # Ensure full URL
                 if src.startswith('//'):
                     src = 'https:' + src
                 elif src.startswith('/'):
                     src = self.BASE_URL.rstrip('/') + src
-                
+
                 # ONLY accept images from cdn.manhuato.com - this prevents grabbing ad images
                 if 'cdn.manhuato.com' not in src.lower():
                     continue
+
+                # Percent-encode spaces/special chars in the CDN path so requests
+                # can actually fetch the URL (spaces in paths cause 400/404 errors)
+                src = self._encode_url(src)
                 
                 if src not in pages:
                     pages.append(src)
