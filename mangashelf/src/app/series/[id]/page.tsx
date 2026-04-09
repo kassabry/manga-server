@@ -384,7 +384,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                       {session?.user && (
                         <button
                           onClick={() => markReadUpTo(group.number)}
-                          className="opacity-0 group-hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
+                          className="opacity-40 hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
                           title={`Mark chapter ${group.number} and all previous as read`}
                         >
                           Mark read up to here
@@ -421,7 +421,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                       {session?.user && (
                         <button
                           onClick={() => markReadUpTo(chapter.number)}
-                          className="opacity-0 group-hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
+                          className="opacity-40 hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
                           title={`Mark chapter ${chapter.number} and all previous as read`}
                         >
                           Mark read up to here
