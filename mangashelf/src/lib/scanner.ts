@@ -443,6 +443,12 @@ async function scanSeries(
     } else {
       coverPath = await extractCover(seriesSlug, seriesDirPath, firstBookPath);
     }
+  } else if (!firstIsEpub) {
+    // Even without new chapters, check if a directory-level cover was added or updated.
+    // Omitting firstCbzPath avoids expensive CBZ extraction; extractCover handles
+    // the mtime comparison so this is a no-op when the cache is already current.
+    const dirCover = await extractCover(seriesSlug, seriesDirPath);
+    if (dirCover) coverPath = dirCover;
   }
 
   // Force-update title if it still has a [Source] prefix (from old scans or ComicInfo metadata)

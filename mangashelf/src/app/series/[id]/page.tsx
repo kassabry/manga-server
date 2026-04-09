@@ -134,6 +134,26 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
     setFollowing(!following);
   }
 
+  async function markReadUpTo(chapterNumber: number) {
+    const res = await fetch(`/api/user/progress/${id}/mark-read`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ upToChapterNumber: chapterNumber }),
+    });
+    if (!res.ok) return;
+
+    // Optimistically update local progress state for all affected chapters
+    setProgress((prev) => {
+      const next = { ...prev };
+      for (const ch of series!.chapters) {
+        if (ch.number <= chapterNumber) {
+          next[ch.id] = { completed: true, page: Math.max(0, ch.pageCount - 1) };
+        }
+      }
+      return next;
+    });
+  }
+
   async function updateListStatus(status: string) {
     if (!status) {
       await fetch(`/api/user/list/${id}`, { method: "DELETE" });
@@ -329,7 +349,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                 return (
                   <div
                     key={group.number}
-                    className={`flex items-center justify-between rounded-lg border border-border px-4 py-3 ${
+                    className={`group flex items-center justify-between rounded-lg border border-border px-4 py-3 ${
                       anyCompleted ? "opacity-60" : ""
                     }`}
                   >
@@ -360,7 +380,16 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                         })}
                       </div>
                     </div>
-                    <div className="flex items-center gap-4 text-xs text-text-secondary shrink-0">
+                    <div className="flex items-center gap-3 text-xs text-text-secondary shrink-0">
+                      {session?.user && (
+                        <button
+                          onClick={() => markReadUpTo(group.number)}
+                          className="opacity-0 group-hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
+                          title={`Mark chapter ${group.number} and all previous as read`}
+                        >
+                          Mark read up to here
+                        </button>
+                      )}
                       <span>{group.pageCount} pages</span>
                       <span>{new Date(group.createdAt).toLocaleDateString()}</span>
                     </div>
@@ -370,27 +399,38 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
             : chapters.map((chapter) => {
                 const prog = progress[chapter.id];
                 return (
-                  <Link
+                  <div
                     key={chapter.id}
-                    href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
-                    className={`flex items-center justify-between rounded-lg border border-border px-4 py-3 hover:border-accent ${
+                    className={`group flex items-center justify-between rounded-lg border border-border px-4 py-3 hover:border-accent ${
                       prog?.completed ? "opacity-60" : ""
                     }`}
                   >
-                    <div className="flex items-center gap-3">
+                    <Link
+                      href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
+                      className="flex flex-1 items-center gap-3 min-w-0"
+                    >
                       {prog?.completed && (
-                        <span className="text-green-500" title="Read">✓</span>
+                        <span className="text-green-500 shrink-0" title="Read">✓</span>
                       )}
-                      <span className="font-medium">Chapter {chapter.number}</span>
+                      <span className="font-medium shrink-0">Chapter {chapter.number}</span>
                       {chapter.title && (
-                        <span className="text-text-secondary">— {chapter.title}</span>
+                        <span className="text-text-secondary truncate">— {chapter.title}</span>
                       )}
-                    </div>
-                    <div className="flex items-center gap-4 text-xs text-text-secondary">
+                    </Link>
+                    <div className="flex items-center gap-3 text-xs text-text-secondary shrink-0">
+                      {session?.user && (
+                        <button
+                          onClick={() => markReadUpTo(chapter.number)}
+                          className="opacity-0 group-hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
+                          title={`Mark chapter ${chapter.number} and all previous as read`}
+                        >
+                          Mark read up to here
+                        </button>
+                      )}
                       <span>{chapter.pageCount} pages</span>
                       <span>{new Date(chapter.createdAt).toLocaleDateString()}</span>
                     </div>
-                  </Link>
+                  </div>
                 );
               })}
         </div>

@@ -393,15 +393,16 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       observers.push(obs);
     }
 
-    if (bottomSentinel && chapter.nextChapter) {
-      const nextId = chapter.nextChapter.id;
+    if (bottomSentinel) {
       const obs = new IntersectionObserver(([entry]) => {
         // Require nav guard AND minimum 500px of scrolling to prevent
         // auto-advance when images haven't loaded yet
         if (entry.isIntersecting && readyForNavRef.current && scrollDistanceRef.current > 500) {
           readyForNavRef.current = false;
           saveProgress(chapter.pages.length - 1, true);
-          router.push(`/read/${nextId}`);
+          if (chapter.nextChapter) {
+            router.push(`/read/${chapter.nextChapter.id}`);
+          }
         }
       }, { threshold: 0.5 });
       obs.observe(bottomSentinel);
@@ -428,8 +429,8 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     const step = settings.layout === "double" || settings.layout === "double-manga" ? 2 : 1;
     const nextPage = currentPage + step;
     if (nextPage >= chapter.pages.length) {
+      saveProgress(currentPage, true);
       if (chapter.nextChapter) {
-        saveProgress(currentPage, true);
         router.push(`/read/${chapter.nextChapter.id}`);
       }
     } else {
