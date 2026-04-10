@@ -134,11 +134,11 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
     setFollowing(!following);
   }
 
-  async function markReadUpTo(chapterNumber: number) {
+  async function markReadUpTo(chapterNumber: number, completed: boolean) {
     const res = await fetch(`/api/user/progress/${id}/mark-read`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ upToChapterNumber: chapterNumber }),
+      body: JSON.stringify({ upToChapterNumber: chapterNumber, completed }),
     });
     if (!res.ok) return;
 
@@ -147,7 +147,9 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       const next = { ...prev };
       for (const ch of series!.chapters) {
         if (ch.number <= chapterNumber) {
-          next[ch.id] = { completed: true, page: Math.max(0, ch.pageCount - 1) };
+          next[ch.id] = completed
+            ? { completed: true, page: Math.max(0, ch.pageCount - 1) }
+            : { completed: false, page: 0 };
         }
       }
       return next;
@@ -356,9 +358,9 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                     <div className="flex items-center gap-3 min-w-0">
                       {session?.user ? (
                         <button
-                          onClick={() => markReadUpTo(group.number)}
-                          className={`shrink-0 transition-colors ${anyCompleted ? "text-green-500" : "text-text-secondary/25 hover:text-green-400"}`}
-                          title={`Mark chapter ${group.number} and all previous as read`}
+                          onClick={() => markReadUpTo(group.number, !anyCompleted)}
+                          className={`shrink-0 transition-colors ${anyCompleted ? "text-green-500 hover:text-red-400" : "text-text-secondary/25 hover:text-green-400"}`}
+                          title={anyCompleted ? `Unmark chapter ${group.number} and all previous` : `Mark chapter ${group.number} and all previous as read`}
                         >
                           {anyCompleted ? (
                             <svg className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
@@ -413,9 +415,9 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                     <div className="flex flex-1 items-center gap-3 min-w-0">
                       {session?.user ? (
                         <button
-                          onClick={() => markReadUpTo(chapter.number)}
-                          className={`shrink-0 transition-colors ${prog?.completed ? "text-green-500" : "text-text-secondary/25 hover:text-green-400"}`}
-                          title={`Mark chapter ${chapter.number} and all previous as read`}
+                          onClick={() => markReadUpTo(chapter.number, !prog?.completed)}
+                          className={`shrink-0 transition-colors ${prog?.completed ? "text-green-500 hover:text-red-400" : "text-text-secondary/25 hover:text-green-400"}`}
+                          title={prog?.completed ? `Unmark chapter ${chapter.number} and all previous` : `Mark chapter ${chapter.number} and all previous as read`}
                         >
                           {prog?.completed ? (
                             <svg className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>

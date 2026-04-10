@@ -13,7 +13,7 @@ export async function POST(
 
   const { seriesId } = await params;
   const body = await request.json();
-  const { upToChapterNumber } = body;
+  const { upToChapterNumber, completed = true } = body;
 
   if (typeof upToChapterNumber !== "number") {
     return NextResponse.json({ error: "Missing upToChapterNumber" }, { status: 400 });
@@ -40,15 +40,15 @@ export async function POST(
           userId_chapterId: { userId: session.user.id, chapterId: ch.id },
         },
         update: {
-          completed: true,
-          page: Math.max(0, ch.pageCount - 1),
+          completed,
+          page: completed ? Math.max(0, ch.pageCount - 1) : 0,
           readAt: new Date(),
         },
         create: {
           userId: session.user.id,
           chapterId: ch.id,
-          completed: true,
-          page: Math.max(0, ch.pageCount - 1),
+          completed,
+          page: completed ? Math.max(0, ch.pageCount - 1) : 0,
         },
       })
     )
