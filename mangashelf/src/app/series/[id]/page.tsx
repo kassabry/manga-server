@@ -349,13 +349,27 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                 return (
                   <div
                     key={group.number}
-                    className={`group flex items-center justify-between rounded-lg border border-border px-4 py-3 ${
+                    className={`flex items-center justify-between rounded-lg border border-border px-4 py-3 ${
                       anyCompleted ? "opacity-60" : ""
                     }`}
                   >
                     <div className="flex items-center gap-3 min-w-0">
-                      {anyCompleted && (
-                        <span className="text-green-500 shrink-0" title="Read">✓</span>
+                      {session?.user ? (
+                        <button
+                          onClick={() => markReadUpTo(group.number)}
+                          className={`shrink-0 transition-colors ${anyCompleted ? "text-green-500" : "text-text-secondary/25 hover:text-green-400"}`}
+                          title={`Mark chapter ${group.number} and all previous as read`}
+                        >
+                          {anyCompleted ? (
+                            <svg className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
+                          ) : (
+                            <svg className="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="10" cy="10" r="7.25" /></svg>
+                          )}
+                        </button>
+                      ) : (
+                        anyCompleted && (
+                          <svg className="h-4 w-4 shrink-0 text-green-500" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
+                        )
                       )}
                       <span className="font-medium shrink-0">Chapter {group.number}</span>
                       {group.title && (
@@ -380,16 +394,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                         })}
                       </div>
                     </div>
-                    <div className="flex items-center gap-3 text-xs text-text-secondary shrink-0">
-                      {session?.user && (
-                        <button
-                          onClick={() => markReadUpTo(group.number)}
-                          className="opacity-40 hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
-                          title={`Mark chapter ${group.number} and all previous as read`}
-                        >
-                          Mark read up to here
-                        </button>
-                      )}
+                    <div className="flex items-center gap-4 text-xs text-text-secondary shrink-0">
                       <span>{group.pageCount} pages</span>
                       <span>{new Date(group.createdAt).toLocaleDateString()}</span>
                     </div>
@@ -401,32 +406,39 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                 return (
                   <div
                     key={chapter.id}
-                    className={`group flex items-center justify-between rounded-lg border border-border px-4 py-3 hover:border-accent ${
+                    className={`flex items-center justify-between rounded-lg border border-border px-4 py-3 hover:border-accent ${
                       prog?.completed ? "opacity-60" : ""
                     }`}
                   >
-                    <Link
-                      href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
-                      className="flex flex-1 items-center gap-3 min-w-0"
-                    >
-                      {prog?.completed && (
-                        <span className="text-green-500 shrink-0" title="Read">✓</span>
-                      )}
-                      <span className="font-medium shrink-0">Chapter {chapter.number}</span>
-                      {chapter.title && (
-                        <span className="text-text-secondary truncate">— {chapter.title}</span>
-                      )}
-                    </Link>
-                    <div className="flex items-center gap-3 text-xs text-text-secondary shrink-0">
-                      {session?.user && (
+                    <div className="flex flex-1 items-center gap-3 min-w-0">
+                      {session?.user ? (
                         <button
                           onClick={() => markReadUpTo(chapter.number)}
-                          className="opacity-40 hover:opacity-100 rounded px-2 py-1 text-[11px] border border-border hover:border-green-600 hover:text-green-400 transition-all"
+                          className={`shrink-0 transition-colors ${prog?.completed ? "text-green-500" : "text-text-secondary/25 hover:text-green-400"}`}
                           title={`Mark chapter ${chapter.number} and all previous as read`}
                         >
-                          Mark read up to here
+                          {prog?.completed ? (
+                            <svg className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
+                          ) : (
+                            <svg className="h-4 w-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="10" cy="10" r="7.25" /></svg>
+                          )}
                         </button>
+                      ) : (
+                        prog?.completed && (
+                          <svg className="h-4 w-4 shrink-0 text-green-500" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clipRule="evenodd" /></svg>
+                        )
                       )}
+                      <Link
+                        href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
+                        className="flex flex-1 items-center gap-3 min-w-0"
+                      >
+                        <span className="font-medium shrink-0">Chapter {chapter.number}</span>
+                        {chapter.title && (
+                          <span className="text-text-secondary truncate">— {chapter.title}</span>
+                        )}
+                      </Link>
+                    </div>
+                    <div className="flex items-center gap-4 text-xs text-text-secondary shrink-0">
                       <span>{chapter.pageCount} pages</span>
                       <span>{new Date(chapter.createdAt).toLocaleDateString()}</span>
                     </div>
