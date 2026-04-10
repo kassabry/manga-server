@@ -526,6 +526,11 @@ async function scanSeries(
       corrections.artist = cleanArtist;
     }
 
+    // Always sync coverPath — must live outside the hasNewChapters gate so that
+    // a cover.jpg added to the folder without new chapters still updates the DB.
+    const effectiveCover = coverPath || series.coverPath;
+    if (effectiveCover !== series.coverPath) corrections.coverPath = effectiveCover;
+
     if (hasNewChapters || needsMetadataRead) {
       // Backfill lastChapterAt for series that existed before this field was added
       if (!series.lastChapterAt) {
@@ -540,10 +545,8 @@ async function scanSeries(
       if (comicInfo?.Summary && !series.description) corrections.description = comicInfo.Summary;
       if (comicInfo?.Genre && !series.genres) corrections.genres = comicInfo.Genre;
 
-      // Only update title/cover if actually changed (avoid unnecessary writes)
+      // Only update title if actually changed (avoid unnecessary writes)
       if (series.title !== seriesTitle) corrections.title = seriesTitle;
-      const effectiveCover = coverPath || series.coverPath;
-      if (effectiveCover !== series.coverPath) corrections.coverPath = effectiveCover;
     }
 
     // Only write to DB if there are actual corrections

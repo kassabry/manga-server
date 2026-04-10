@@ -45,19 +45,17 @@ export async function extractCover(
 
   await ensureDir(COVERS_DIR);
 
-  // Strategy 1: Look for cover.jpg/cover.png in series directory (always preferred)
+  // Strategy 1: Look for cover.jpg/cover.png in series directory (always preferred).
+  // A directory-level cover is always authoritative — always overwrite the cache so
+  // that covers added or replaced after the initial scan are picked up reliably,
+  // regardless of file timestamps (which can be stale when files are transferred).
   const coverExtensions = [".jpg", ".jpeg", ".png", ".webp"];
   for (const ext of coverExtensions) {
     const coverPath = join(seriesDirPath, `cover${ext}`);
     try {
       await access(coverPath);
-      // Check if series cover is newer than cached version
-      const srcMtime = await getMtime(coverPath);
-      const cacheMtime = await getMtime(coverOutputPath);
-      if (srcMtime > cacheMtime || cacheMtime === 0) {
-        const coverData = await readFile(coverPath);
-        await writeFile(coverOutputPath, coverData);
-      }
+      const coverData = await readFile(coverPath);
+      await writeFile(coverOutputPath, coverData);
       return `/api/covers/${seriesSlug}`;
     } catch {
       continue;
