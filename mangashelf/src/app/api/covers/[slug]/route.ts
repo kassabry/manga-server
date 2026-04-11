@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readFile } from "fs/promises";
+import { readFile, stat } from "fs/promises";
 import { join } from "path";
 import { getCoversDir } from "@/lib/covers";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ slug: string }> }
 ) {
   const { slug } = await params;
@@ -18,6 +20,14 @@ export async function GET(
   const coverPath = join(getCoversDir(), `${safeSlug}.dat`);
 
   try {
+    const fileStat = await stat(coverPath);
+    // ETag based on mtime — changes whenever the .dat file is updated by the scanner
+    const etag = `"${fileStat.mtimeMs.toString(16)}"`;
+
+    if (request.headers.get("if-none-match") === etag) {
+      return new NextResponse(null, { status: 304 });
+    }
+
     const data = await readFile(coverPath);
 
     // Detect actual image format from magic bytes
@@ -36,7 +46,11 @@ export async function GET(
     return new NextResponse(new Uint8Array(data), {
       headers: {
         "Content-Type": contentType,
-        "Cache-Control": "public, max-age=86400, stale-while-revalidate=604800",
+        // no-cache: browser must revalidate on every request (sends If-None-Match).
+        // ETag lets the server return 304 Not Modified when unchanged — no bandwidth
+        // wasted, but covers always reflect the latest scan without a 24h delay.
+        "Cache-Control": "no-cache",
+        "ETag": etag,
       },
     });
   } catch {
