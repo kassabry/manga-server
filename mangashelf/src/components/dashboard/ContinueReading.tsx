@@ -27,8 +27,8 @@ export function ContinueReading({ columns = 6 }: { columns?: number }) {
           const res = await fetch(`/api/user/progress/${entry.series.id}`);
           const data = await res.json();
           const latest = data.progress?.sort(
-            (a: { chapter: { number: number } }, b: { chapter: { number: number } }) =>
-              b.chapter.number - a.chapter.number
+            (a: { readAt: string }, b: { readAt: string }) =>
+              new Date(b.readAt).getTime() - new Date(a.readAt).getTime()
           )[0];
 
           if (latest && !latest.completed) {
