@@ -41,6 +41,9 @@ function BrowseContent() {
   const status = searchParams.get("status") || "";
   const publisher = searchParams.get("publisher") || "";
   const sort = searchParams.get("sort") || "title";
+  const minChapters = searchParams.get("minChapters") || "";
+  const maxChapters = searchParams.get("maxChapters") || "";
+  const minRating = searchParams.get("minRating") || "";
 
   // Fetch available filter options once
   useEffect(() => {
@@ -60,6 +63,9 @@ function BrowseContent() {
       if (genre) params.set("genre", genre);
       if (status) params.set("status", status);
       if (publisher) params.set("publisher", publisher);
+      if (minChapters) params.set("minChapters", minChapters);
+      if (maxChapters) params.set("maxChapters", maxChapters);
+      if (minRating) params.set("minRating", minRating);
       params.set("sort", sort);
 
       const res = await fetch(`/api/series?${params}`);
@@ -71,7 +77,7 @@ function BrowseContent() {
     } finally {
       setLoadingMore(false);
     }
-  }, [search, type, genre, status, publisher, sort]);
+  }, [search, type, genre, status, publisher, sort, minChapters, maxChapters, minRating]);
 
   // When filters change (fetchPage gets a new reference), reset and load page 1
   useEffect(() => {
@@ -129,7 +135,7 @@ function BrowseContent() {
   }
 
   const selectedGenres = genre.split(",").map((s) => s.trim()).filter(Boolean);
-  const hasFilters = !!(search || type || genre || status || publisher);
+  const hasFilters = !!(search || type || genre || status || publisher || minChapters || maxChapters || minRating);
 
   return (
     <div className="space-y-6">
@@ -153,7 +159,7 @@ function BrowseContent() {
           Filters
           {hasFilters && (
             <span className="ml-1 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-[10px] text-white">
-              {[search, type, genre, status, publisher].filter(Boolean).length}
+              {[search, type, genre, status, publisher, minChapters, maxChapters, minRating].filter(Boolean).length}
             </span>
           )}
         </button>
@@ -192,6 +198,34 @@ function BrowseContent() {
           {(filterMeta?.publishers || []).map((p) => (
             <option key={p} value={p}>{p}</option>
           ))}
+        </select>
+
+        <select
+          value={minChapters}
+          onChange={(e) => {
+            const val = e.target.value;
+            updateParam("minChapters", val === "custom" ? minChapters : val);
+          }}
+          className="rounded-lg border border-border bg-bg-card px-3 py-2 text-sm focus:border-accent focus:outline-none"
+        >
+          <option value="">Any Chapters</option>
+          <option value="25">25+</option>
+          <option value="50">50+</option>
+          <option value="100">100+</option>
+          <option value="200">200+</option>
+          <option value="500">500+</option>
+        </select>
+
+        <select
+          value={minRating}
+          onChange={(e) => updateParam("minRating", e.target.value)}
+          className="rounded-lg border border-border bg-bg-card px-3 py-2 text-sm focus:border-accent focus:outline-none"
+        >
+          <option value="">Any Rating</option>
+          <option value="6">★ 6.0+</option>
+          <option value="7">★ 7.0+</option>
+          <option value="8">★ 8.0+</option>
+          <option value="9">★ 9.0+</option>
         </select>
 
         <select
@@ -238,6 +272,15 @@ function BrowseContent() {
           )}
           {publisher && (
             <FilterChip label={`Source: ${publisher}`} onRemove={() => updateParam("publisher", "")} />
+          )}
+          {minChapters && (
+            <FilterChip label={`${minChapters}+ chapters`} onRemove={() => updateParam("minChapters", "")} />
+          )}
+          {maxChapters && (
+            <FilterChip label={`≤${maxChapters} chapters`} onRemove={() => updateParam("maxChapters", "")} />
+          )}
+          {minRating && (
+            <FilterChip label={`★ ${minRating}+`} onRemove={() => updateParam("minRating", "")} />
           )}
         </div>
       )}

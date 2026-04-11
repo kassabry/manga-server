@@ -12,6 +12,9 @@ export async function GET(request: NextRequest) {
   const publisher = searchParams.get("publisher") || "";
   const sort = searchParams.get("sort") || "title";
   const excludeType = searchParams.get("excludeType") || "";
+  const minChapters = searchParams.get("minChapters") ? parseInt(searchParams.get("minChapters")!) : null;
+  const maxChapters = searchParams.get("maxChapters") ? parseInt(searchParams.get("maxChapters")!) : null;
+  const minRating = searchParams.get("minRating") ? parseFloat(searchParams.get("minRating")!) : null;
 
   // Build AND conditions array for more complex filtering
   const andConditions: Record<string, unknown>[] = [];
@@ -47,6 +50,15 @@ export async function GET(request: NextRequest) {
   }
   if (excludeType) {
     andConditions.push({ type: { not: excludeType } });
+  }
+  if (minChapters !== null) {
+    andConditions.push({ chapterCount: { gte: minChapters } });
+  }
+  if (maxChapters !== null) {
+    andConditions.push({ chapterCount: { lte: maxChapters } });
+  }
+  if (minRating !== null) {
+    andConditions.push({ rating: { gte: minRating } });
   }
 
   const where = andConditions.length > 0 ? { AND: andConditions } : {};
