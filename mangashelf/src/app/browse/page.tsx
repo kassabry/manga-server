@@ -45,6 +45,16 @@ function BrowseContent() {
   const maxChapters = searchParams.get("maxChapters") || "";
   const minRating = searchParams.get("minRating") || "";
 
+  // Local draft state for free-form inputs — only committed to URL on blur/Enter
+  const [draftMinChapters, setDraftMinChapters] = useState(minChapters);
+  const [draftMaxChapters, setDraftMaxChapters] = useState(maxChapters);
+  const [draftMinRating, setDraftMinRating] = useState(minRating);
+
+  // Keep drafts in sync when URL params change (e.g. Clear All)
+  useEffect(() => { setDraftMinChapters(minChapters); }, [minChapters]);
+  useEffect(() => { setDraftMaxChapters(maxChapters); }, [maxChapters]);
+  useEffect(() => { setDraftMinRating(minRating); }, [minRating]);
+
   // Fetch available filter options once
   useEffect(() => {
     fetch("/api/genres")
@@ -119,6 +129,21 @@ function BrowseContent() {
     router.push(`/browse?${params}`);
   }
 
+  function commitChapters() {
+    const params = new URLSearchParams(searchParams.toString());
+    if (draftMinChapters) params.set("minChapters", draftMinChapters); else params.delete("minChapters");
+    if (draftMaxChapters) params.set("maxChapters", draftMaxChapters); else params.delete("maxChapters");
+    router.push(`/browse?${params}`);
+  }
+
+  function commitRating() {
+    const clamped = draftMinRating
+      ? String(Math.min(5, Math.max(0, parseFloat(draftMinRating) || 0)))
+      : "";
+    setDraftMinRating(clamped);
+    updateParam("minRating", clamped);
+  }
+
   function toggleGenre(g: string) {
     const current = genre.split(",").map((s) => s.trim()).filter(Boolean);
     const idx = current.indexOf(g);
@@ -136,6 +161,7 @@ function BrowseContent() {
 
   const selectedGenres = genre.split(",").map((s) => s.trim()).filter(Boolean);
   const hasFilters = !!(search || type || genre || status || publisher || minChapters || maxChapters || minRating);
+  const activeFilterCount = [search, type, genre, status, publisher, minChapters || maxChapters, minRating].filter(Boolean).length;
 
   return (
     <div className="space-y-6">
@@ -159,7 +185,7 @@ function BrowseContent() {
           Filters
           {hasFilters && (
             <span className="ml-1 flex h-4 w-4 items-center justify-center rounded-full bg-accent text-[10px] text-white">
-              {[search, type, genre, status, publisher, minChapters, maxChapters, minRating].filter(Boolean).length}
+              {activeFilterCount}
             </span>
           )}
         </button>
@@ -198,34 +224,6 @@ function BrowseContent() {
           {(filterMeta?.publishers || []).map((p) => (
             <option key={p} value={p}>{p}</option>
           ))}
-        </select>
-
-        <select
-          value={minChapters}
-          onChange={(e) => {
-            const val = e.target.value;
-            updateParam("minChapters", val === "custom" ? minChapters : val);
-          }}
-          className="rounded-lg border border-border bg-bg-card px-3 py-2 text-sm focus:border-accent focus:outline-none"
-        >
-          <option value="">Any Chapters</option>
-          <option value="25">25+</option>
-          <option value="50">50+</option>
-          <option value="100">100+</option>
-          <option value="200">200+</option>
-          <option value="500">500+</option>
-        </select>
-
-        <select
-          value={minRating}
-          onChange={(e) => updateParam("minRating", e.target.value)}
-          className="rounded-lg border border-border bg-bg-card px-3 py-2 text-sm focus:border-accent focus:outline-none"
-        >
-          <option value="">Any Rating</option>
-          <option value="6">★ 6.0+</option>
-          <option value="7">★ 7.0+</option>
-          <option value="8">★ 8.0+</option>
-          <option value="9">★ 9.0+</option>
         </select>
 
         <select
@@ -273,11 +271,16 @@ function BrowseContent() {
           {publisher && (
             <FilterChip label={`Source: ${publisher}`} onRemove={() => updateParam("publisher", "")} />
           )}
-          {minChapters && (
-            <FilterChip label={`${minChapters}+ chapters`} onRemove={() => updateParam("minChapters", "")} />
-          )}
-          {maxChapters && (
-            <FilterChip label={`≤${maxChapters} chapters`} onRemove={() => updateParam("maxChapters", "")} />
+          {(minChapters || maxChapters) && (
+            <FilterChip
+              label={minChapters && maxChapters ? `${minChapters}–${maxChapters} ch` : minChapters ? `${minChapters}+ ch` : `≤${maxChapters} ch`}
+              onRemove={() => {
+                const params = new URLSearchParams(searchParams.toString());
+                params.delete("minChapters");
+                params.delete("maxChapters");
+                router.push(`/browse?${params}`);
+              }}
+            />
           )}
           {minRating && (
             <FilterChip label={`★ ${minRating}+`} onRemove={() => updateParam("minRating", "")} />
@@ -285,26 +288,80 @@ function BrowseContent() {
         </div>
       )}
 
-      {/* Expanded genre filter panel */}
-      {showFilters && filterMeta && filterMeta.genres.length > 0 && (
-        <div className="rounded-xl border border-border bg-bg-card p-4">
-          <h3 className="mb-3 text-sm font-semibold">Genres</h3>
-          <div className="flex flex-wrap gap-2">
-            {filterMeta.genres.map((g) => (
-              <button
-                key={g.name}
-                onClick={() => toggleGenre(g.name)}
-                className={`rounded-full border px-3 py-1 text-xs transition ${
-                  selectedGenres.includes(g.name)
-                    ? "border-accent bg-accent/20 text-accent"
-                    : "border-border text-text-secondary hover:border-text-secondary hover:text-text-primary"
-                }`}
-              >
-                {g.name}
-                <span className="ml-1 opacity-50">{g.count}</span>
-              </button>
-            ))}
+      {/* Expanded filter panel */}
+      {showFilters && (
+        <div className="space-y-5 rounded-xl border border-border bg-bg-card p-4">
+          {/* Chapter count */}
+          <div>
+            <h3 className="mb-2 text-sm font-semibold">Chapter Count</h3>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="0"
+                placeholder="Min"
+                value={draftMinChapters}
+                onChange={(e) => setDraftMinChapters(e.target.value)}
+                onBlur={commitChapters}
+                onKeyDown={(e) => e.key === "Enter" && commitChapters()}
+                className="w-24 rounded-lg border border-border bg-bg-secondary px-3 py-1.5 text-sm focus:border-accent focus:outline-none"
+              />
+              <span className="text-text-secondary">–</span>
+              <input
+                type="number"
+                min="0"
+                placeholder="Max"
+                value={draftMaxChapters}
+                onChange={(e) => setDraftMaxChapters(e.target.value)}
+                onBlur={commitChapters}
+                onKeyDown={(e) => e.key === "Enter" && commitChapters()}
+                className="w-24 rounded-lg border border-border bg-bg-secondary px-3 py-1.5 text-sm focus:border-accent focus:outline-none"
+              />
+              <span className="text-xs text-text-secondary">chapters</span>
+            </div>
           </div>
+
+          {/* Minimum rating */}
+          <div>
+            <h3 className="mb-2 text-sm font-semibold">Minimum Rating</h3>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min="0"
+                max="5"
+                step="0.5"
+                placeholder="e.g. 3.5"
+                value={draftMinRating}
+                onChange={(e) => setDraftMinRating(e.target.value)}
+                onBlur={commitRating}
+                onKeyDown={(e) => e.key === "Enter" && commitRating()}
+                className="w-24 rounded-lg border border-border bg-bg-secondary px-3 py-1.5 text-sm focus:border-accent focus:outline-none"
+              />
+              <span className="text-xs text-text-secondary">/ 5</span>
+            </div>
+          </div>
+
+          {/* Genres */}
+          {filterMeta && filterMeta.genres.length > 0 && (
+            <div>
+              <h3 className="mb-2 text-sm font-semibold">Genres</h3>
+              <div className="flex flex-wrap gap-2">
+                {filterMeta.genres.map((g) => (
+                  <button
+                    key={g.name}
+                    onClick={() => toggleGenre(g.name)}
+                    className={`rounded-full border px-3 py-1 text-xs transition ${
+                      selectedGenres.includes(g.name)
+                        ? "border-accent bg-accent/20 text-accent"
+                        : "border-border text-text-secondary hover:border-text-secondary hover:text-text-primary"
+                    }`}
+                  >
+                    {g.name}
+                    <span className="ml-1 opacity-50">{g.count}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
