@@ -2642,18 +2642,20 @@ class WebtoonScraper(BaseSiteScraper):
 
                 page += 1
 
-                # Page limit (user-specified or safety cap)
-                if page > (self.max_pages or 200):
-                    logger.warning(f"Reached page limit ({self.max_pages or 200})")
+                # Fixed safety cap only — self.max_pages controls how many
+                # catalog/browse pages to scan for series discovery, NOT how
+                # many chapter-list pages to fetch per series.
+                if page > 200:
+                    logger.warning(f"Reached chapter page safety cap (200) for {series.title}")
                     break
-                    
+
             except Exception as e:
                 logger.error(f"Error fetching chapter list page {page}: {e}")
                 break
-        
+
         # Sort by episode number
         chapters.sort(key=lambda x: int(x.number) if x.number.isdigit() else 0)
-        
+
         logger.info(f"Found {len(chapters)} free chapters for {series.title}")
         return chapters
     
