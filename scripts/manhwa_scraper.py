@@ -1308,7 +1308,7 @@ class BaseSiteScraper:
             series_dir.resolve().relative_to(output_dir.resolve())
         except ValueError:
             logger.error(f"Path traversal detected for title '{series_title}' — skipping")
-            return False
+            return 'fail'
         cbz_name = f"{safe_title} - Chapter {safe_chapter}.cbz"
         cbz_path = series_dir / cbz_name
 
@@ -1323,7 +1323,7 @@ class BaseSiteScraper:
         if tracker.is_downloaded(chapter.url):
             if _exists():
                 logger.debug(f"Skipping (already downloaded): {series_title} Ch.{chapter.number}")
-                return True
+                return 'skip'
             else:
                 # File was deleted — clear from cache so we re-download
                 tracker.downloaded.discard(chapter.url)
@@ -1345,7 +1345,7 @@ class BaseSiteScraper:
         if _exists():
             tracker.mark_downloaded(chapter.url)
             logger.info(f"Already exists: {cbz_name}")
-            return True
+            return 'exists'
 
         logger.info(f"Downloading: {series_title} - Chapter {chapter.number}")
 
@@ -1360,7 +1360,7 @@ class BaseSiteScraper:
                 # in get_pages); other sites treat this as a real error.
                 if self.SITE_NAME != 'drake':
                     logger.error(f"No pages found for chapter {chapter.number}")
-                return False
+                return 'fail'
             
             # Create temp directory for images
             temp_dir = series_dir / f".temp_{safe_chapter}"
@@ -1409,11 +1409,11 @@ class BaseSiteScraper:
                 existing_cbzs.add(cbz_name)
 
             logger.info(f"Created: {cbz_name} ({success_count} pages)")
-            return True
-            
+            return 'new'
+
         except Exception as e:
             logger.error(f"Error downloading chapter: {e}")
-            return False
+            return 'fail'
     
     def _download_image(self, url: str, path: Path, referer: str) -> bool:
         """Download an image file"""
@@ -4428,9 +4428,23 @@ Examples:
                         if result is None:
                             scraper._failed_cover_urls.add(series_for_meta.cover_url)
 
+                counts = {'new': 0, 'exists': 0, 'skip': 0, 'fail': 0}
                 for chapter in chapters:
-                    scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
-                    
+                    status = scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
+                    counts[status if status in counts else 'fail'] += 1
+
+                # Always log a per-series summary so silent skips are visible
+                parts = []
+                if counts['new']:
+                    parts.append(f"{counts['new']} downloaded")
+                if counts['exists']:
+                    parts.append(f"{counts['exists']} found on disk")
+                if counts['skip']:
+                    parts.append(f"{counts['skip']} already up-to-date")
+                if counts['fail']:
+                    parts.append(f"{counts['fail']} failed/paywalled")
+                logger.info(f"  Summary: {', '.join(parts) if parts else 'nothing to do'}")
+
             except Exception as e:
                 logger.error(f"  Error processing {series.title}: {e}")
                 continue
