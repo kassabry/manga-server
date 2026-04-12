@@ -475,6 +475,45 @@ class BaseSiteScraper:
             self.driver = None
     
     @staticmethod
+    def _is_browser_error_page(soup) -> bool:
+        """Detect browser/OS network error pages (Chrome ERR_*, Firefox, etc.)
+        that contain no real content.  These must not overwrite series metadata.
+        """
+        # Chrome error pages have a distinctive div or body class
+        if soup.select_one('#main-frame-error, #error-information-popup-container'):
+            return True
+        body = soup.find('body')
+        if body and 'neterror' in body.get('class', []):
+            return True
+
+        # Fallback: check the page title for well-known browser error strings
+        title_tag = soup.find('title')
+        if title_tag:
+            title_text = title_tag.get_text(strip=True).lower()
+            error_titles = (
+                'your connection was interrupted',
+                'your connection was reset',
+                'your connection is not private',
+                'this site can't be reached',
+                "this site can't be reached",
+                'this page isn't working',
+                "this page isn't working",
+                'server not found',
+                'unable to connect',
+                'the connection was reset',
+                'err_connection_interrupted',
+                'err_connection_refused',
+                'err_connection_reset',
+                'err_connection_timed_out',
+                'err_name_not_resolved',
+                'err_internet_disconnected',
+            )
+            if any(e in title_text for e in error_titles):
+                return True
+
+        return False
+
+    @staticmethod
     def _is_cloudflare_challenge(html: str) -> bool:
         """Detect Cloudflare challenge/block pages that aren't real content."""
         markers = [
@@ -634,7 +673,18 @@ class BaseSiteScraper:
         """Fetch full details for a series: title, status, rating, description, author, artist"""
         try:
             soup = self._get_soup(series.url, use_selenium=True)
-            
+
+            # If we got a browser error page (ERR_CONNECTION_INTERRUPTED, etc.)
+            # instead of real content, bail out immediately — do NOT overwrite
+            # any existing series metadata (especially series.title) with text
+            # from the error page (e.g. "Your connection was interrupted").
+            if self._is_browser_error_page(soup):
+                logger.warning(
+                    f"Browser error page detected for {series.url!r} — "
+                    f"skipping detail fetch, keeping title: {series.title!r}"
+                )
+                return series
+
             # Always prefer the detail page title — it is more authoritative
             # than the listing page title, which may be shortened, use an
             # alternate translation, or come from a generic link attribute.
@@ -3480,6 +3530,16 @@ class DrakeFullScraper(BaseSiteScraper):
     
     def get_chapters(self, series: Series) -> List[Chapter]:
         soup = self._get_soup(series.url, use_selenium=True)
+
+        # Bail out cleanly if the network returned a browser error page
+        # instead of the real series page — returning [] skips downloading
+        # rather than creating fake chapters from error page link text.
+        if self._is_browser_error_page(soup):
+            logger.warning(
+                f"Browser error page for {series.url!r} — "
+                f"returning 0 chapters for {series.title!r}"
+            )
+            return []
 
         chapters = []
         # Prefer specific Madara list containers; fall back to the broad
