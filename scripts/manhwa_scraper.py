@@ -3098,27 +3098,51 @@ class ManhuaToScraper(BaseSiteScraper):
             
             # Find images - ONLY from cdn.manhuato.com (strict filter!)
             for img in soup.select('img'):
-                src = img.get('data-original') or img.get('data-src') or img.get('data-lazy-src') or img.get('src', '')
-                
-                if not src or src.startswith('data:') or len(src) < 10:
+                # Try attributes in priority order; validate each candidate before
+                # accepting it — ManhuaTo CDN URLs for series whose titles contain a
+                # comma are truncated at the comma so the path starts with a space
+                # (e.g. "/ Please Act Like a Final Boss/ch-1/1.jpeg"). After
+                # percent-encoding that becomes "/%20Please..." which is a broken path
+                # that returns 404. When we detect this, skip that attribute and try
+                # the next one.
+                src = None
+                for attr in ('data-original', 'data-src', 'data-lazy-src', 'src'):
+                    candidate = img.get(attr, '')
+                    if not candidate or candidate.startswith('data:') or len(candidate) < 10:
+                        continue
+
+                    candidate = candidate.strip()
+
+                    # Ensure full URL
+                    if candidate.startswith('//'):
+                        candidate = 'https:' + candidate
+                    elif candidate.startswith('/'):
+                        candidate = self.BASE_URL.rstrip('/') + candidate
+
+                    # Only consider CDN images
+                    if 'cdn.manhuato.com' not in candidate.lower():
+                        continue
+
+                    # Percent-encode spaces/special chars in the CDN path
+                    candidate = self._encode_url(candidate)
+
+                    # Detect truncated-at-comma CDN paths: after encoding, the first
+                    # path segment after the host starts with %20 (a space). This
+                    # means the real series directory is missing — skip this attribute
+                    # and try the next one which may have the full URL.
+                    if urlparse(candidate).path.startswith('/%20'):
+                        logger.debug(
+                            f"Skipping truncated CDN URL from {attr!r} "
+                            f"(path starts with space): {candidate}"
+                        )
+                        continue
+
+                    src = candidate
+                    break
+
+                if not src:
                     continue
 
-                src = src.strip()
-
-                # Ensure full URL
-                if src.startswith('//'):
-                    src = 'https:' + src
-                elif src.startswith('/'):
-                    src = self.BASE_URL.rstrip('/') + src
-
-                # ONLY accept images from cdn.manhuato.com - this prevents grabbing ad images
-                if 'cdn.manhuato.com' not in src.lower():
-                    continue
-
-                # Percent-encode spaces/special chars in the CDN path so requests
-                # can actually fetch the URL (spaces in paths cause 400/404 errors)
-                src = self._encode_url(src)
-                
                 if src not in pages:
                     pages.append(src)
             
