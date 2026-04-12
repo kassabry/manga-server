@@ -27,6 +27,9 @@ RUN pip install --no-cache-dir \
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
+# Force Python to flush stdout/stderr immediately so docker logs -f works
+ENV PYTHONUNBUFFERED=1
+
 # Create entrypoint script
 RUN echo '#!/bin/bash\n\
 set -e\n\
@@ -39,7 +42,7 @@ while true; do\n\
     \n\
     if [ -f /app/run_all_scrapers.sh ]; then\n\
         bash /app/run_all_scrapers.sh \\\n\
-            2>&1 | tee -a /app/logs/downloader.log\n\
+            2>&1 | stdbuf -oL tee -a /app/logs/downloader.log\n\
     else\n\
         echo "run_all_scrapers.sh not found"\n\
     fi\n\
