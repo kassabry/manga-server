@@ -124,6 +124,11 @@ du -sh /mnt/manga-storage/manga-server/library/*
 # Check runc version (must be v1.2.5 to avoid ARM64 seccomp crash)
 runc --version
 
+# Truncate the logs file for manhwa-downloader
+sudo truncate -s 0 $(docker inspect --format='{{.LogPath}}' manhwa-downloader)
+
+
+
 ---------------------------------------------------------------
   RUNC FIX (if Docker builds break after apt upgrade)
 ---------------------------------------------------------------

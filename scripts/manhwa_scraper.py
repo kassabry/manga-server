@@ -173,8 +173,12 @@ class ProgressTracker:
         return chapter_url in self.downloaded
     
     def mark_downloaded(self, chapter_url: str):
+        """Add chapter URL to the in-memory downloaded set.
+
+        Does NOT write to disk — callers must invoke save() explicitly
+        (e.g. once per series) to avoid hundreds of individual JSON writes.
+        """
         self.downloaded.add(chapter_url)
-        self.save()
 
 
 class BaseSiteScraper:
@@ -1328,9 +1332,10 @@ class BaseSiteScraper:
                 logger.debug(f"Skipping (already downloaded): {series_title} Ch.{chapter.number}")
                 return 'skip'
             else:
-                # File was deleted — clear from cache so we re-download
+                # File was deleted — clear from cache so we re-download.
+                # The in-memory discard is enough here; tracker.save() will
+                # be called at the end of the series loop.
                 tracker.downloaded.discard(chapter.url)
-                tracker.save()
                 logger.info(f"Re-downloading (file missing): {cbz_name}")
 
         series_dir.mkdir(parents=True, exist_ok=True)
@@ -4462,6 +4467,10 @@ Examples:
                     status = scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
                     counts[status if status in counts else 'fail'] += 1
 
+                # Flush tracker to disk once per series instead of once per chapter.
+                # This turns O(N) disk writes per series into O(1).
+                tracker.save()
+
                 # Always log a per-series summary so silent skips are visible
                 parts = []
                 if counts['new']:
@@ -4515,6 +4524,8 @@ Examples:
                     existing_cbzs = scraper._scan_series_dir(s.title, output_path)
                     for chapter in chapters:
                         scraper.download_chapter(chapter, s.title, output_path, tracker, s, existing_cbzs=existing_cbzs)
+                    # Flush once per series (not once per chapter)
+                    tracker.save()
                 except Exception as e:
                     logger.error(f"Error: {e}")
             
