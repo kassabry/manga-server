@@ -717,11 +717,14 @@ class BaseSiteScraper:
             if not series.cover_url:
                 series.cover_url = self._extract_cover_from_soup(soup)
 
-            # Get chapter count if not set
+            # Get chapter count if not set.  Store the chapters list as a
+            # dynamic attribute so the download_all loop can reuse it without
+            # making a second identical network request.
             if series.chapters_count == 0:
                 try:
                     chapters = self.get_chapters(series)
                     series.chapters_count = len(chapters)
+                    series._chapters_cache = chapters  # consumed once by download_all
                 except Exception:
                     pass
             
@@ -2379,10 +2382,15 @@ class FlameFullScraper(BaseSiteScraper):
 
 class WebtoonScraper(BaseSiteScraper):
     """Full site scraper for webtoons.com (official platform)"""
-    
+
     BASE_URL = "https://www.webtoons.com"
     SITE_NAME = "webtoon"
-    
+
+    # Webtoon is not Cloudflare-protected — use a lighter delay than the
+    # default 2–5 s so chapter-list pagination doesn't dominate runtime.
+    MIN_DELAY = 0.5
+    MAX_DELAY = 1.5
+
     # Webtoon genres for ORIGINALS
     GENRES = [
         'drama', 'fantasy', 'comedy', 'action', 'slice-of-life', 'romance',
@@ -2708,24 +2716,38 @@ class WebtoonScraper(BaseSiteScraper):
         return chapters
     
     def get_pages(self, chapter: Chapter) -> List[str]:
-        """Get image URLs for a chapter"""
-        try:
-            soup = self._get_soup(chapter.url, use_selenium=True)
-            
+        """Get image URLs for a chapter.
+
+        Webtoon embeds image URLs in the static HTML via data-url attributes on
+        <img> tags inside #_imageList.  No JavaScript execution is needed, so a
+        plain HTTP request is ~10× faster than spinning up a Selenium driver.
+        We try requests first and only fall back to Selenium when the fast path
+        returns nothing (e.g. a redirect or age-gate check page).
+        """
+        def _extract(soup) -> list:
             pages = []
-            
-            # Webtoon stores images in the reader container
             for img in soup.select('#_imageList img, .viewer_img img, #content img._images'):
                 src = img.get('data-url') or img.get('data-src') or img.get('src', '')
-                
                 if src and 'webtoon' in src.lower() and 'blank' not in src.lower():
-                    # Clean up URL
                     src = src.split('?')[0] if '?' in src else src
                     if src not in pages:
                         pages.append(src)
-            
             return pages
-            
+
+        # Fast path: plain HTTP request (no Selenium/5 s wait overhead)
+        try:
+            soup = self._get_soup(chapter.url, use_selenium=False)
+            pages = _extract(soup)
+            if pages:
+                return pages
+            logger.debug(f"Requests path returned no images for {chapter.url}, retrying with Selenium")
+        except Exception as e:
+            logger.debug(f"Requests fetch failed for {chapter.url}: {e}")
+
+        # Slow path: Selenium (handles JS redirects / age-gate)
+        try:
+            soup = self._get_soup(chapter.url, use_selenium=True)
+            return _extract(soup)
         except Exception as e:
             logger.error(f"Error getting pages for {chapter.url}: {e}")
             return []
@@ -4397,7 +4419,14 @@ Examples:
                 if not series.cover_url or (series.rating == 0.0 and not series.description):
                     series = scraper.get_series_details(series)
                 
-                chapters = scraper.get_chapters(series)
+                # Reuse chapters pre-fetched inside get_series_details to
+                # avoid making a duplicate network round-trip per series.
+                cached = getattr(series, '_chapters_cache', None)
+                if cached is not None:
+                    chapters = cached
+                    series._chapters_cache = None  # release memory
+                else:
+                    chapters = scraper.get_chapters(series)
                 logger.info(f"  Found {len(chapters)} chapters")
                 
                 # Apply source prefix if requested
