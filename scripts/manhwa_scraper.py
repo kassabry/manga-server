@@ -1382,7 +1382,7 @@ class BaseSiteScraper:
                 img_path = temp_dir / f"{i:03d}{ext}"
                 download_tasks.append((i, page_url, img_path))
 
-            with ThreadPoolExecutor(max_workers=4) as pool:
+            with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = {
                     pool.submit(self._download_image, url, path, chapter.url): page_num
                     for page_num, url, path in download_tasks
