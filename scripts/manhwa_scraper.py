@@ -3991,16 +3991,47 @@ class ManhuaFastScraper(DrakeFullScraper):
                 logger.info(f"FlareSolverr POST failed ({e}) — falling back to session.post")
             # Fall through to plain session.post with cf_clearance cookies
 
-        # ── Plain requests POST path ───────────────────────────────────────────
-        # On ARM: cf_clearance from FlareSolverr is applied to self.session.
-        # On x86: direct requests to the site (no Cloudflare challenge).
-        headers = {
+        # Full browser-like headers — Cloudflare WAF checks Origin and Sec-Fetch-*
+        ua = self.session.headers.get("User-Agent", "Mozilla/5.0")
+        ajax_headers = {
             "Referer": series_url,
+            "Origin": self.BASE_URL,
             "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "User-Agent": ua,
         }
 
-        # Try with nonce first (required by Madara 3.x+), then without
+        # ── Try 1: POST to Madara's frontend chapter endpoint ─────────────────
+        # /manga/{slug}/ajax/chapters/ is a frontend URL and typically NOT
+        # subject to Cloudflare WAF rules that block /wp-admin/ access.
+        frontend_url = series_url.rstrip('/') + '/ajax/chapters/'
+        try:
+            resp = self.session.post(
+                frontend_url,
+                data={"action": "manga_get_chapters"},
+                headers=ajax_headers,
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                resp.encoding = 'utf-8'
+                text = resp.text.strip()
+                if text and text not in ('0', '-1') and 'wp-manga-chapter' in text:
+                    logger.info(f"AJAX chapter fetch succeeded via frontend endpoint ({len(text)} chars)")
+                    return text
+                logger.info(f"Frontend endpoint returned status=200 but invalid body ({text[:60]!r})")
+            else:
+                logger.info(f"Frontend endpoint returned HTTP {resp.status_code}")
+        except Exception as e:
+            logger.info(f"Frontend endpoint failed: {e}")
+
+        # ── Try 2: POST to /wp-admin/admin-ajax.php with full browser headers ──
+        # On ARM: cf_clearance from FlareSolverr is applied to self.session.
+        # On x86: direct requests to the site (no Cloudflare challenge).
         payloads = []
         if nonce:
             payloads.append({"action": "manga_get_chapters", "manga": manga_id, "nonce": nonce})
@@ -4008,14 +4039,14 @@ class ManhuaFastScraper(DrakeFullScraper):
 
         for payload in payloads:
             try:
-                resp = self.session.post(ajax_url, data=payload, headers=headers, timeout=30)
+                resp = self.session.post(ajax_url, data=payload, headers=ajax_headers, timeout=30)
                 resp.raise_for_status()
                 resp.encoding = 'utf-8'
                 text = resp.text.strip()
-                if text and text != '0' and 'wp-manga-chapter' in text:
-                    logger.debug(f"AJAX chapter response: {len(text)} chars")
+                if text and text not in ('0', '-1') and 'wp-manga-chapter' in text:
+                    logger.info(f"AJAX chapter fetch succeeded via session.post ({len(text)} chars)")
                     return text
-                logger.debug(f"AJAX returned empty/invalid response with payload keys {list(payload.keys())}")
+                logger.info(f"session.post AJAX returned invalid body ({text[:60]!r})")
             except Exception as e:
                 logger.warning(f"AJAX chapter fetch failed for {series_url}: {e}")
                 break
