@@ -141,7 +141,7 @@ with patch.object(scraper3, '_flaresolverr_get', side_effect=RuntimeError("Flare
 check("returns [] when FlareSolverr throws", pages6 == [])
 
 # ── Test 7: _get_soup — FlareSolverr failure + None driver → empty BS, no crash
-print("\nTest 7: _get_soup() — FlareSolverr failure with driver=None → empty BS (no crash)")
+print("\nTest 7: _get_soup() -- FlareSolverr failure with driver=None -> empty BS (no crash)")
 
 base = ms.BaseSiteScraper.__new__(ms.BaseSiteScraper)
 base.session = requests.Session()

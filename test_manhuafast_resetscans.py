@@ -169,6 +169,35 @@ AJAX_CHAPTERS_HTML = """
 </ul>
 """
 
+# AJAX response that includes sidebar contamination — URL-path filter must catch it
+AJAX_CHAPTERS_HTML_WITH_SIDEBAR = AJAX_CHAPTERS_HTML + """
+<li class="wp-manga-chapter">
+  <a href="https://manhuafast.com/manga/other-series/chapter-517/">Chapter 517</a>
+</li>
+<li class="wp-manga-chapter">
+  <a href="https://manhuafast.com/manga/other-series/chapter-265/">Chapter 265</a>
+</li>
+"""
+
+# Series page with data-nonce on the holder (Madara 3.x+)
+SERIES_PAGE_MF_WITH_NONCE_HTML = """
+<div id="manga-chapters-holder" data-id="99999" data-nonce="abc123def4">
+  <ul class="main version-chap">
+    <li class="wp-manga-chapter">
+      <a href="https://manhuafast.com/manga/hero-returns/chapter-1/">Chapter 1</a>
+    </li>
+  </ul>
+</div>
+"""
+
+# Series page with nonce in inline script (Madara 3.x variation)
+SERIES_PAGE_MF_WITH_SCRIPT_NONCE_HTML = """
+<div id="manga-chapters-holder" data-id="99999"></div>
+<script>
+var manga_ajax_obj = {"manga_nonce": "ff8a3b921c", "action": "manga_get_chapters"};
+</script>
+"""
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Section 1 — ManhuaFastScraper
@@ -289,6 +318,38 @@ with patch.object(scraper_mf, '_get_soup', return_value=mf_series_soup), \
 check("returns 3 chapters from plain HTML", len(chapters_html) == 3)
 check("chapters have numbers 1, 2, 3",
       {c.number for c in chapters_html} == {"1", "2", "3"})
+
+# ── Test 2d: _extract_ajax_nonce — data-nonce attribute ──────────────────────
+print("\nTest 2d: ManhuaFastScraper._extract_ajax_nonce() — data-nonce attribute")
+
+nonce_soup1 = BeautifulSoup(SERIES_PAGE_MF_WITH_NONCE_HTML, 'html.parser')
+nonce1 = scraper_mf._extract_ajax_nonce(nonce_soup1)
+check("extracts nonce from data-nonce attribute", nonce1 == "abc123def4")
+
+# ── Test 2e: _extract_ajax_nonce — inline script variable ────────────────────
+print("\nTest 2e: ManhuaFastScraper._extract_ajax_nonce() — inline script pattern")
+
+nonce_soup2 = BeautifulSoup(SERIES_PAGE_MF_WITH_SCRIPT_NONCE_HTML, 'html.parser')
+nonce2 = scraper_mf._extract_ajax_nonce(nonce_soup2)
+check("extracts nonce from inline script manga_nonce pattern", nonce2 == "ff8a3b921c")
+
+# ── Test 2f: URL-path filter blocks sidebar in AJAX flat-list ────────────────
+print("\nTest 2f: ManhuaFastScraper.get_chapters() — URL-path filter on AJAX flat-list with sidebar")
+
+with patch.object(scraper_mf, '_get_soup', return_value=series_page_soup), \
+     patch.object(scraper_mf, '_fetch_chapters_ajax',
+                  return_value=AJAX_CHAPTERS_HTML_WITH_SIDEBAR), \
+     patch.object(scraper_mf, '_delay'):
+    chapters_2f = scraper_mf.get_chapters(series_mf)
+
+check("3 hero-returns chapters returned (not 5)", len(chapters_2f) == 3)
+check("chapter 517 from other-series is filtered out (URL-path)",
+      not any(c.number == "517" for c in chapters_2f))
+check("chapter 265 from other-series is filtered out (URL-path)",
+      not any(c.number == "265" for c in chapters_2f))
+check("all returned URLs start with series path",
+      all(c.url.startswith("https://manhuafast.com/manga/hero-returns/")
+          for c in chapters_2f))
 
 # ── Test 3: get_pages (FlareSolverr path) ─────────────────────────────────────
 print("\nTest 3: ManhuaFastScraper.get_pages() — Madara chapter images via FlareSolverr")

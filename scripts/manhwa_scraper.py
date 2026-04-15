@@ -3838,7 +3838,34 @@ class ManhuaFastScraper(DrakeFullScraper):
         logger.info(f"Total series found: {len(all_series)}")
         return all_series
 
-    def _fetch_chapters_ajax(self, series_url: str, soup: BeautifulSoup) -> List[str]:
+    def _extract_ajax_nonce(self, soup: BeautifulSoup) -> str:
+        """Extract the Madara AJAX nonce from the series page.
+
+        Madara 3.x+ requires a nonce in the admin-ajax.php POST body.  It is
+        embedded in the page via one of several patterns depending on the theme
+        version:
+          - data-nonce attribute on #manga-chapters-holder
+          - JavaScript variable  wp_manga_ajax_nonce / manga_ajax_nonce
+          - Inline JSON  {"manga_nonce":"<token>"} in a localized script block
+        """
+        holder = soup.select_one('#manga-chapters-holder[data-nonce]')
+        if holder:
+            return holder.get('data-nonce', '').strip()
+
+        for script in soup.find_all('script'):
+            text = script.get_text()
+            for pat in (
+                r'"manga_nonce"\s*:\s*"([^"]+)"',
+                r'wp_manga_ajax_nonce\s*[=:]\s*["\']([^"\']+)["\']',
+                r'manga_ajax_nonce\s*[=:]\s*["\']([^"\']+)["\']',
+                r'"nonce"\s*:\s*"([a-f0-9]{8,})"',
+            ):
+                m = re.search(pat, text)
+                if m:
+                    return m.group(1).strip()
+        return ''
+
+    def _fetch_chapters_ajax(self, series_url: str, soup: BeautifulSoup) -> str:
         """Fetch the full chapter list via Madara's AJAX endpoint.
 
         ManhuaFast (and most Madara sites) lazy-load the chapter list: the
@@ -3848,6 +3875,7 @@ class ManhuaFastScraper(DrakeFullScraper):
           action=manga_get_chapters&manga=<post_id>
 
         The post ID is stored in  <div id="manga-chapters-holder" data-id="…">.
+        A nonce may also be required (Madara 3.x+).
         Returns the raw HTML of the chapter list on success, or "" on failure.
         """
         holder = soup.select_one('#manga-chapters-holder[data-id]')
@@ -3857,25 +3885,39 @@ class ManhuaFastScraper(DrakeFullScraper):
         manga_id = holder.get('data-id', '').strip()
         if not manga_id:
             return ""
-        try:
-            logger.debug(f"Fetching full chapter list via AJAX (manga_id={manga_id})")
-            resp = self.session.post(
-                f"{self.BASE_URL}/wp-admin/admin-ajax.php",
-                data={"action": "manga_get_chapters", "manga": manga_id},
-                headers={
-                    "Referer": series_url,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            resp.encoding = 'utf-8'
-            logger.debug(f"AJAX chapter response: {len(resp.text)} chars")
-            return resp.text
-        except Exception as e:
-            logger.warning(f"AJAX chapter fetch failed for {series_url}: {e}")
-            return ""
+
+        nonce = self._extract_ajax_nonce(soup)
+        logger.debug(f"Fetching full chapter list via AJAX (manga_id={manga_id}, nonce={'yes' if nonce else 'none'})")
+
+        ajax_url = f"{self.BASE_URL}/wp-admin/admin-ajax.php"
+        headers = {
+            "Referer": series_url,
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+        # Try with nonce first (required by Madara 3.x+), then without
+        payloads = []
+        if nonce:
+            payloads.append({"action": "manga_get_chapters", "manga": manga_id, "cookie": nonce})
+            payloads.append({"action": "manga_get_chapters", "manga": manga_id, "nonce": nonce})
+        payloads.append({"action": "manga_get_chapters", "manga": manga_id})
+
+        for payload in payloads:
+            try:
+                resp = self.session.post(ajax_url, data=payload, headers=headers, timeout=30)
+                resp.raise_for_status()
+                resp.encoding = 'utf-8'
+                text = resp.text.strip()
+                # A valid response contains chapter markup, not just "0" (WP failure code)
+                if text and text != '0' and 'wp-manga-chapter' in text:
+                    logger.debug(f"AJAX chapter response: {len(text)} chars")
+                    return text
+                logger.debug(f"AJAX returned empty/invalid response with payload keys {list(payload.keys())}")
+            except Exception as e:
+                logger.warning(f"AJAX chapter fetch failed for {series_url}: {e}")
+                break  # Network error — no point retrying other payloads
+        return ""
 
     def get_chapters(self, series: Series) -> List[Chapter]:
         """Get the full chapter list for a ManhuaFast series.
@@ -3900,8 +3942,33 @@ class ManhuaFastScraper(DrakeFullScraper):
             )
             return []
 
+        # URL-path filter: only accept chapters whose URL starts with the series
+        # path, e.g. https://manhuafast.com/manga/solo-reincarnation/…
+        # This is the definitive fix for sidebar contamination — sidebar links
+        # point to entirely different series and will never start with series.url.
+        series_path = series.url.rstrip('/').split('?')[0]
+
+        def _parse_chapter_link(href: str, link) -> 'Chapter | None':
+            if not href or '{' in href:
+                return None
+            full_url = href if href.startswith('http') else self.BASE_URL + href
+            if not full_url.startswith(self.BASE_URL):
+                return None
+            # Reject chapters that belong to other series (sidebar widgets)
+            if not full_url.startswith(series_path):
+                return None
+            text = link.get_text(separator=' ', strip=True)
+            m = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+            if not m:
+                m = re.search(r'(\d+(?:\.\d+)?)', text)
+            if not m:
+                return None
+            num = m.group(1)
+            return Chapter(number=num, title=text or f"Chapter {num}", url=full_url)
+
         def _parse_chapter_links(source_soup) -> List[Chapter]:
             found = []
+            seen_urls: set = set()
             # Scope strictly to the chapter list container — never touch sidebar
             for container_sel in (
                 '.listing-chapters_wrap',
@@ -3913,29 +3980,15 @@ class ManhuaFastScraper(DrakeFullScraper):
                     links = container.select('li.wp-manga-chapter a')
                     if links:
                         for link in links:
-                            href = link.get('href', '').strip()
-                            if not href or '{' in href:
-                                continue
-                            full_url = href if href.startswith('http') else self.BASE_URL + href
-                            if not full_url.startswith(self.BASE_URL):
-                                continue
-                            text = link.get_text(separator=' ', strip=True)
-                            m = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
-                            if not m:
-                                m = re.search(r'(\d+(?:\.\d+)?)', text)
-                            if not m:
-                                continue
-                            num = m.group(1)
-                            if not any(c.url == full_url for c in found):
-                                found.append(Chapter(
-                                    number=num,
-                                    title=text or f"Chapter {num}",
-                                    url=full_url,
-                                ))
-                        break  # found a container with chapters — stop searching
+                            ch = _parse_chapter_link(link.get('href', '').strip(), link)
+                            if ch and ch.url not in seen_urls:
+                                seen_urls.add(ch.url)
+                                found.append(ch)
+                        if found:
+                            break  # found a container with chapters — stop searching
             return found
 
-        chapters = []
+        chapters: List[Chapter] = []
 
         # Primary path: AJAX full chapter list
         ajax_html = self._fetch_chapters_ajax(series.url, soup)
@@ -3944,27 +3997,12 @@ class ManhuaFastScraper(DrakeFullScraper):
             chapters = _parse_chapter_links(ajax_soup)
             if not chapters:
                 # AJAX HTML may itself be a flat list without the container wrapper
-                chapters = []
+                seen_urls: set = set()
                 for link in ajax_soup.select('li.wp-manga-chapter a'):
-                    href = link.get('href', '').strip()
-                    if not href or '{' in href:
-                        continue
-                    full_url = href if href.startswith('http') else self.BASE_URL + href
-                    if not full_url.startswith(self.BASE_URL):
-                        continue
-                    text = link.get_text(separator=' ', strip=True)
-                    m = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
-                    if not m:
-                        m = re.search(r'(\d+(?:\.\d+)?)', text)
-                    if not m:
-                        continue
-                    num = m.group(1)
-                    if not any(c.url == full_url for c in chapters):
-                        chapters.append(Chapter(
-                            number=num,
-                            title=text or f"Chapter {num}",
-                            url=full_url,
-                        ))
+                    ch = _parse_chapter_link(link.get('href', '').strip(), link)
+                    if ch and ch.url not in seen_urls:
+                        seen_urls.add(ch.url)
+                        chapters.append(ch)
 
         # Fallback: scoped selectors from the initial page HTML
         if not chapters:
@@ -4032,7 +4070,10 @@ class ResetScansScraper(DrakeFullScraper):
             )
             return []
 
+        # URL-path filter: reject sidebar links that belong to other series
+        series_path = series.url.rstrip('/').split('?')[0]
         chapters = []
+        seen_urls: set = set()
 
         # Primary: standard Madara chapter list
         for link in soup.select('li.wp-manga-chapter a, #chapterlist li a, .eplister li a'):
@@ -4042,6 +4083,8 @@ class ResetScansScraper(DrakeFullScraper):
             full_url = href if href.startswith('http') else self.BASE_URL + href
             if not full_url.startswith(self.BASE_URL):
                 continue
+            if not full_url.startswith(series_path):
+                continue  # Sidebar link for a different series
 
             text = link.get_text(separator=' ', strip=True)
             match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
@@ -4051,7 +4094,8 @@ class ResetScansScraper(DrakeFullScraper):
                 continue
             num = match.group(1)
 
-            if not any(c.url == full_url for c in chapters):
+            if full_url not in seen_urls:
+                seen_urls.add(full_url)
                 chapters.append(Chapter(
                     number=num,
                     title=text or f"Chapter {num}",
