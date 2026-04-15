@@ -3838,16 +3838,58 @@ class ManhuaFastScraper(DrakeFullScraper):
         logger.info(f"Total series found: {len(all_series)}")
         return all_series
 
-    def get_chapters(self, series: Series) -> List[Chapter]:
-        """Get chapters using Madara's li.wp-manga-chapter selector first.
+    def _fetch_chapters_ajax(self, series_url: str, soup: BeautifulSoup) -> List[str]:
+        """Fetch the full chapter list via Madara's AJAX endpoint.
 
-        ManhuaFast uses the standard Madara chapter list markup:
-          <ul class="main version-chap">
-            <li class="wp-manga-chapter">
-              <a href=".../chapter-N/">Chapter N</a>
-            </li>
-          </ul>
-        Falls back to DrakeFullScraper selectors if nothing is found.
+        ManhuaFast (and most Madara sites) lazy-load the chapter list: the
+        initial page HTML only contains the first ~16 chapters; the rest are
+        loaded by JavaScript via:
+          POST /wp-admin/admin-ajax.php
+          action=manga_get_chapters&manga=<post_id>
+
+        The post ID is stored in  <div id="manga-chapters-holder" data-id="…">.
+        Returns the raw HTML of the chapter list on success, or "" on failure.
+        """
+        holder = soup.select_one('#manga-chapters-holder[data-id]')
+        if not holder:
+            logger.debug(f"No #manga-chapters-holder data-id found for {series_url}")
+            return ""
+        manga_id = holder.get('data-id', '').strip()
+        if not manga_id:
+            return ""
+        try:
+            logger.debug(f"Fetching full chapter list via AJAX (manga_id={manga_id})")
+            resp = self.session.post(
+                f"{self.BASE_URL}/wp-admin/admin-ajax.php",
+                data={"action": "manga_get_chapters", "manga": manga_id},
+                headers={
+                    "Referer": series_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            resp.encoding = 'utf-8'
+            logger.debug(f"AJAX chapter response: {len(resp.text)} chars")
+            return resp.text
+        except Exception as e:
+            logger.warning(f"AJAX chapter fetch failed for {series_url}: {e}")
+            return ""
+
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Get the full chapter list for a ManhuaFast series.
+
+        Madara lazy-loads chapters: the initial HTML only contains the first
+        batch (~16).  The complete list requires a POST to admin-ajax.php.
+
+        Strategy:
+        1. Fetch the series page (needed for the #manga-chapters-holder data-id).
+        2. POST to admin-ajax.php to get the full chapter list HTML.
+        3. Scope all selectors to the chapter list container to avoid
+           contamination from sidebar "related series" chapter links.
+        4. Fall back to the initial HTML if AJAX fails.
+        5. Fall back to DrakeFullScraper if still nothing.
         """
         soup = self._get_soup(series.url, use_selenium=True)
 
@@ -3858,34 +3900,83 @@ class ManhuaFastScraper(DrakeFullScraper):
             )
             return []
 
+        def _parse_chapter_links(source_soup) -> List[Chapter]:
+            found = []
+            # Scope strictly to the chapter list container — never touch sidebar
+            for container_sel in (
+                '.listing-chapters_wrap',
+                '#manga-chapters-holder',
+                '.tab-summary',
+            ):
+                container = source_soup.select_one(container_sel)
+                if container:
+                    links = container.select('li.wp-manga-chapter a')
+                    if links:
+                        for link in links:
+                            href = link.get('href', '').strip()
+                            if not href or '{' in href:
+                                continue
+                            full_url = href if href.startswith('http') else self.BASE_URL + href
+                            if not full_url.startswith(self.BASE_URL):
+                                continue
+                            text = link.get_text(separator=' ', strip=True)
+                            m = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+                            if not m:
+                                m = re.search(r'(\d+(?:\.\d+)?)', text)
+                            if not m:
+                                continue
+                            num = m.group(1)
+                            if not any(c.url == full_url for c in found):
+                                found.append(Chapter(
+                                    number=num,
+                                    title=text or f"Chapter {num}",
+                                    url=full_url,
+                                ))
+                        break  # found a container with chapters — stop searching
+            return found
+
         chapters = []
-        for link in soup.select('li.wp-manga-chapter a, #chapterlist li a, .eplister li a'):
-            href = link.get('href', '').strip()
-            if not href or '{' in href:
-                continue
-            full_url = href if href.startswith('http') else self.BASE_URL + href
-            if not full_url.startswith(self.BASE_URL):
-                continue
 
-            text = link.get_text(separator=' ', strip=True)
-            match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
-            if not match:
-                match = re.search(r'(\d+(?:\.\d+)?)', text)
-            if not match:
-                continue
-            num = match.group(1)
+        # Primary path: AJAX full chapter list
+        ajax_html = self._fetch_chapters_ajax(series.url, soup)
+        if ajax_html:
+            ajax_soup = BeautifulSoup(ajax_html, 'html.parser')
+            chapters = _parse_chapter_links(ajax_soup)
+            if not chapters:
+                # AJAX HTML may itself be a flat list without the container wrapper
+                chapters = []
+                for link in ajax_soup.select('li.wp-manga-chapter a'):
+                    href = link.get('href', '').strip()
+                    if not href or '{' in href:
+                        continue
+                    full_url = href if href.startswith('http') else self.BASE_URL + href
+                    if not full_url.startswith(self.BASE_URL):
+                        continue
+                    text = link.get_text(separator=' ', strip=True)
+                    m = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+                    if not m:
+                        m = re.search(r'(\d+(?:\.\d+)?)', text)
+                    if not m:
+                        continue
+                    num = m.group(1)
+                    if not any(c.url == full_url for c in chapters):
+                        chapters.append(Chapter(
+                            number=num,
+                            title=text or f"Chapter {num}",
+                            url=full_url,
+                        ))
 
-            if not any(c.url == full_url for c in chapters):
-                chapters.append(Chapter(
-                    number=num,
-                    title=text or f"Chapter {num}",
-                    url=full_url,
-                ))
+        # Fallback: scoped selectors from the initial page HTML
+        if not chapters:
+            logger.debug("AJAX returned no chapters; falling back to initial HTML")
+            chapters = _parse_chapter_links(soup)
 
         if chapters:
-            chapters.reverse()
+            chapters.sort(key=lambda c: float(c.number) if c.number.replace('.', '', 1).isdigit() else 0)
+            logger.info(f"  Found {len(chapters)} chapters")
             return chapters
 
+        # Last resort: parent DrakeFullScraper (broad a[href*="chapter"] selector)
         return super().get_chapters(series)
 
 

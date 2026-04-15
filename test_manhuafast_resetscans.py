@@ -128,6 +128,47 @@ CHAPTER_HTML = """
 
 CHAPTER_HTML_RESET = CHAPTER_HTML.replace("manhuafast.net", "reset-scans.org")
 
+# ManhuaFast series page: only the FIRST batch of chapters is in the HTML
+# (sidebar has unrelated chapter links that must NOT be picked up).
+# The full list comes from the AJAX endpoint.
+SERIES_PAGE_MF_HTML = """
+<div id="manga-chapters-holder" data-id="99999">
+  <!-- only the latest 3 loaded in HTML; rest fetched via AJAX -->
+  <ul class="main version-chap">
+    <li class="wp-manga-chapter">
+      <a href="https://manhuafast.com/manga/hero-returns/chapter-3/">Chapter 3</a>
+    </li>
+    <li class="wp-manga-chapter">
+      <a href="https://manhuafast.com/manga/hero-returns/chapter-2/">Chapter 2</a>
+    </li>
+  </ul>
+</div>
+<!-- sidebar: MUST NOT be scraped -->
+<div class="sidebar-widget">
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/other-series/chapter-592/">Chapter 592</a>
+  </li>
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/other-series/chapter-264/">Chapter 264</a>
+  </li>
+</div>
+"""
+
+# AJAX response HTML: full flat list (no outer container wrapper)
+AJAX_CHAPTERS_HTML = """
+<ul class="main version-chap no-volumn">
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/hero-returns/chapter-90/">Chapter 90</a>
+  </li>
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/hero-returns/chapter-2/">Chapter 2</a>
+  </li>
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/hero-returns/chapter-1/">Chapter 1</a>
+  </li>
+</ul>
+"""
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Section 1 — ManhuaFastScraper
@@ -194,40 +235,60 @@ check("page 1 URL is /manga/ (no /page/1/)",
 check("page 2 URL uses /manga/page/2/ format (NOT ?page=2)",
       mf_urls_fetched[1] == "https://manhuafast.com/manga/page/2/")
 
-# ── Test 2: get_chapters — li.wp-manga-chapter selector ─────────────────────
-print("\nTest 2: ManhuaFastScraper.get_chapters() — li.wp-manga-chapter selector")
-
 series_mf = ms.Series(
     title="Hero Returns",
     url="https://manhuafast.com/manga/hero-returns/",
     source="manhuafast"
 )
-mf_series_soup = BeautifulSoup(SERIES_HTML_MF, 'html.parser')
 
-with patch.object(scraper_mf, '_get_soup', return_value=mf_series_soup), \
+# ── Test 2: AJAX chapter fetch — full list, no sidebar contamination ──────────
+print("\nTest 2: ManhuaFastScraper.get_chapters() — AJAX full list, sidebar ignored")
+
+series_page_soup = BeautifulSoup(SERIES_PAGE_MF_HTML, 'html.parser')
+
+with patch.object(scraper_mf, '_get_soup', return_value=series_page_soup), \
+     patch.object(scraper_mf, '_fetch_chapters_ajax', return_value=AJAX_CHAPTERS_HTML), \
      patch.object(scraper_mf, '_delay'):
     chapters = scraper_mf.get_chapters(series_mf)
 
-check("returns 3 chapters via li.wp-manga-chapter", len(chapters) == 3)
-check("chapters have numbers 1, 2, 3",
-      {c.number for c in chapters} == {"1", "2", "3"})
-check("chapters are in ascending order (oldest first)",
-      chapters[0].number == "1" and chapters[-1].number == "3")
-check("chapter URLs contain manhuafast.com",
+check("returns 3 chapters (full AJAX list, not the 2 from HTML)", len(chapters) == 3)
+check("chapter 90 is present (full AJAX list)", any(c.number == "90" for c in chapters))
+check("chapter 592 is NOT present (sidebar filtered out)",
+      not any(c.number == "592" for c in chapters))
+check("chapter 264 is NOT present (sidebar filtered out)",
+      not any(c.number == "264" for c in chapters))
+check("chapters are in ascending order",
+      chapters[0].number == "1" and chapters[-1].number == "90")
+check("chapter URLs all contain manhuafast.com",
       all("manhuafast.com" in c.url for c in chapters))
 
-# ── Test 2b: get_chapters — fallback to #chapterlist ─────────────────────────
-print("\nTest 2b: ManhuaFastScraper.get_chapters() — fallback to #chapterlist")
+# ── Test 2b: AJAX fails — fall back to scoped initial HTML (no sidebar) ───────
+print("\nTest 2b: ManhuaFastScraper.get_chapters() — AJAX fails, scoped HTML fallback")
 
-mf_fallback_soup = BeautifulSoup(SERIES_HTML, 'html.parser')
-
-with patch.object(scraper_mf, '_get_soup', return_value=mf_fallback_soup), \
+with patch.object(scraper_mf, '_get_soup', return_value=series_page_soup), \
+     patch.object(scraper_mf, '_fetch_chapters_ajax', return_value=""), \
      patch.object(scraper_mf, '_delay'):
     chapters_fb = scraper_mf.get_chapters(series_mf)
 
-check("fallback returns 3 chapters", len(chapters_fb) == 3)
-check("fallback chapters have numbers 1, 2, 3",
-      {c.number for c in chapters_fb} == {"1", "2", "3"})
+check("fallback finds 2 chapters from scoped HTML", len(chapters_fb) == 2)
+check("chapter 592 still not present (sidebar scoping works even without AJAX)",
+      not any(c.number == "592" for c in chapters_fb))
+check("chapter 264 still not present",
+      not any(c.number == "264" for c in chapters_fb))
+
+# ── Test 2c: get_chapters — li.wp-manga-chapter in initial HTML (no AJAX) ─────
+print("\nTest 2c: ManhuaFastScraper.get_chapters() — li.wp-manga-chapter in HTML")
+
+mf_series_soup = BeautifulSoup(SERIES_HTML_MF, 'html.parser')
+
+with patch.object(scraper_mf, '_get_soup', return_value=mf_series_soup), \
+     patch.object(scraper_mf, '_fetch_chapters_ajax', return_value=""), \
+     patch.object(scraper_mf, '_delay'):
+    chapters_html = scraper_mf.get_chapters(series_mf)
+
+check("returns 3 chapters from plain HTML", len(chapters_html) == 3)
+check("chapters have numbers 1, 2, 3",
+      {c.number for c in chapters_html} == {"1", "2", "3"})
 
 # ── Test 3: get_pages (FlareSolverr path) ─────────────────────────────────────
 print("\nTest 3: ManhuaFastScraper.get_pages() — Madara chapter images via FlareSolverr")
