@@ -3706,13 +3706,23 @@ class DrakeFullScraper(BaseSiteScraper):
         # Skip it entirely and go straight to FlareSolverr (full headless
         # Chromium that executes the JS) on the first attempt.
         if self._use_flaresolverr:
-            try:
-                html, cookies, user_agent = self._flaresolverr_get(chapter.url)
-                self._apply_flaresolverr_cookies(cookies, user_agent)
-                self._fs_cookies_applied = True
-                soup = BeautifulSoup(html, 'html.parser')
-            except Exception as e:
-                logger.warning(f"FlareSolverr failed for {chapter.url}: {e}")
+            last_err = None
+            for attempt in range(3):
+                try:
+                    html, cookies, user_agent = self._flaresolverr_get(chapter.url)
+                    self._apply_flaresolverr_cookies(cookies, user_agent)
+                    self._fs_cookies_applied = True
+                    soup = BeautifulSoup(html, 'html.parser')
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        wait = (attempt + 1) * 10
+                        logger.warning(f"FlareSolverr failed for {chapter.url} (attempt {attempt+1}/3): {e} — retrying in {wait}s")
+                        time.sleep(wait)
+            if last_err:
+                logger.warning(f"FlareSolverr failed for {chapter.url} after 3 attempts: {last_err}")
                 return []
         else:
             # Non-ARM path: use Selenium with undetected-chromedriver
