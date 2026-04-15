@@ -3968,10 +3968,11 @@ class ManhuaFastScraper(DrakeFullScraper):
         ajax_url = f"{self.BASE_URL}/wp-admin/admin-ajax.php"
 
         # ── FlareSolverr POST path (ARM / Cloudflare-protected sites) ─────────
-        # cf_clearance is TLS-session-bound; a plain requests.Session POST is
-        # blocked by Cloudflare's WAF even with the clearance cookie applied.
-        # Routing the POST through FlareSolverr's headless browser keeps us in
-        # the same browser session, satisfying both Cloudflare and WordPress.
+        # Try FlareSolverr's request.post first.  Some FlareSolverr versions
+        # don't support POST (they make a GET instead and WordPress returns "0").
+        # If that happens, fall through to plain session.post — cf_clearance
+        # is already applied to self.session from the series page GET, so the
+        # same IP/UA combination should satisfy Cloudflare.
         if self._use_flaresolverr:
             post_data = f"action=manga_get_chapters&manga={manga_id}"
             if nonce:
@@ -3982,15 +3983,17 @@ class ManhuaFastScraper(DrakeFullScraper):
                     ajax_url, post_data, cookies=raw_cookies
                 )
                 html = html.strip()
-                if html and html != '0' and 'wp-manga-chapter' in html:
-                    logger.info(f"AJAX chapter fetch succeeded via FlareSolverr ({len(html)} chars)")
+                if html and html not in ('0', '-1') and 'wp-manga-chapter' in html:
+                    logger.info(f"AJAX chapter fetch succeeded via FlareSolverr POST ({len(html)} chars)")
                     return html
-                logger.warning(f"FlareSolverr AJAX POST returned unexpected response (len={len(html)}, preview={html[:120]!r})")
+                logger.info(f"FlareSolverr POST returned '{html[:40]}' — falling back to session.post")
             except Exception as e:
-                logger.warning(f"FlareSolverr AJAX POST failed for {series_url}: {e}")
-            return ""
+                logger.info(f"FlareSolverr POST failed ({e}) — falling back to session.post")
+            # Fall through to plain session.post with cf_clearance cookies
 
-        # ── Plain requests POST path (x86, no Cloudflare) ─────────────────────
+        # ── Plain requests POST path ───────────────────────────────────────────
+        # On ARM: cf_clearance from FlareSolverr is applied to self.session.
+        # On x86: direct requests to the site (no Cloudflare challenge).
         headers = {
             "Referer": series_url,
             "X-Requested-With": "XMLHttpRequest",
