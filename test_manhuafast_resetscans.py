@@ -264,6 +264,45 @@ check("page 1 URL is /manga/ (no /page/1/)",
 check("page 2 URL uses /manga/page/2/ format (NOT ?page=2)",
       mf_urls_fetched[1] == "https://manhuafast.com/manga/page/2/")
 
+# ── Test 1b: get_all_series with --sort views ─────────────────────────────────
+print("\nTest 1b: ManhuaFastScraper.get_all_series(order_by='views') — adds ?m_orderby=views")
+
+mf_urls_sorted = []
+
+def mf_get_soup_sorted(url, use_selenium=False):
+    mf_urls_sorted.append(url)
+    if "/page/" in url:
+        return empty_soup
+    return listing_soup
+
+with patch.object(scraper_mf, '_get_soup', side_effect=mf_get_soup_sorted), \
+     patch.object(scraper_mf, '_delay'):
+    series_sorted = scraper_mf.get_all_series(order_by='views')
+
+check("sorted: returns 2 series", len(series_sorted) == 2)
+check("page 1 URL includes ?m_orderby=views",
+      mf_urls_sorted[0] == "https://manhuafast.com/manga/?m_orderby=views")
+check("page 2 URL includes ?m_orderby=views",
+      mf_urls_sorted[1] == "https://manhuafast.com/manga/page/2/?m_orderby=views")
+
+# ── Test 1c: get_all_series with invalid sort key — warns, uses default ────────
+print("\nTest 1c: ManhuaFastScraper.get_all_series(order_by='bogus') — falls back to default")
+
+mf_urls_bogus = []
+
+def mf_get_soup_bogus(url, use_selenium=False):
+    mf_urls_bogus.append(url)
+    if "/page/" in url:
+        return empty_soup
+    return listing_soup
+
+with patch.object(scraper_mf, '_get_soup', side_effect=mf_get_soup_bogus), \
+     patch.object(scraper_mf, '_delay'):
+    scraper_mf.get_all_series(order_by='bogus')
+
+check("bogus sort: page 1 URL has no ?m_orderby= param",
+      '?' not in mf_urls_bogus[0])
+
 series_mf = ms.Series(
     title="Hero Returns",
     url="https://manhuafast.com/manga/hero-returns/",
@@ -515,8 +554,27 @@ check("first series title is 'Hero Returns'", rs_series[0].title == "Hero Return
 check("series URLs point to reset-scans.org",
       all("reset-scans.org" in s.url for s in rs_series))
 check("source is 'resetscans'", all(s.source == "resetscans" for s in rs_series))
-check("scraper stopped after duplicate page (no infinite loop)",
-      call_count[0] == 2)  # page 1 (real) + page 2 (duplicate) → stop
+check("fetches exactly 1 page (no unnecessary pagination for small catalog)",
+      call_count[0] == 1)
+
+# ── Test 5b: get_all_series with --sort views ─────────────────────────────────
+print("\nTest 5b: ResetScansScraper.get_all_series(order_by='views') — adds ?m_orderby=views")
+
+rs_urls_sorted = []
+
+def rs_get_soup_sorted(url, use_selenium=False):
+    rs_urls_sorted.append(url)
+    return rs_listing_soup
+
+with patch.object(scraper_rs, '_get_soup', side_effect=rs_get_soup_sorted), \
+     patch.object(scraper_rs, '_delay'):
+    rs_sorted = scraper_rs.get_all_series(order_by='views')
+
+check("sorted: returns 2 series", len(rs_sorted) == 2)
+check("URL includes ?m_orderby=views",
+      any('?m_orderby=views' in u for u in rs_urls_sorted))
+check("series URLs point to reset-scans.org",
+      all("reset-scans.org" in s.url for s in rs_sorted))
 
 # ── Test 6: get_chapters — li.wp-manga-chapter (standard Madara, no #chapterlist) ─
 print("\nTest 6: ResetScansScraper.get_chapters() — li.wp-manga-chapter selector")

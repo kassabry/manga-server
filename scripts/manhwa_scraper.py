@@ -3789,21 +3789,46 @@ class ManhuaFastScraper(DrakeFullScraper):
         """ManhuaFast og:image is a clean cover — use base class logic (og:image first)."""
         return BaseSiteScraper._extract_cover_from_soup(self, soup)
 
-    def get_all_series(self) -> List[Series]:
+    # Valid Madara sort keys and their human-readable names
+    SORT_KEYS = {
+        'latest':    'latest',
+        'views':     'views',
+        'trending':  'trending',
+        'rating':    'rating',
+        'az':        'alphabet',
+        'alphabet':  'alphabet',
+        'new':       'new-manga',
+        'new-manga': 'new-manga',
+    }
+
+    def get_all_series(self, order_by: str = None) -> List[Series]:
         """Get all series using WordPress /manga/page/N/ pagination.
 
         ManhuaFast (and manhuafast.com) use the WordPress standard pagination
         format /manga/page/N/ rather than the ?page=N query-string format that
         Drake uses.  Using the wrong format returns page 1 on every request,
         so only the first ~18 series would ever be scraped.
+
+        order_by: Madara sort key — one of latest, views, trending, rating,
+                  alphabet/az, new.  Defaults to site default (latest).
         """
-        logger.info("Fetching all series from ManhuaFast...")
+        sort_param = self.SORT_KEYS.get((order_by or '').lower().strip(), '')
+        if order_by and not sort_param:
+            logger.warning(f"Unknown sort key '{order_by}' — using site default. Valid: {', '.join(self.SORT_KEYS)}")
+        if sort_param:
+            logger.info(f"Fetching all series from ManhuaFast (sort={sort_param})...")
+        else:
+            logger.info("Fetching all series from ManhuaFast...")
         all_series = []
         page = 1
 
         while True:
-            url = (f"{self.BASE_URL}/manga/page/{page}/"
-                   if page > 1 else f"{self.BASE_URL}/manga/")
+            if page > 1:
+                url = f"{self.BASE_URL}/manga/page/{page}/"
+            else:
+                url = f"{self.BASE_URL}/manga/"
+            if sort_param:
+                url += f"?m_orderby={sort_param}"
             logger.info(f"Fetching page {page}: {url}")
 
             try:
@@ -4187,9 +4212,82 @@ class ResetScansScraper(DrakeFullScraper):
                 logger.info("Reset Scans: switching to non-headless mode for Cloudflare bypass.")
             self.headless = False
 
+    # Inherit sort keys from ManhuaFastScraper (same Madara theme, same params)
+    SORT_KEYS = ManhuaFastScraper.SORT_KEYS
+
     def _extract_cover_from_soup(self, soup) -> str:
         """Reset Scans og:image is a clean cover — use base class logic (og:image first)."""
         return BaseSiteScraper._extract_cover_from_soup(self, soup)
+
+    def get_all_series(self, order_by: str = None) -> List[Series]:
+        """Get all series from Reset Scans, optionally sorted.
+
+        Reset Scans is a small scanlation group — all series fit on one page.
+        Supports Madara's ?m_orderby= parameter for sorting.
+        order_by: views, trending, rating, latest, alphabet/az, new.
+        """
+        sort_param = self.SORT_KEYS.get((order_by or '').lower().strip(), '')
+        if order_by and not sort_param:
+            logger.warning(f"Unknown sort key '{order_by}' — using site default. Valid: {', '.join(self.SORT_KEYS)}")
+
+        # Temporarily override BASE_URL page-1 fetch to include sort param
+        orig_url = f"{self.BASE_URL}/manga/"
+        sorted_url = f"{orig_url}?m_orderby={sort_param}" if sort_param else orig_url
+
+        if sort_param:
+            logger.info(f"Fetching all series from Reset Scans (sort={sort_param})...")
+        else:
+            logger.info("Fetching all series from Reset Scans...")
+
+        # DrakeFullScraper.get_all_series() always fetches BASE_URL/manga/?page=N.
+        # For Reset Scans the entire catalog is on one page so we just fetch it
+        # directly (with optional sort param) rather than using the paginating loop.
+        soup = self._get_soup(sorted_url)
+        items = (
+            soup.select('div.bs') or
+            soup.select('.listupd .bs') or
+            soup.select('.listupd article') or
+            soup.select('a[href*="/manga/"]:not([href*="chapter"])')
+        )
+
+        all_series = []
+        seen_urls: set = set()
+        for item in items:
+            try:
+                link = item.select_one('a[href*="/manga/"]') if item.name != 'a' else item
+                if not link:
+                    continue
+                href = link.get('href', '').strip()
+                if not href or '/manga/' not in href:
+                    continue
+                title = link.get('title', '')
+                if not title:
+                    title_elem = item.select_one('div.tt, .title')
+                    if title_elem:
+                        title = title_elem.get_text(strip=True)
+                if not title or len(title) < 2:
+                    continue
+                full_url = href if href.startswith('http') else self.BASE_URL + href
+                if full_url in seen_urls:
+                    continue
+                seen_urls.add(full_url)
+                genres = []
+                type_elem = item.select_one('span.type')
+                if type_elem:
+                    genres.append(type_elem.get_text(strip=True))
+                all_series.append(Series(
+                    title=title,
+                    url=full_url,
+                    source=self.SITE_NAME,
+                    genres=genres,
+                ))
+                if self.limit and len(all_series) >= self.limit:
+                    break
+            except Exception:
+                continue
+
+        logger.info(f"Total series found: {len(all_series)}")
+        return all_series
 
     def get_chapters(self, series: Series) -> List[Chapter]:
         """Get chapters using Madara's li.wp-manga-chapter selector first.
@@ -4601,6 +4699,21 @@ Examples:
   
   # Download from a curated YAML list
   python manhwa_scraper.py --config my_series.yaml -o ./library/Manhwa
+
+  # ============================================
+  # SORT ORDER (Madara sites: manhuafast, resetscans)
+  # ============================================
+
+  # Download the top-viewed ManhuaFast series (first 10 pages)
+  python manhwa_scraper.py --site manhuafast --download-all --sort views --pages 10 -o ./library/Manhua
+
+  # List Reset Scans series sorted by most views
+  python manhwa_scraper.py --site resetscans --list-all --sort views -o resetscans.yaml
+
+  # Download trending ManhuaFast series
+  python manhwa_scraper.py --site manhuafast --download-all --sort trending --pages 5 -o ./library/Manhua
+
+  # Valid sort values: latest (default), views, trending, rating, az, new
         """
     )
     
@@ -4624,6 +4737,7 @@ Examples:
     parser.add_argument('--pages', type=int, help='Max browse pages per category (all paginated sites; Flame: max scroll rounds)')
     parser.add_argument('--canvas', action='store_true', help='For Webtoon: scrape CANVAS instead of ORIGINALS')
     parser.add_argument('--source-prefix', action='store_true', help='Prefix series folders with [Source] for multi-source comparison')
+    parser.add_argument('--sort', help='Sort order for Madara sites (manhuafast, resetscans): views, trending, rating, latest, az, new')
     
     args = parser.parse_args()
     
@@ -4793,8 +4907,11 @@ Examples:
         # Single site mode
         scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit, max_pages=getattr(args, 'pages', None))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
+        sort_order = getattr(args, 'sort', None)
         if isinstance(scraper, ManhuaToScraper) and filter_terms:
             series_list = scraper.get_all_series(genre_filter=filter_terms)
+        elif isinstance(scraper, (ManhuaFastScraper, ResetScansScraper)) and sort_order:
+            series_list = scraper.get_all_series(order_by=sort_order)
         else:
             series_list = scraper.get_all_series()
 
@@ -4935,8 +5052,11 @@ Examples:
         # Single site mode
         scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit, max_pages=getattr(args, 'pages', None))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
+        sort_order = getattr(args, 'sort', None)
         if isinstance(scraper, ManhuaToScraper) and filter_terms:
             series_list = scraper.get_all_series(genre_filter=filter_terms)
+        elif isinstance(scraper, (ManhuaFastScraper, ResetScansScraper)) and sort_order:
+            series_list = scraper.get_all_series(order_by=sort_order)
         else:
             series_list = scraper.get_all_series()
 
