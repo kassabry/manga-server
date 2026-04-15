@@ -319,15 +319,40 @@ check("returns 3 chapters from plain HTML", len(chapters_html) == 3)
 check("chapters have numbers 1, 2, 3",
       {c.number for c in chapters_html} == {"1", "2", "3"})
 
-# ── Test 2d: _extract_ajax_nonce — data-nonce attribute ──────────────────────
-print("\nTest 2d: ManhuaFastScraper._extract_ajax_nonce() — data-nonce attribute")
+# ── Test 2d: _fetch_chapters_ajax — FlareSolverr POST path ───────────────────
+print("\nTest 2d: ManhuaFastScraper._fetch_chapters_ajax() — FlareSolverr POST path")
+
+scraper_mf._last_fs_raw_cookies = [{"name": "cf_clearance", "value": "test123", "domain": "manhuafast.com"}]
+
+series_page_nonce_soup = BeautifulSoup(SERIES_PAGE_MF_WITH_NONCE_HTML, 'html.parser')
+
+with patch.object(scraper_mf, '_flaresolverr_post',
+                  return_value=(AJAX_CHAPTERS_HTML, [], "TestUA")) as mock_fspost:
+    ajax_result = scraper_mf._fetch_chapters_ajax(
+        "https://manhuafast.com/manga/hero-returns/", series_page_nonce_soup
+    )
+
+check("FlareSolverr POST called (not plain requests)", mock_fspost.call_count == 1)
+check("POST URL is admin-ajax.php",
+      "admin-ajax.php" in mock_fspost.call_args[0][0])
+post_data_sent = mock_fspost.call_args[0][1]
+check("POST data includes manga_get_chapters action",
+      "manga_get_chapters" in post_data_sent)
+check("POST data includes nonce from data-nonce attribute",
+      "abc123def4" in post_data_sent)
+check("raw cookies passed to FlareSolverr POST",
+      bool(mock_fspost.call_args[1].get('cookies')))
+check("returns AJAX HTML on success", 'wp-manga-chapter' in ajax_result)
+
+# ── Test 2e: _extract_ajax_nonce — data-nonce attribute ──────────────────────
+print("\nTest 2e: ManhuaFastScraper._extract_ajax_nonce() — data-nonce attribute")
 
 nonce_soup1 = BeautifulSoup(SERIES_PAGE_MF_WITH_NONCE_HTML, 'html.parser')
 nonce1 = scraper_mf._extract_ajax_nonce(nonce_soup1)
 check("extracts nonce from data-nonce attribute", nonce1 == "abc123def4")
 
-# ── Test 2e: _extract_ajax_nonce — inline script variable ────────────────────
-print("\nTest 2e: ManhuaFastScraper._extract_ajax_nonce() — inline script pattern")
+# ── Test 2e2: _extract_ajax_nonce — inline script variable ───────────────────
+print("\nTest 2e2: ManhuaFastScraper._extract_ajax_nonce() — inline script pattern")
 
 nonce_soup2 = BeautifulSoup(SERIES_PAGE_MF_WITH_SCRIPT_NONCE_HTML, 'html.parser')
 nonce2 = scraper_mf._extract_ajax_nonce(nonce_soup2)

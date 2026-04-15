@@ -321,8 +321,50 @@ class BaseSiteScraper:
         user_agent = solution.get("userAgent", "")
         return html, cookies, user_agent
 
+    def _flaresolverr_post(self, url: str, post_data: str,
+                           cookies: list = None, max_timeout: int = 60000):
+        """Use FlareSolverr to POST to a URL (e.g. admin-ajax.php).
+
+        Sending the POST through FlareSolverr's headless browser keeps us in
+        the same Cloudflare-cleared browser session, which is required for
+        sites that bind cf_clearance to a TLS fingerprint.  The caller can pass
+        the raw cookie list returned by a prior _flaresolverr_get call so that
+        the same WordPress/Cloudflare session is reused.
+
+        Returns (html, cookies_list, user_agent) or raises on failure.
+        """
+        payload = {
+            "cmd": "request.post",
+            "url": url,
+            "postData": post_data,
+            "maxTimeout": max_timeout,
+        }
+        if cookies:
+            payload["cookies"] = cookies
+        resp = requests.post(
+            f"{self._flaresolverr_url()}/v1",
+            json=payload,
+            timeout=max_timeout // 1000 + 30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("status") != "ok":
+            raise RuntimeError(f"FlareSolverr error: {data.get('message', 'unknown')}")
+
+        solution = data["solution"]
+        html = solution["response"]
+        resp_cookies = solution.get("cookies", [])
+        user_agent = solution.get("userAgent", "")
+        return html, resp_cookies, user_agent
+
     def _apply_flaresolverr_cookies(self, cookies: list, user_agent: str = ""):
-        """Apply cookies from FlareSolverr to the requests session."""
+        """Apply cookies from FlareSolverr to the requests session.
+
+        Also saves the raw cookie list to self._last_fs_raw_cookies so that
+        follow-up FlareSolverr POST requests (e.g. admin-ajax.php) can reuse
+        the same session without needing to re-solve the Cloudflare challenge.
+        """
         applied = 0
         for c in cookies:
             domain = c.get("domain", "").strip()
@@ -337,6 +379,8 @@ class BaseSiteScraper:
             applied += 1
         if user_agent:
             self.session.headers["User-Agent"] = user_agent
+        # Stash raw cookies for follow-up FlareSolverr POST requests
+        self._last_fs_raw_cookies = list(cookies)
         logger.debug(f"Applied {applied}/{len(cookies)} FlareSolverr cookies to session")
 
     def _inject_ad_blocker(self):
@@ -3890,6 +3934,31 @@ class ManhuaFastScraper(DrakeFullScraper):
         logger.debug(f"Fetching full chapter list via AJAX (manga_id={manga_id}, nonce={'yes' if nonce else 'none'})")
 
         ajax_url = f"{self.BASE_URL}/wp-admin/admin-ajax.php"
+
+        # ── FlareSolverr POST path (ARM / Cloudflare-protected sites) ─────────
+        # cf_clearance is TLS-session-bound; a plain requests.Session POST is
+        # blocked by Cloudflare's WAF even with the clearance cookie applied.
+        # Routing the POST through FlareSolverr's headless browser keeps us in
+        # the same browser session, satisfying both Cloudflare and WordPress.
+        if self._use_flaresolverr:
+            post_data = f"action=manga_get_chapters&manga={manga_id}"
+            if nonce:
+                post_data += f"&nonce={nonce}"
+            raw_cookies = getattr(self, '_last_fs_raw_cookies', [])
+            try:
+                html, _, _ = self._flaresolverr_post(
+                    ajax_url, post_data, cookies=raw_cookies
+                )
+                html = html.strip()
+                if html and html != '0' and 'wp-manga-chapter' in html:
+                    logger.debug(f"FlareSolverr AJAX chapter response: {len(html)} chars")
+                    return html
+                logger.debug(f"FlareSolverr POST returned invalid AJAX response (len={len(html)})")
+            except Exception as e:
+                logger.warning(f"FlareSolverr AJAX POST failed for {series_url}: {e}")
+            return ""
+
+        # ── Plain requests POST path (x86, no Cloudflare) ─────────────────────
         headers = {
             "Referer": series_url,
             "X-Requested-With": "XMLHttpRequest",
@@ -3899,7 +3968,6 @@ class ManhuaFastScraper(DrakeFullScraper):
         # Try with nonce first (required by Madara 3.x+), then without
         payloads = []
         if nonce:
-            payloads.append({"action": "manga_get_chapters", "manga": manga_id, "cookie": nonce})
             payloads.append({"action": "manga_get_chapters", "manga": manga_id, "nonce": nonce})
         payloads.append({"action": "manga_get_chapters", "manga": manga_id})
 
@@ -3909,14 +3977,13 @@ class ManhuaFastScraper(DrakeFullScraper):
                 resp.raise_for_status()
                 resp.encoding = 'utf-8'
                 text = resp.text.strip()
-                # A valid response contains chapter markup, not just "0" (WP failure code)
                 if text and text != '0' and 'wp-manga-chapter' in text:
                     logger.debug(f"AJAX chapter response: {len(text)} chars")
                     return text
                 logger.debug(f"AJAX returned empty/invalid response with payload keys {list(payload.keys())}")
             except Exception as e:
                 logger.warning(f"AJAX chapter fetch failed for {series_url}: {e}")
-                break  # Network error — no point retrying other payloads
+                break
         return ""
 
     def get_chapters(self, series: Series) -> List[Chapter]:
