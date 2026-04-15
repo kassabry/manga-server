@@ -13,6 +13,8 @@ Supports:
 - asuracomic.net
 - flamecomics.xyz
 - drakecomic.org
+- manhuafast.net
+- reset-scans.org
 
 Usage:
     # List all series from a site (creates series list file)
@@ -1187,6 +1189,8 @@ class BaseSiteScraper:
                 'drake': 'Drake Comics',
                 'manhuato': 'ManhuaTo',
                 'webtoon': 'Webtoon',
+                'manhuafast': 'ManhuaFast',
+                'resetscans': 'Reset Scans',
             }
             publisher = source_publishers.get(series.source, series.source.title())
             xml_parts.append(f'  <Publisher>{escape_xml(publisher)}</Publisher>')
@@ -3699,6 +3703,118 @@ class DrakeFullScraper(BaseSiteScraper):
             return False
 
 
+class ManhuaFastScraper(DrakeFullScraper):
+    """Full site scraper for manhuafast.net (Madara/WP-manga theme).
+
+    Structurally identical to DrakeFullScraper — same Madara theme, same
+    page-break image layout, same chapter list container.  Only the base URL
+    and site name differ.  og:image on ManhuaFast is a clean series cover
+    (unlike Drake where it is a branded site banner), so we use the base class
+    cover extractor which tries og:image first.
+    """
+
+    BASE_URL = "https://manhuafast.net"
+    SITE_NAME = "manhuafast"
+    CLOUDFLARE_SITE = True
+
+    def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None):
+        BaseSiteScraper.__init__(self, headless=headless, limit=limit, max_pages=max_pages)
+        if not self._is_arm() and not self._use_flaresolverr:
+            if headless:
+                logger.info("ManhuaFast: switching to non-headless mode for Cloudflare bypass.")
+            self.headless = False
+
+    def _extract_cover_from_soup(self, soup) -> str:
+        """ManhuaFast og:image is a clean cover — use base class logic (og:image first)."""
+        return BaseSiteScraper._extract_cover_from_soup(self, soup)
+
+
+class ResetScansScraper(DrakeFullScraper):
+    """Full site scraper for reset-scans.org (Madara/WP-manga theme).
+
+    Reset Scans is a small scanlation group with a compact catalog (typically
+    < 30 series).  All series are listed on a single /manga/ page — there is
+    no URL-based pagination (?page=2, /page/2/ etc.).  The inherited
+    get_all_series() handles this naturally: it scrapes /manga/ on the first
+    pass, then on the second pass finds no new series (found_count == 0) and
+    stops.
+
+    Chapter list note: Tachiyomi's Madara class targets li.wp-manga-chapter
+    elements.  This scraper adds that as the primary selector before the broader
+    a[href*="chapter"] fallback used by DrakeFullScraper.
+    """
+
+    BASE_URL = "https://reset-scans.org"
+    SITE_NAME = "resetscans"
+    CLOUDFLARE_SITE = True
+
+    def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None):
+        BaseSiteScraper.__init__(self, headless=headless, limit=limit, max_pages=max_pages)
+        if not self._is_arm() and not self._use_flaresolverr:
+            if headless:
+                logger.info("Reset Scans: switching to non-headless mode for Cloudflare bypass.")
+            self.headless = False
+
+    def _extract_cover_from_soup(self, soup) -> str:
+        """Reset Scans og:image is a clean cover — use base class logic (og:image first)."""
+        return BaseSiteScraper._extract_cover_from_soup(self, soup)
+
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Get chapters using Madara's li.wp-manga-chapter selector first.
+
+        Reset Scans uses the standard Madara chapter list markup:
+          <ul class="main version-chap">
+            <li class="wp-manga-chapter">
+              <a href=".../chapter-01/">Chapter 1</a>
+            </li>
+          </ul>
+        The inherited DrakeFullScraper.get_chapters() tries #chapterlist first
+        which may not be present.  We try li.wp-manga-chapter directly, then
+        fall back to the parent implementation if nothing is found.
+        """
+        soup = self._get_soup(series.url, use_selenium=True)
+
+        if self._is_browser_error_page(soup):
+            logger.warning(
+                f"Browser error page for {series.url!r} — "
+                f"returning 0 chapters for {series.title!r}"
+            )
+            return []
+
+        chapters = []
+
+        # Primary: standard Madara chapter list
+        for link in soup.select('li.wp-manga-chapter a, #chapterlist li a, .eplister li a'):
+            href = link.get('href', '').strip()
+            if not href or '{' in href:
+                continue
+            full_url = href if href.startswith('http') else self.BASE_URL + href
+            if not full_url.startswith(self.BASE_URL):
+                continue
+
+            text = link.get_text(separator=' ', strip=True)
+            match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+            if not match:
+                match = re.search(r'(\d+(?:\.\d+)?)', text)
+            if not match:
+                continue
+            num = match.group(1)
+
+            if not any(c.url == full_url for c in chapters):
+                chapters.append(Chapter(
+                    number=num,
+                    title=text or f"Chapter {num}",
+                    url=full_url
+                ))
+
+        if chapters:
+            chapters.reverse()
+            return chapters
+
+        # Fallback: let parent implementation try its broader selectors
+        return super().get_chapters(series)
+
+
 # Site registry
 SCRAPERS = {
     'asura': AsuraFullScraper,
@@ -3715,6 +3831,11 @@ SCRAPERS = {
     'webtoon': WebtoonScraper,
     'webtoons': WebtoonScraper,
     'webtoons.com': WebtoonScraper,
+    'manhuafast': ManhuaFastScraper,
+    'manhuafast.net': ManhuaFastScraper,
+    'resetscans': ResetScansScraper,
+    'reset-scans': ResetScansScraper,
+    'reset-scans.org': ResetScansScraper,
 }
 
 # Primary sites (canonical names only, no aliases) - used for --site all
@@ -3724,6 +3845,8 @@ PRIMARY_SITES = {
     'flame': FlameFullScraper,
     'manhuato': ManhuaToScraper,
     'webtoon': WebtoonScraper,
+    'manhuafast': ManhuaFastScraper,
+    'resetscans': ResetScansScraper,
 }
 
 
