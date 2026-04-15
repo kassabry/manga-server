@@ -3909,6 +3909,41 @@ class ManhuaFastScraper(DrakeFullScraper):
                     return m.group(1).strip()
         return ''
 
+    def _extract_manga_id(self, soup: BeautifulSoup) -> str:
+        """Extract the WordPress post ID for the Madara AJAX chapter endpoint.
+
+        Different Madara versions store this differently:
+          - data-id on #manga-chapters-holder  (most common)
+          - data-postid on the wrapper div
+          - inline JavaScript variable
+        """
+        # Primary: data-id on the chapters holder div
+        holder = soup.select_one('#manga-chapters-holder')
+        if holder:
+            manga_id = holder.get('data-id', '').strip()
+            if manga_id and manga_id.isdigit():
+                return manga_id
+
+        # Fallback: data-postid on any element
+        for el in soup.select('[data-postid]'):
+            val = el.get('data-postid', '').strip()
+            if val and val.isdigit():
+                return val
+
+        # Fallback: inline JavaScript variable
+        for script in soup.find_all('script'):
+            text = script.get_text()
+            for pat in (
+                r'["\']?manga["\']?\s*:\s*["\']?(\d+)["\']?',
+                r'manga[_-]id["\']?\s*[=:]\s*["\']?(\d+)',
+                r'var\s+post_id\s*=\s*(\d+)',
+                r'"postid"\s*:\s*(\d+)',
+            ):
+                m = re.search(pat, text, re.I)
+                if m:
+                    return m.group(1)
+        return ''
+
     def _fetch_chapters_ajax(self, series_url: str, soup: BeautifulSoup) -> str:
         """Fetch the full chapter list via Madara's AJAX endpoint.
 
@@ -3922,16 +3957,13 @@ class ManhuaFastScraper(DrakeFullScraper):
         A nonce may also be required (Madara 3.x+).
         Returns the raw HTML of the chapter list on success, or "" on failure.
         """
-        holder = soup.select_one('#manga-chapters-holder[data-id]')
-        if not holder:
-            logger.debug(f"No #manga-chapters-holder data-id found for {series_url}")
-            return ""
-        manga_id = holder.get('data-id', '').strip()
+        manga_id = self._extract_manga_id(soup)
         if not manga_id:
+            logger.info(f"Could not extract manga ID for AJAX from {series_url} — skipping AJAX fetch")
             return ""
 
         nonce = self._extract_ajax_nonce(soup)
-        logger.debug(f"Fetching full chapter list via AJAX (manga_id={manga_id}, nonce={'yes' if nonce else 'none'})")
+        logger.info(f"AJAX chapter fetch: manga_id={manga_id}, nonce={'found' if nonce else 'none'}, via={'FlareSolverr' if self._use_flaresolverr else 'requests'}")
 
         ajax_url = f"{self.BASE_URL}/wp-admin/admin-ajax.php"
 
@@ -3951,9 +3983,9 @@ class ManhuaFastScraper(DrakeFullScraper):
                 )
                 html = html.strip()
                 if html and html != '0' and 'wp-manga-chapter' in html:
-                    logger.debug(f"FlareSolverr AJAX chapter response: {len(html)} chars")
+                    logger.info(f"AJAX chapter fetch succeeded via FlareSolverr ({len(html)} chars)")
                     return html
-                logger.debug(f"FlareSolverr POST returned invalid AJAX response (len={len(html)})")
+                logger.warning(f"FlareSolverr AJAX POST returned unexpected response (len={len(html)}, preview={html[:120]!r})")
             except Exception as e:
                 logger.warning(f"FlareSolverr AJAX POST failed for {series_url}: {e}")
             return ""
