@@ -3706,14 +3706,21 @@ class DrakeFullScraper(BaseSiteScraper):
 class ManhuaFastScraper(DrakeFullScraper):
     """Full site scraper for manhuafast.net (Madara/WP-manga theme).
 
-    Structurally identical to DrakeFullScraper — same Madara theme, same
-    page-break image layout, same chapter list container.  Only the base URL
-    and site name differ.  og:image on ManhuaFast is a clean series cover
-    (unlike Drake where it is a branded site banner), so we use the base class
-    cover extractor which tries og:image first.
+    ManhuaFast uses the standard Madara WordPress theme with WordPress-style
+    pagination: /manga/page/N/ (NOT ?page=N which Drake uses).  The catalog
+    is large (~64 pages), so proper multi-page scraping is required.
+
+    Chapter list uses li.wp-manga-chapter (confirmed via Tachiyomi/Madara
+    default) before falling back to the broader Drake selectors.
+
+    og:image on ManhuaFast is a clean series cover (unlike Drake where it is
+    a branded site banner), so we use the base class cover extractor which
+    tries og:image first.
     """
 
-    BASE_URL = "https://manhuafast.net"
+    # .com and .net are the same site; .com is the canonical domain used by
+    # Tachiyomi and has the full catalog (~152 pages vs ~64 on .net).
+    BASE_URL = "https://manhuafast.com"
     SITE_NAME = "manhuafast"
     CLOUDFLARE_SITE = True
 
@@ -3727,6 +3734,159 @@ class ManhuaFastScraper(DrakeFullScraper):
     def _extract_cover_from_soup(self, soup) -> str:
         """ManhuaFast og:image is a clean cover — use base class logic (og:image first)."""
         return BaseSiteScraper._extract_cover_from_soup(self, soup)
+
+    def get_all_series(self) -> List[Series]:
+        """Get all series using WordPress /manga/page/N/ pagination.
+
+        ManhuaFast (and manhuafast.com) use the WordPress standard pagination
+        format /manga/page/N/ rather than the ?page=N query-string format that
+        Drake uses.  Using the wrong format returns page 1 on every request,
+        so only the first ~18 series would ever be scraped.
+        """
+        logger.info("Fetching all series from ManhuaFast...")
+        all_series = []
+        page = 1
+
+        while True:
+            url = (f"{self.BASE_URL}/manga/page/{page}/"
+                   if page > 1 else f"{self.BASE_URL}/manga/")
+            logger.info(f"Fetching page {page}: {url}")
+
+            try:
+                soup = self._get_soup(url)
+
+                items = (
+                    soup.select('div.bs') or
+                    soup.select('div.bsx') or
+                    soup.select('.listupd .bs') or
+                    soup.select('.listupd article') or
+                    soup.select('article.item') or
+                    soup.select('a[href*="/manga/"]:not([href*="chapter"])')
+                )
+
+                if not items:
+                    logger.debug(f"Page title: {soup.title.string if soup.title else 'none'}")
+                    logger.debug(f"Body classes: {soup.body.get('class', []) if soup.body else []}")
+                    break
+
+                found_count = 0
+                for item in items:
+                    try:
+                        link = item.select_one('a[href*="/manga/"]') if item.name != 'a' else item
+                        if not link:
+                            continue
+                        href = link.get('href', '').strip()
+                        if not href or '/manga/' not in href:
+                            continue
+
+                        title = link.get('title', '')
+                        if not title:
+                            title_elem = item.select_one('div.tt, .title')
+                            if title_elem:
+                                title = title_elem.get_text(strip=True)
+                        if not title or len(title) < 2:
+                            continue
+
+                        full_url = href if href.startswith('http') else self.BASE_URL + href
+
+                        genres = []
+                        type_elem = item.select_one('span.type')
+                        if type_elem:
+                            genres.append(type_elem.get_text(strip=True))
+
+                        rating = 0.0
+                        rating_elem = item.select_one('div.rating')
+                        if rating_elem:
+                            m = re.search(r'(\d+\.?\d*)', rating_elem.get_text(strip=True))
+                            if m:
+                                rating = float(m.group(1))
+                                if rating > 5:
+                                    rating /= 2
+
+                        if not any(s.url == full_url for s in all_series):
+                            all_series.append(Series(
+                                title=title,
+                                url=full_url,
+                                source=self.SITE_NAME,
+                                genres=genres,
+                                rating=round(rating, 2),
+                            ))
+                            found_count += 1
+                            if self.limit and len(all_series) >= self.limit:
+                                break
+                    except Exception as e:
+                        logger.debug(f"Error parsing item: {e}")
+
+                if self.limit and len(all_series) >= self.limit:
+                    break
+
+                logger.info(f"Found {found_count} series on page {page}")
+                if found_count == 0:
+                    break
+
+                page += 1
+                if page > (self.max_pages or 200):
+                    logger.warning(f"Reached page limit ({self.max_pages or 200})")
+                    break
+
+                time.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Error on page {page}: {e}")
+                break
+
+        logger.info(f"Total series found: {len(all_series)}")
+        return all_series
+
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Get chapters using Madara's li.wp-manga-chapter selector first.
+
+        ManhuaFast uses the standard Madara chapter list markup:
+          <ul class="main version-chap">
+            <li class="wp-manga-chapter">
+              <a href=".../chapter-N/">Chapter N</a>
+            </li>
+          </ul>
+        Falls back to DrakeFullScraper selectors if nothing is found.
+        """
+        soup = self._get_soup(series.url, use_selenium=True)
+
+        if self._is_browser_error_page(soup):
+            logger.warning(
+                f"Browser error page for {series.url!r} — "
+                f"returning 0 chapters for {series.title!r}"
+            )
+            return []
+
+        chapters = []
+        for link in soup.select('li.wp-manga-chapter a, #chapterlist li a, .eplister li a'):
+            href = link.get('href', '').strip()
+            if not href or '{' in href:
+                continue
+            full_url = href if href.startswith('http') else self.BASE_URL + href
+            if not full_url.startswith(self.BASE_URL):
+                continue
+
+            text = link.get_text(separator=' ', strip=True)
+            match = re.search(r'chapter[- ]?(\d+(?:\.\d+)?)', href, re.I)
+            if not match:
+                match = re.search(r'(\d+(?:\.\d+)?)', text)
+            if not match:
+                continue
+            num = match.group(1)
+
+            if not any(c.url == full_url for c in chapters):
+                chapters.append(Chapter(
+                    number=num,
+                    title=text or f"Chapter {num}",
+                    url=full_url,
+                ))
+
+        if chapters:
+            chapters.reverse()
+            return chapters
+
+        return super().get_chapters(series)
 
 
 class ResetScansScraper(DrakeFullScraper):
@@ -3832,6 +3992,7 @@ SCRAPERS = {
     'webtoons': WebtoonScraper,
     'webtoons.com': WebtoonScraper,
     'manhuafast': ManhuaFastScraper,
+    'manhuafast.com': ManhuaFastScraper,
     'manhuafast.net': ManhuaFastScraper,
     'resetscans': ResetScansScraper,
     'reset-scans': ResetScansScraper,

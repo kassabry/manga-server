@@ -144,47 +144,90 @@ scraper_mf.headless = True
 scraper_mf.driver = None
 scraper_mf.limit = None
 scraper_mf.max_pages = None
-scraper_mf.BASE_URL = ms.ManhuaFastScraper.BASE_URL
+scraper_mf.BASE_URL = ms.ManhuaFastScraper.BASE_URL  # https://manhuafast.com
 scraper_mf.SITE_NAME = ms.ManhuaFastScraper.SITE_NAME
 
-# ── Test 1: get_all_series ────────────────────────────────────────────────────
-print("\nTest 1: ManhuaFastScraper.get_all_series() — parses Madara listing HTML")
+# ── ManhuaFast fixtures ───────────────────────────────────────────────────────
+
+# ManhuaFast uses li.wp-manga-chapter (standard Madara, confirmed by Tachiyomi extension)
+SERIES_HTML_MF = """
+<ul class="main version-chap no-volumn">
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/hero-returns/chapter-3/">Chapter 3</a>
+  </li>
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/hero-returns/chapter-2/">Chapter 2</a>
+  </li>
+  <li class="wp-manga-chapter">
+    <a href="https://manhuafast.com/manga/hero-returns/chapter-1/">Chapter 1</a>
+  </li>
+</ul>
+"""
+
+# ── Test 1: get_all_series — /manga/page/N/ pagination ───────────────────────
+print("\nTest 1: ManhuaFastScraper.get_all_series() — /manga/page/N/ pagination")
 
 listing_soup = BeautifulSoup(LISTING_HTML, 'html.parser')
+empty_soup = BeautifulSoup("<html></html>", 'html.parser')
 
-with patch.object(scraper_mf, '_get_soup', return_value=listing_soup) as mock_soup, \
+mf_urls_fetched = []
+
+def mf_get_soup_side(url, use_selenium=False):
+    mf_urls_fetched.append(url)
+    # page 1 = real content, page 2 = empty
+    if "/page/" in url:
+        return empty_soup
+    return listing_soup
+
+with patch.object(scraper_mf, '_get_soup', side_effect=mf_get_soup_side), \
      patch.object(scraper_mf, '_delay'):
-    # Page 1 returns 2 series; page 2 returns nothing → stop
-    empty_soup = BeautifulSoup("<html></html>", 'html.parser')
-    mock_soup.side_effect = [listing_soup, empty_soup]
     series_list = scraper_mf.get_all_series()
 
 check("returns 2 series", len(series_list) == 2)
 check("first series title is 'Hero Returns'", series_list[0].title == "Hero Returns")
 check("second series title is 'Villain Academy'", series_list[1].title == "Villain Academy")
-check("series URLs point to manhuafast.net",
-      all("manhuafast.net" in s.url for s in series_list))
+check("series URLs point to manhuafast.com",
+      all("manhuafast.com" in s.url for s in series_list))
 check("source is 'manhuafast'", all(s.source == "manhuafast" for s in series_list))
+check("page 1 URL is /manga/ (no /page/1/)",
+      mf_urls_fetched[0] == "https://manhuafast.com/manga/")
+check("page 2 URL uses /manga/page/2/ format (NOT ?page=2)",
+      mf_urls_fetched[1] == "https://manhuafast.com/manga/page/2/")
 
-# ── Test 2: get_chapters ─────────────────────────────────────────────────────
-print("\nTest 2: ManhuaFastScraper.get_chapters() — Madara chapter list")
+# ── Test 2: get_chapters — li.wp-manga-chapter selector ─────────────────────
+print("\nTest 2: ManhuaFastScraper.get_chapters() — li.wp-manga-chapter selector")
 
 series_mf = ms.Series(
     title="Hero Returns",
-    url="https://manhuafast.net/manga/hero-returns/",
+    url="https://manhuafast.com/manga/hero-returns/",
     source="manhuafast"
 )
-series_soup = BeautifulSoup(SERIES_HTML, 'html.parser')
+mf_series_soup = BeautifulSoup(SERIES_HTML_MF, 'html.parser')
 
-with patch.object(scraper_mf, '_get_soup', return_value=series_soup), \
+with patch.object(scraper_mf, '_get_soup', return_value=mf_series_soup), \
      patch.object(scraper_mf, '_delay'):
     chapters = scraper_mf.get_chapters(series_mf)
 
-check("returns 3 chapters", len(chapters) == 3)
+check("returns 3 chapters via li.wp-manga-chapter", len(chapters) == 3)
 check("chapters have numbers 1, 2, 3",
       {c.number for c in chapters} == {"1", "2", "3"})
-check("chapter URLs contain manhuafast.net",
-      all("manhuafast.net" in c.url for c in chapters))
+check("chapters are in ascending order (oldest first)",
+      chapters[0].number == "1" and chapters[-1].number == "3")
+check("chapter URLs contain manhuafast.com",
+      all("manhuafast.com" in c.url for c in chapters))
+
+# ── Test 2b: get_chapters — fallback to #chapterlist ─────────────────────────
+print("\nTest 2b: ManhuaFastScraper.get_chapters() — fallback to #chapterlist")
+
+mf_fallback_soup = BeautifulSoup(SERIES_HTML, 'html.parser')
+
+with patch.object(scraper_mf, '_get_soup', return_value=mf_fallback_soup), \
+     patch.object(scraper_mf, '_delay'):
+    chapters_fb = scraper_mf.get_chapters(series_mf)
+
+check("fallback returns 3 chapters", len(chapters_fb) == 3)
+check("fallback chapters have numbers 1, 2, 3",
+      {c.number for c in chapters_fb} == {"1", "2", "3"})
 
 # ── Test 3: get_pages (FlareSolverr path) ─────────────────────────────────────
 print("\nTest 3: ManhuaFastScraper.get_pages() — Madara chapter images via FlareSolverr")
@@ -192,7 +235,7 @@ print("\nTest 3: ManhuaFastScraper.get_pages() — Madara chapter images via Fla
 chapter_mf = ms.Chapter(
     number="1",
     title="Chapter 1",
-    url="https://manhuafast.net/manga/hero-returns/chapter-1/"
+    url="https://manhuafast.com/manga/hero-returns/chapter-1/"
 )
 
 with patch.object(scraper_mf, '_flaresolverr_get',
@@ -204,7 +247,7 @@ with patch.object(scraper_mf, '_flaresolverr_get',
 check("FlareSolverr called once", mock_fs.call_count == 1)
 check("returns 3 page URLs", len(pages) == 3)
 check("page URLs are CDN image URLs",
-      all("cdn.manhuafast.net" in p for p in pages))
+      all("cdn.manhuafast" in p for p in pages))
 check("pages ordered 001, 002, 003",
       pages[0].endswith("001.jpg") and pages[2].endswith("003.jpg"))
 
@@ -226,20 +269,20 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
     series_for_dl = ms.Series(
         title="Hero Returns",
-        url="https://manhuafast.net/manga/hero-returns/",
+        url="https://manhuafast.com/manga/hero-returns/",
         source="manhuafast",
         chapters_count=3,
     )
     chapter_for_dl = ms.Chapter(
         number="1",
         title="Chapter 1",
-        url="https://manhuafast.net/manga/hero-returns/chapter-1/"
+        url="https://manhuafast.com/manga/hero-returns/chapter-1/"
     )
 
     fake_pages = [
-        "https://cdn.manhuafast.net/uploads/hero-returns/ch1/001.jpg",
-        "https://cdn.manhuafast.net/uploads/hero-returns/ch1/002.jpg",
-        "https://cdn.manhuafast.net/uploads/hero-returns/ch1/003.jpg",
+        "https://cdn.manhuafast.com/uploads/hero-returns/ch1/001.jpg",
+        "https://cdn.manhuafast.com/uploads/hero-returns/ch1/002.jpg",
+        "https://cdn.manhuafast.com/uploads/hero-returns/ch1/003.jpg",
     ]
 
     with patch.object(scraper_mf, 'get_pages', return_value=fake_pages), \
@@ -443,7 +486,7 @@ print("\n-- Registry -----------------------------------------------------------
 
 print("\nTest 9: get_scraper() resolves all name aliases")
 
-for alias in ('manhuafast', 'manhuafast.net'):
+for alias in ('manhuafast', 'manhuafast.com', 'manhuafast.net'):
     s = ms.get_scraper(alias)
     check(f"get_scraper('{alias}') -> ManhuaFastScraper",
           isinstance(s, ms.ManhuaFastScraper))
