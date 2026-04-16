@@ -196,6 +196,10 @@ class BaseSiteScraper:
     # Cloudflare-protected sites that benefit from FlareSolverr
     CLOUDFLARE_SITE = False
 
+    # Concurrent image download threads.  Override to a lower value for CDNs
+    # that rate-limit or 504 under parallel load (e.g. ManhuaFast/Drake sites).
+    _DOWNLOAD_WORKERS = 8
+
     def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None):
         self.headless = headless
         self.driver = None
@@ -1430,7 +1434,7 @@ class BaseSiteScraper:
                 img_path = temp_dir / f"{i:03d}{ext}"
                 download_tasks.append((i, page_url, img_path))
 
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            with ThreadPoolExecutor(max_workers=self._DOWNLOAD_WORKERS) as pool:
                 futures = {
                     pool.submit(self._download_image, url, path, chapter.url): page_num
                     for page_num, url, path in download_tasks
@@ -3371,6 +3375,10 @@ class DrakeFullScraper(BaseSiteScraper):
     SITE_NAME = "drake"
     CLOUDFLARE_SITE = True
 
+    # ManhuaFast/Drake CDNs 504 under heavy parallel load — use fewer workers
+    # than the base-class default (8) to avoid hammering the CDN.
+    _DOWNLOAD_WORKERS = 4
+
     def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None):
         super().__init__(headless=headless, limit=limit, max_pages=max_pages)
         if not self._is_arm() and not self._use_flaresolverr:
@@ -3783,36 +3791,55 @@ class DrakeFullScraper(BaseSiteScraper):
         # without any image tags, so the cached-session fast path always fails.
         # Skip it entirely and go straight to FlareSolverr (full headless
         # Chromium that executes the JS) on the first attempt.
-        if self._use_flaresolverr:
-            last_err = None
-            for attempt in range(3):
-                try:
-                    html, cookies, user_agent = self._flaresolverr_get(chapter.url)
-                    self._apply_flaresolverr_cookies(cookies, user_agent)
-                    self._fs_cookies_applied = True
-                    soup = BeautifulSoup(html, 'html.parser')
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    if attempt < 2:
-                        wait = (attempt + 1) * 10
-                        logger.warning(f"FlareSolverr failed for {chapter.url} (attempt {attempt+1}/3): {e} — retrying in {wait}s")
-                        time.sleep(wait)
-            if last_err:
-                logger.warning(f"FlareSolverr failed for {chapter.url} after 3 attempts: {last_err}")
-                return []
-        else:
-            # Non-ARM path: use Selenium with undetected-chromedriver
-            soup = self._get_soup(chapter.url, use_selenium=True)
-            self._sync_cookies_from_driver()
+        #
+        # We retry the full page fetch up to 3 times total.  On each attempt we
+        # re-request via FlareSolverr/Selenium — if we get HTML but 0 images it
+        # means the JS reader hasn't finished rendering yet, so waiting a bit
+        # and fetching again usually resolves it.
+        max_page_attempts = 3
+        for page_attempt in range(max_page_attempts):
+            if self._use_flaresolverr:
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        html, cookies, user_agent = self._flaresolverr_get(chapter.url)
+                        self._apply_flaresolverr_cookies(cookies, user_agent)
+                        self._fs_cookies_applied = True
+                        soup = BeautifulSoup(html, 'html.parser')
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if attempt < 2:
+                            wait = (attempt + 1) * 10
+                            logger.warning(f"FlareSolverr failed for {chapter.url} (attempt {attempt+1}/3): {e} — retrying in {wait}s")
+                            time.sleep(wait)
+                if last_err:
+                    logger.warning(f"FlareSolverr failed for {chapter.url} after 3 attempts: {last_err}")
+                    return []
+            else:
+                # Non-ARM path: use Selenium with undetected-chromedriver
+                soup = self._get_soup(chapter.url, use_selenium=True)
+                self._sync_cookies_from_driver()
 
-        pages = self._extract_drake_pages(soup)
+            pages = self._extract_drake_pages(soup)
 
-        if not pages:
-            logger.debug(f"No pages found for {chapter.url} (likely paywalled, will retry next run)")
+            if pages:
+                return pages
 
-        return pages
+            # Got HTML but no images — JS reader may not have finished rendering.
+            # Wait before re-fetching; skip retry on the last attempt.
+            if page_attempt < max_page_attempts - 1:
+                wait = 15 * (page_attempt + 1)
+                logger.warning(
+                    f"No images in rendered HTML for {chapter.url} "
+                    f"(attempt {page_attempt + 1}/{max_page_attempts}) — "
+                    f"retrying in {wait}s"
+                )
+                time.sleep(wait)
+
+        logger.debug(f"No pages found for {chapter.url} after {max_page_attempts} attempts (likely paywalled)")
+        return []
 
     def _extract_description_from_soup(self, soup) -> str:
         """Extract description for Madara/WP-manga theme sites.
@@ -3849,9 +3876,9 @@ class DrakeFullScraper(BaseSiteScraper):
             'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
         }
         last_err = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
-                response = self.session.get(url, headers=headers, timeout=30)
+                response = self.session.get(url, headers=headers, timeout=45)
                 response.raise_for_status()
                 if len(response.content) < 1000:
                     logger.warning(f"Image too small (<1 KB), likely promo/placeholder: {url}")
@@ -3860,9 +3887,17 @@ class DrakeFullScraper(BaseSiteScraper):
                 return True
             except Exception as e:
                 last_err = e
-                if attempt < 2:
-                    time.sleep(2)
-        logger.warning(f"Failed to download image after 3 attempts: {url} — {last_err}")
+                if attempt < 3:
+                    # 5xx errors (504 Gateway Timeout, 503 Service Unavailable)
+                    # mean the CDN is temporarily overloaded — back off longer so
+                    # it has time to recover before the next attempt.
+                    import requests as _req
+                    is_5xx = (isinstance(e, _req.HTTPError) and
+                              e.response is not None and
+                              e.response.status_code >= 500)
+                    wait = (15 * (attempt + 1)) if is_5xx else (3 * (attempt + 1))
+                    time.sleep(wait)
+        logger.warning(f"Failed to download image after 4 attempts: {url} — {last_err}")
         return False
 
 
