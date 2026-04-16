@@ -3526,7 +3526,10 @@ class DrakeFullScraper(BaseSiteScraper):
                         href = link.get('href', '').strip()
                         if not href or '/manga/' not in href:
                             continue
-                        # Exclude pagination links (/manga/page/2/) and filter pages
+                        # Require a non-empty slug after /manga/ — rejects the bare
+                        # listing URL /manga/ and pagination links /manga/page/2/
+                        if not re.search(r'/manga/[^/?#\s]+', href):
+                            continue
                         if re.search(r'/manga/page/\d+', href):
                             continue
 
@@ -3678,7 +3681,13 @@ class DrakeFullScraper(BaseSiteScraper):
             logger.debug("Synced cookies and UA from browser to requests session")
 
     def _extract_drake_pages(self, soup: BeautifulSoup) -> List[str]:
-        """Extract chapter image URLs from a parsed Drake chapter page."""
+        """Extract chapter image URLs from a parsed Drake chapter page.
+
+        Filters out data: URIs (lazy-load placeholders), logo/icon URLs, and
+        promotional banner images injected at the end by some Madara sites.
+        A promotional image is detected when the last URL's hostname differs
+        from the hostname used by all other chapter images.
+        """
         pages = []
         # Madara/WP-manga theme: images live in .reading-content .page-break img.
         # Try selectors in specificity order; stop at the first one that yields.
@@ -3694,11 +3703,33 @@ class DrakeFullScraper(BaseSiteScraper):
             for img in soup.select(selector):
                 src = img.get('data-src') or img.get('data-lazy-src') or img.get('src', '')
                 src = src.strip()
-                if src and 'logo' not in src.lower() and 'icon' not in src.lower():
+                if (src and
+                        not src.startswith('data:') and
+                        'logo' not in src.lower() and
+                        'icon' not in src.lower()):
                     if src not in pages:
                         pages.append(src)
             if pages:
                 break
+
+        # Drop promotional/banner images appended at the end by the site.
+        # These are identified by having a different hostname from the rest of
+        # the chapter images (e.g. an ad CDN vs the site's image CDN).
+        if len(pages) >= 2:
+            from urllib.parse import urlparse
+            def _host(url):
+                try:
+                    return urlparse(url).netloc.lower()
+                except Exception:
+                    return ''
+            # Find the dominant host (used by the majority of pages)
+            hosts = [_host(p) for p in pages]
+            majority_host = max(set(hosts), key=hosts.count)
+            # If the last image is from a different host, it's a promo banner
+            if hosts[-1] and hosts[-1] != majority_host:
+                logger.debug(f"Dropping suspected promo image (host {hosts[-1]!r} != {majority_host!r}): {pages[-1]}")
+                pages = pages[:-1]
+
         return pages
 
     def get_pages(self, chapter: Chapter) -> List[str]:
@@ -3760,24 +3791,35 @@ class DrakeFullScraper(BaseSiteScraper):
         return super()._extract_description_from_soup(soup)
 
     def _download_image(self, url: str, path: Path, referer: str) -> bool:
-        """Download image using session with synced Cloudflare cookies and matching UA"""
-        try:
-            headers = {
-                'Referer': referer,
-                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-            }
-            # Don't override User-Agent - use the one synced from the browser
-            response = self.session.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
+        """Download image using session with synced Cloudflare cookies and matching UA.
 
-            if len(response.content) < 1000:
-                return False
-
-            path.write_bytes(response.content)
-            return True
-        except Exception as e:
-            logger.debug(f"Failed to download {url}: {e}")
+        Retries up to 3 times with short backoff for transient failures.
+        Skips data: URIs (lazy-load placeholders that slipped through extraction).
+        """
+        if url.startswith('data:'):
+            logger.debug(f"Skipping data: URI placeholder in page list")
             return False
+
+        headers = {
+            'Referer': referer,
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        }
+        last_err = None
+        for attempt in range(3):
+            try:
+                response = self.session.get(url, headers=headers, timeout=30)
+                response.raise_for_status()
+                if len(response.content) < 1000:
+                    logger.warning(f"Image too small (<1 KB), likely promo/placeholder: {url}")
+                    return False
+                path.write_bytes(response.content)
+                return True
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(2)
+        logger.warning(f"Failed to download image after 3 attempts: {url} — {last_err}")
+        return False
 
 
 class ManhuaFastScraper(DrakeFullScraper):
@@ -3880,8 +3922,12 @@ class ManhuaFastScraper(DrakeFullScraper):
                         href = link.get('href', '').strip()
                         if not href or '/manga/' not in href:
                             continue
-                        # Exclude pagination links like /manga/page/2/ and
-                        # category/tag pages like /manga/?m_orderby=views
+                        # Require a non-empty slug after /manga/ — rejects the bare
+                        # listing URL /manga/ (the "Page 1" pagination link) as well
+                        # as pagination sub-pages /manga/page/2/ and query-string
+                        # category pages /manga/?m_orderby=views.
+                        if not re.search(r'/manga/[^/?#\s]+', href):
+                            continue
                         if re.search(r'/manga/page/\d+', href) or \
                                 re.search(r'/manga/\?(genre|tag|type|status|m_orderby)', href):
                             continue
