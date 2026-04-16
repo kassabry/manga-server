@@ -576,6 +576,42 @@ check("URL includes ?m_orderby=views",
 check("series URLs point to reset-scans.org",
       all("reset-scans.org" in s.url for s in rs_sorted))
 
+# ── Test 5c: get_all_series with genre filter — /manga-genre/{slug}/ URL ─────
+print("\nTest 5c: ResetScansScraper.get_all_series(genre='action') — uses /manga-genre/action/")
+
+rs_urls_genre = []
+
+def rs_get_soup_genre(url, use_selenium=False):
+    rs_urls_genre.append(url)
+    return rs_listing_soup
+
+with patch.object(scraper_rs, '_get_soup', side_effect=rs_get_soup_genre), \
+     patch.object(scraper_rs, '_delay'):
+    rs_genre = scraper_rs.get_all_series(genre='action')
+
+check("genre: returns 2 series", len(rs_genre) == 2)
+check("URL uses /manga-genre/action/ path",
+      any('/manga-genre/action/' in u for u in rs_urls_genre))
+check("URL does NOT use /manga/ base when genre given",
+      not any(u.rstrip('/').endswith('/manga') for u in rs_urls_genre))
+
+# ── Test 5d: get_all_series with genre + sort ─────────────────────────────────
+print("\nTest 5d: ResetScansScraper.get_all_series(genre='action', order_by='views') — /manga-genre/action/?m_orderby=views")
+
+rs_urls_genre_sort = []
+
+def rs_get_soup_genre_sort(url, use_selenium=False):
+    rs_urls_genre_sort.append(url)
+    return rs_listing_soup
+
+with patch.object(scraper_rs, '_get_soup', side_effect=rs_get_soup_genre_sort), \
+     patch.object(scraper_rs, '_delay'):
+    rs_genre_sort = scraper_rs.get_all_series(genre='action', order_by='views')
+
+check("genre+sort: returns 2 series", len(rs_genre_sort) == 2)
+check("URL is /manga-genre/action/?m_orderby=views",
+      any('/manga-genre/action/?m_orderby=views' in u for u in rs_urls_genre_sort))
+
 # ── Test 6: get_chapters — li.wp-manga-chapter (standard Madara, no #chapterlist) ─
 print("\nTest 6: ResetScansScraper.get_chapters() — li.wp-manga-chapter selector")
 
