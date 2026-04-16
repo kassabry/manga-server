@@ -782,6 +782,37 @@ check("'manhuafast' in PRIMARY_SITES", 'manhuafast' in ms.PRIMARY_SITES)
 check("'resetscans' in PRIMARY_SITES", 'resetscans' in ms.PRIMARY_SITES)
 
 
+# ── Test 11: DrakeFullScraper._normalize_page_url ─────────────────────────────
+print("\nTest 11: DrakeFullScraper._normalize_page_url")
+_n = ms.DrakeFullScraper._normalize_page_url
+
+# Statically CDN unwrapping
+statically_url = 'https://cdn.statically.io/img/toy.novel-fast.club/wp-content/uploads/chapter-01/001.jpg'
+expected_direct = 'https://toy.novel-fast.club/wp-content/uploads/chapter-01/001.jpg'
+check("statically.io -> direct URL", _n(statically_url) == expected_direct)
+
+# Proxy ?url= extraction
+proxy_url = 'https://porn18comic.com/proxy?url=https://www.toonix.xyz/wp-content/img/001.jpg'
+check("proxy ?url= -> original URL", _n(proxy_url) == 'https://www.toonix.xyz/wp-content/img/001.jpg')
+
+# $object template string filtered
+check("$object template -> empty string", _n('https://cdn.statically.io/img/images.novel-fast.club/$object%5Bkey%5D.manga_cover') == '')
+
+# ${ template string filtered
+check("${ template -> empty string", _n('https://example.com/img/${filename}.jpg') == '')
+
+# {{ template string filtered
+check("{{ template -> empty string", _n('https://example.com/img/{{number}}/001.jpg') == '')
+
+# Regular URL passes through unchanged
+normal_url = 'https://cdn.manhuafast.com/uploads/chapter-01/001.jpg'
+check("normal URL passes through", _n(normal_url) == normal_url)
+
+# data: URI filtered (caller handles these, but normalize should pass through for caller to skip)
+data_uri = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+check("data: URI passes through unchanged", _n(data_uri) == data_uri)
+
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 print(f"\n{'='*60}")
 total = len(results)

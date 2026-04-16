@@ -3660,9 +3660,9 @@ class DrakeFullScraper(BaseSiteScraper):
                     url=full_url
                 ))
 
-        chapters.reverse()
+        chapters.sort(key=lambda c: float(c.number) if c.number.replace('.', '', 1).isdigit() else 0)
         return chapters
-    
+
     def _sync_cookies_from_driver(self):
         """Transfer Cloudflare cookies and UA from selenium to requests session"""
         # In FlareSolverr mode, cookies are already on the session
@@ -3679,6 +3679,47 @@ class DrakeFullScraper(BaseSiteScraper):
             except Exception:
                 pass
             logger.debug("Synced cookies and UA from browser to requests session")
+
+    @staticmethod
+    def _normalize_page_url(url: str) -> str:
+        """Normalise CDN proxy / template URLs to their direct source form.
+
+        Handles three cases that cause download failures:
+
+        1. Statically CDN proxy:
+           ``cdn.statically.io/img/{host}/{path}`` → ``https://{host}/{path}``
+           These return HTTP 400 when the origin is rate-limiting or the proxy
+           quota is exhausted; the direct URL almost always works.
+
+        2. Generic ``?url=`` proxy:
+           ``some-domain.com/proxy?url=https://real.host/img.jpg``
+           → ``https://real.host/img.jpg``
+           Used by dead proxy domains (e.g. porn18comic.com) that no longer
+           resolve.
+
+        3. Unrendered JS template strings:
+           URLs containing ``$object``, ``${``, or ``{{`` are JavaScript
+           template literals that were never evaluated — discard them.
+
+        Returns the normalised URL, or ``""`` to signal the caller to skip it.
+        """
+        from urllib.parse import urlparse, parse_qs, unquote
+        # Filter unrendered JS template strings
+        if '$object' in url or '${' in url or '{{' in url:
+            return ''
+        parsed = urlparse(url)
+        # Statically CDN: cdn.statically.io/img/{host}/{path} → https://{host}/{path}
+        if parsed.netloc == 'cdn.statically.io' and parsed.path.startswith('/img/'):
+            remainder = parsed.path[5:]  # strip leading '/img/'
+            parts = remainder.split('/', 1)
+            if len(parts) == 2 and parts[0]:
+                return f'https://{parts[0]}/{parts[1]}'
+        # Generic proxy: ?url=https://... → extract original URL
+        if parsed.query and 'url=' in parsed.query:
+            qs = parse_qs(parsed.query, keep_blank_values=False)
+            if 'url' in qs and qs['url']:
+                return unquote(qs['url'][0])
+        return url
 
     def _extract_drake_pages(self, soup: BeautifulSoup) -> List[str]:
         """Extract chapter image URLs from a parsed Drake chapter page.
@@ -3703,12 +3744,15 @@ class DrakeFullScraper(BaseSiteScraper):
             for img in soup.select(selector):
                 src = img.get('data-src') or img.get('data-lazy-src') or img.get('src', '')
                 src = src.strip()
-                if (src and
-                        not src.startswith('data:') and
-                        'logo' not in src.lower() and
-                        'icon' not in src.lower()):
-                    if src not in pages:
-                        pages.append(src)
+                if not src or src.startswith('data:'):
+                    continue
+                if 'logo' in src.lower() or 'icon' in src.lower():
+                    continue
+                src = self._normalize_page_url(src)
+                if not src:
+                    continue
+                if src not in pages:
+                    pages.append(src)
             if pages:
                 break
 
@@ -4254,12 +4298,28 @@ class ManhuaFastScraper(DrakeFullScraper):
             logger.debug("AJAX returned no chapters; falling back to initial HTML")
             chapters = _parse_chapter_links(soup)
 
+        # Broad fallback: scan ALL links on the page but enforce the series_path
+        # filter.  This catches chapter lists that use non-standard containers
+        # (e.g. plain <ul> without .listing-chapters_wrap).  We still reject
+        # chapters that belong to sidebar / "related series" widgets because
+        # _parse_chapter_link filters by series_path.
+        if not chapters:
+            logger.debug("Scoped selectors returned no chapters; trying broad link scan with series-path filter")
+            seen_urls: set = set()
+            for link in soup.select('a[href*="chapter"]'):
+                ch = _parse_chapter_link(link.get('href', '').strip(), link)
+                if ch and ch.url not in seen_urls:
+                    seen_urls.add(ch.url)
+                    chapters.append(ch)
+
         if chapters:
             chapters.sort(key=lambda c: float(c.number) if c.number.replace('.', '', 1).isdigit() else 0)
             logger.info(f"  Found {len(chapters)} chapters")
             return chapters
 
-        # Last resort: parent DrakeFullScraper (broad a[href*="chapter"] selector)
+        # Last resort: parent DrakeFullScraper (broad a[href*="chapter"] selector,
+        # no series-path filter — may include sidebar chapters from other series).
+        logger.debug("All ManhuaFast-specific strategies failed; delegating to DrakeFullScraper.get_chapters()")
         return super().get_chapters(series)
 
 
