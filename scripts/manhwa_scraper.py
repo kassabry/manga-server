@@ -3552,7 +3552,15 @@ class DrakeFullScraper(BaseSiteScraper):
                             continue
                         
                         full_url = href if href.startswith('http') else self.BASE_URL + href
-                        
+
+                        # Only accept series actually hosted on this site — some
+                        # aggregator themes embed absolute hrefs pointing to the
+                        # original source domain (e.g. novel-fast.club) which must
+                        # be filtered out.
+                        if not full_url.startswith(self.BASE_URL):
+                            logger.debug(f"Skipping off-site series URL: {full_url}")
+                            continue
+
                         # Get type/genre
                         genres = []
                         type_elem = item.select_one('span.type')
@@ -4051,6 +4059,14 @@ class ManhuaFastScraper(DrakeFullScraper):
                         # Reject pagination/filter URLs after full_url is built
                         if re.search(r'/manga/page/\d+', full_url):
                             continue
+                        # Reject series whose URLs belong to a different domain.
+                        # ManhuaFast aggregates content from other sites (e.g.
+                        # novel-fast.club) and some series cards link directly to
+                        # the original site's URL.  Only accept series that are
+                        # actually hosted on this site.
+                        if not full_url.startswith(self.BASE_URL):
+                            logger.debug(f"Skipping off-site series URL: {full_url}")
+                            continue
 
                         genres = []
                         type_elem = item.select_one('span.type')
@@ -4492,6 +4508,9 @@ class ResetScansScraper(DrakeFullScraper):
                     if not title or len(title) < 2:
                         continue
                     full_url = href if href.startswith('http') else self.BASE_URL + href
+                    if not full_url.startswith(self.BASE_URL):
+                        logger.debug(f"Skipping off-site series URL: {full_url}")
+                        continue
                     if full_url in seen_urls:
                         continue
                     seen_urls.add(full_url)
