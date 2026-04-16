@@ -3879,13 +3879,23 @@ class DrakeFullScraper(BaseSiteScraper):
         # Pick the right Referer for hotlink-protected CDNs.
         # If the image is on a different host than the chapter page, the CDN's
         # hotlink filter will reject a Referer from the chapter page host.
-        # Use the image's own origin instead (matches "same-site" image requests
-        # that browsers make when following <img src> tags on third-party pages).
+        # Use the image's parent directory URL on the same host — this mimics
+        # what a browser sends when loading <img> tags (the page that contains
+        # the image, not just the origin root).
+        # e.g. https://novel-fast.club/cdn_mangaraw/series/chapter-1/001.jpg
+        #   → Referer: https://novel-fast.club/cdn_mangaraw/series/chapter-1/
         try:
             from urllib.parse import urlparse as _up
-            img_host = _up(url).netloc
+            _parsed_img = _up(url)
+            img_host = _parsed_img.netloc
             ref_host = _up(referer).netloc
-            effective_referer = (f'https://{img_host}/' if img_host != ref_host else referer)
+            if img_host != ref_host:
+                # Build the directory URL of the image as Referer
+                img_path = _parsed_img.path
+                img_dir = img_path.rsplit('/', 1)[0] + '/' if '/' in img_path else '/'
+                effective_referer = f'https://{img_host}{img_dir}'
+            else:
+                effective_referer = referer
         except Exception:
             effective_referer = referer
 
