@@ -3864,15 +3864,33 @@ class DrakeFullScraper(BaseSiteScraper):
     def _download_image(self, url: str, path: Path, referer: str) -> bool:
         """Download image using session with synced Cloudflare cookies and matching UA.
 
-        Retries up to 3 times with short backoff for transient failures.
+        Retries up to 4 times with backoff for transient failures.
         Skips data: URIs (lazy-load placeholders that slipped through extraction).
+
+        Hotlink protection: some image CDNs (e.g. novel-fast.club) only allow
+        requests whose Referer comes from their own domain.  When the image host
+        differs from the chapter page host, use the image's own origin as Referer
+        so we don't get a 403.
         """
         if url.startswith('data:'):
             logger.debug(f"Skipping data: URI placeholder in page list")
             return False
 
+        # Pick the right Referer for hotlink-protected CDNs.
+        # If the image is on a different host than the chapter page, the CDN's
+        # hotlink filter will reject a Referer from the chapter page host.
+        # Use the image's own origin instead (matches "same-site" image requests
+        # that browsers make when following <img src> tags on third-party pages).
+        try:
+            from urllib.parse import urlparse as _up
+            img_host = _up(url).netloc
+            ref_host = _up(referer).netloc
+            effective_referer = (f'https://{img_host}/' if img_host != ref_host else referer)
+        except Exception:
+            effective_referer = referer
+
         headers = {
-            'Referer': referer,
+            'Referer': effective_referer,
             'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
         }
         last_err = None
