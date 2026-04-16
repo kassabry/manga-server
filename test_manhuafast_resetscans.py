@@ -612,6 +612,44 @@ check("genre+sort: returns 2 series", len(rs_genre_sort) == 2)
 check("URL is /manga-genre/action/?m_orderby=views",
       any('/manga-genre/action/?m_orderby=views' in u for u in rs_urls_genre_sort))
 
+# ── Test 5e: multi-genre — fetches one URL per genre, dedupes ────────────────
+print("\nTest 5e: ResetScansScraper.get_all_series(genre='action,romance') — one request per genre, deduped")
+
+# Two separate listing pages: action has series A+B, romance has series B+C
+RS_ACTION_HTML = """
+<div class="listupd">
+  <div class="bs"><a href="https://reset-scans.org/manga/series-a/" title="Series A"></a></div>
+  <div class="bs"><a href="https://reset-scans.org/manga/series-b/" title="Series B"></a></div>
+</div>
+"""
+RS_ROMANCE_HTML = """
+<div class="listupd">
+  <div class="bs"><a href="https://reset-scans.org/manga/series-b/" title="Series B"></a></div>
+  <div class="bs"><a href="https://reset-scans.org/manga/series-c/" title="Series C"></a></div>
+</div>
+"""
+from bs4 import BeautifulSoup as BS
+
+rs_multi_soups = [BS(RS_ACTION_HTML, 'html.parser'), BS(RS_ROMANCE_HTML, 'html.parser')]
+rs_multi_urls = []
+
+def rs_get_soup_multi(url, use_selenium=False):
+    rs_multi_urls.append(url)
+    return rs_multi_soups[len(rs_multi_urls) - 1]
+
+with patch.object(scraper_rs, '_get_soup', side_effect=rs_get_soup_multi), \
+     patch.object(scraper_rs, '_delay'):
+    rs_multi = scraper_rs.get_all_series(genre='action,romance')
+
+check("multi-genre: fetched 2 URLs (one per genre)", len(rs_multi_urls) == 2)
+check("multi-genre: /manga-genre/action/ fetched",
+      any('/manga-genre/action/' in u for u in rs_multi_urls))
+check("multi-genre: /manga-genre/romance/ fetched",
+      any('/manga-genre/romance/' in u for u in rs_multi_urls))
+check("multi-genre: 3 distinct series returned (B deduped)", len(rs_multi) == 3)
+check("multi-genre: all 3 titles present",
+      {s.title for s in rs_multi} == {"Series A", "Series B", "Series C"})
+
 # ── Test 6: get_chapters — li.wp-manga-chapter (standard Madara, no #chapterlist) ─
 print("\nTest 6: ResetScansScraper.get_chapters() — li.wp-manga-chapter selector")
 

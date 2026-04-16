@@ -3739,6 +3739,26 @@ class DrakeFullScraper(BaseSiteScraper):
 
         return pages
 
+    def _extract_description_from_soup(self, soup) -> str:
+        """Extract description for Madara/WP-manga theme sites.
+
+        The base-class [class*="summary"] selector is too broad — it matches
+        the page-level wrapper (.profile-manga.summary-layout-1) first, which
+        contains the entire page and returns garbled text.  Try Madara-specific
+        selectors first before falling back.
+        """
+        # Reset Scans uses a two-tab layout; the Summary tab panel is #nav-profile.
+        # Standard Madara puts the synopsis text in .summary_content.
+        for selector in ('#nav-profile', '.summary_content', '.post-content',
+                         'div[itemprop="description"]'):
+            elem = soup.select_one(selector)
+            if elem:
+                text = elem.get_text(separator=' ', strip=True)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if len(text) > 50:
+                    return text[:2000]
+        return super()._extract_description_from_soup(soup)
+
     def _download_image(self, url: str, path: Path, referer: str) -> bool:
         """Download image using session with synced Cloudflare cookies and matching UA"""
         try:
@@ -4231,84 +4251,98 @@ class ResetScansScraper(DrakeFullScraper):
         return BaseSiteScraper._extract_cover_from_soup(self, soup)
 
     def get_all_series(self, order_by: str = None, genre: str = None) -> List[Series]:
-        """Get all series from Reset Scans, optionally filtered by genre and/or sorted.
+        """Get all series from Reset Scans, optionally filtered by genre(s) and/or sorted.
 
         Reset Scans uses /manga-genre/{slug}/ for genre browsing — a separate
         URL namespace from /manga/ (unlike most Madara sites that use query params).
 
-          No genre:  https://reset-scans.org/manga/?m_orderby=views
-          Genre:     https://reset-scans.org/manga-genre/action/?m_orderby=views
+          No genre:        https://reset-scans.org/manga/?m_orderby=views
+          Single genre:    https://reset-scans.org/manga-genre/action/?m_orderby=views
+          Multiple genres: fetches each genre URL and merges results (deduped by URL)
 
         order_by: views, trending, rating, latest, alphabet/az, new.
-        genre: URL slug, e.g. "action", "romance", "fantasy".
+        genre: single slug or comma-separated slugs, e.g. "action" or "action,romance".
         """
         sort_param = self.SORT_KEYS.get((order_by or '').lower().strip(), '')
         if order_by and not sort_param:
             logger.warning(f"Unknown sort key '{order_by}' — using site default. Valid: {', '.join(self.SORT_KEYS)}")
 
-        genre_slug = (genre or '').lower().strip().replace(' ', '-')
+        # Support comma-separated genres
+        genre_slugs = [
+            g.lower().strip().replace(' ', '-')
+            for g in (genre or '').split(',')
+            if g.strip()
+        ]
 
-        if genre_slug:
-            base = f"{self.BASE_URL}/manga-genre/{genre_slug}/"
-            log_suffix = f"genre={genre_slug}"
+        # Build list of URLs to fetch: one per genre, or /manga/ if no genre
+        if genre_slugs:
+            fetch_urls = [
+                (f"{self.BASE_URL}/manga-genre/{slug}/" +
+                 (f"?m_orderby={sort_param}" if sort_param else ""))
+                for slug in genre_slugs
+            ]
+            log_suffix = f"genre={','.join(genre_slugs)}"
         else:
             base = f"{self.BASE_URL}/manga/"
+            fetch_urls = [base + (f"?m_orderby={sort_param}" if sort_param else "")]
             log_suffix = ""
 
         if sort_param:
-            fetch_url = f"{base}?m_orderby={sort_param}"
             log_suffix = f"{log_suffix + ', ' if log_suffix else ''}sort={sort_param}"
-        else:
-            fetch_url = base
 
         if log_suffix:
             logger.info(f"Fetching all series from Reset Scans ({log_suffix})...")
         else:
             logger.info("Fetching all series from Reset Scans...")
 
-        soup = self._get_soup(fetch_url)
-        items = (
-            soup.select('div.bs') or
-            soup.select('.listupd .bs') or
-            soup.select('.listupd article') or
-            soup.select('a[href*="/manga/"]:not([href*="chapter"])')
-        )
-
         all_series = []
         seen_urls: set = set()
-        for item in items:
-            try:
-                link = item.select_one('a[href*="/manga/"]') if item.name != 'a' else item
-                if not link:
+
+        for fetch_url in fetch_urls:
+            soup = self._get_soup(fetch_url)
+            items = (
+                soup.select('div.bs') or
+                soup.select('.listupd .bs') or
+                soup.select('.listupd article') or
+                soup.select('a[href*="/manga/"]:not([href*="chapter"])')
+            )
+
+            for item in items:
+                try:
+                    link = item.select_one('a[href*="/manga/"]') if item.name != 'a' else item
+                    if not link:
+                        continue
+                    href = link.get('href', '').strip()
+                    if not href or '/manga/' not in href:
+                        continue
+                    title = link.get('title', '')
+                    if not title:
+                        title_elem = item.select_one('div.tt, .title')
+                        if title_elem:
+                            title = title_elem.get_text(strip=True)
+                    if not title or len(title) < 2:
+                        continue
+                    full_url = href if href.startswith('http') else self.BASE_URL + href
+                    if full_url in seen_urls:
+                        continue
+                    seen_urls.add(full_url)
+                    genres = []
+                    type_elem = item.select_one('span.type')
+                    if type_elem:
+                        genres.append(type_elem.get_text(strip=True))
+                    all_series.append(Series(
+                        title=title,
+                        url=full_url,
+                        source=self.SITE_NAME,
+                        genres=genres,
+                    ))
+                    if self.limit and len(all_series) >= self.limit:
+                        break
+                except Exception:
                     continue
-                href = link.get('href', '').strip()
-                if not href or '/manga/' not in href:
-                    continue
-                title = link.get('title', '')
-                if not title:
-                    title_elem = item.select_one('div.tt, .title')
-                    if title_elem:
-                        title = title_elem.get_text(strip=True)
-                if not title or len(title) < 2:
-                    continue
-                full_url = href if href.startswith('http') else self.BASE_URL + href
-                if full_url in seen_urls:
-                    continue
-                seen_urls.add(full_url)
-                genres = []
-                type_elem = item.select_one('span.type')
-                if type_elem:
-                    genres.append(type_elem.get_text(strip=True))
-                all_series.append(Series(
-                    title=title,
-                    url=full_url,
-                    source=self.SITE_NAME,
-                    genres=genres,
-                ))
-                if self.limit and len(all_series) >= self.limit:
-                    break
-            except Exception:
-                continue
+
+            if self.limit and len(all_series) >= self.limit:
+                break
 
         logger.info(f"Total series found: {len(all_series)}")
         return all_series
