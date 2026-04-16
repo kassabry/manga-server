@@ -3526,7 +3526,10 @@ class DrakeFullScraper(BaseSiteScraper):
                         href = link.get('href', '').strip()
                         if not href or '/manga/' not in href:
                             continue
-                        
+                        # Exclude pagination links (/manga/page/2/) and filter pages
+                        if re.search(r'/manga/page/\d+', href):
+                            continue
+
                         # Get title from title attribute or div.tt
                         title = link.get('title', '')
                         if not title:
@@ -3857,6 +3860,11 @@ class ManhuaFastScraper(DrakeFullScraper):
                         href = link.get('href', '').strip()
                         if not href or '/manga/' not in href:
                             continue
+                        # Exclude pagination links like /manga/page/2/ and
+                        # category/tag pages like /manga/?m_orderby=views
+                        if re.search(r'/manga/page/\d+', href) or \
+                                re.search(r'/manga/\?(genre|tag|type|status|m_orderby)', href):
+                            continue
 
                         title = link.get('title', '')
                         if not title:
@@ -3867,6 +3875,9 @@ class ManhuaFastScraper(DrakeFullScraper):
                             continue
 
                         full_url = href if href.startswith('http') else self.BASE_URL + href
+                        # Reject pagination/filter URLs after full_url is built
+                        if re.search(r'/manga/page/\d+', full_url):
+                            continue
 
                         genres = []
                         type_elem = item.select_one('span.type')
