@@ -3700,20 +3700,27 @@ class DrakeFullScraper(BaseSiteScraper):
     def _normalize_page_url(url: str) -> str:
         """Normalise CDN proxy / template URLs to their direct source form.
 
-        Handles three cases that cause download failures:
+        Handles five cases that cause download failures:
 
-        1. Statically CDN proxy:
+        1. Triple-slash URLs (malformed older chapter content):
+           ``https:///cdn.host/path`` → ``https://cdn.host/path``
+           Produced when a site prepends "https:" to a root-relative URL
+           ("/cdn.host/...") instead of a protocol-relative one.
+
+        2. Protocol-relative URLs: ``//cdn.host/path`` → ``https://cdn.host/path``
+
+        3. Statically CDN proxy:
            ``cdn.statically.io/img/{host}/{path}`` → ``https://{host}/{path}``
            These return HTTP 400 when the origin is rate-limiting or the proxy
            quota is exhausted; the direct URL almost always works.
 
-        2. Generic ``?url=`` proxy:
+        4. Generic ``?url=`` proxy:
            ``some-domain.com/proxy?url=https://real.host/img.jpg``
            → ``https://real.host/img.jpg``
            Used by dead proxy domains (e.g. porn18comic.com) that no longer
            resolve.
 
-        3. Unrendered JS template strings:
+        5. Unrendered JS template strings:
            URLs containing ``$object``, ``${``, or ``{{`` are JavaScript
            template literals that were never evaluated — discard them.
 
@@ -3723,6 +3730,16 @@ class DrakeFullScraper(BaseSiteScraper):
         # Filter unrendered JS template strings
         if '$object' in url or '${' in url or '{{' in url:
             return ''
+        # Fix triple-slash URLs from old chapter content: https:///host/path → https://host/path
+        # Caused by sites prepending "https:" to a root-relative URL ("/cdn.host/...")
+        # instead of a protocol-relative one ("//cdn.host/...").
+        if url.startswith('https:///'):
+            url = 'https://' + url[9:]
+        elif url.startswith('http:///'):
+            url = 'http://' + url[8:]
+        # Fix protocol-relative URLs: //cdn.host/path → https://cdn.host/path
+        elif url.startswith('//'):
+            url = 'https:' + url
         parsed = urlparse(url)
         # Statically CDN: cdn.statically.io/img/{host}/{path} → https://{host}/{path}
         if parsed.netloc == 'cdn.statically.io' and parsed.path.startswith('/img/'):
@@ -3954,7 +3971,7 @@ class ManhuaFastScraper(DrakeFullScraper):
 
     # .com and .net are the same site; .com is the canonical domain used by
     # Tachiyomi and has the full catalog (~152 pages vs ~64 on .net).
-    BASE_URL = "https://manhuafast.com"
+    BASE_URL = "https://manhuafast.net"
     SITE_NAME = "manhuafast"
     CLOUDFLARE_SITE = True
 
