@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 
-export async function PUT(request: NextRequest) {
+async function upsertProgress(request: NextRequest) {
   const session = await auth();
   if (!session?.user) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -34,3 +34,7 @@ export async function PUT(request: NextRequest) {
 
   return NextResponse.json(progress);
 }
+
+export const PUT = upsertProgress;
+// sendBeacon always sends POST — alias so tab-close saves aren't lost
+export const POST = upsertProgress;

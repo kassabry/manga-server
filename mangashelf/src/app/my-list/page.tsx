@@ -6,6 +6,32 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { LIST_STATUS_LABELS, type ListStatus } from "@/lib/types";
 
+interface CustomListSummary {
+  id: string;
+  name: string;
+  entryCount: number;
+  updatedAt: string;
+}
+
+interface CustomListDetail {
+  id: string;
+  name: string;
+  entries: {
+    id: string;
+    seriesId: string;
+    addedAt: string;
+    series: {
+      id: string;
+      title: string;
+      slug: string;
+      type: string;
+      coverPath: string | null;
+      chapterCount: number;
+      status: string | null;
+    };
+  }[];
+}
+
 interface ListEntryData {
   id: string;
   status: string;
@@ -49,10 +75,16 @@ export default function MyListPage() {
   const [entries, setEntries] = useState<ListEntryData[]>([]);
   const [follows, setFollows] = useState<FollowEntry[]>([]);
   const [progressMap, setProgressMap] = useState<Map<string, ProgressInfo>>(new Map());
-  const [activeTab, setActiveTab] = useState<ListStatus | "all" | "following" | "in_progress">("all");
+  const [activeTab, setActiveTab] = useState<ListStatus | "all" | "following" | "in_progress" | "custom_lists">("all");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState<SortOption>("recent");
   const [loading, setLoading] = useState(true);
+  const [customLists, setCustomLists] = useState<CustomListSummary[]>([]);
+  const [openListId, setOpenListId] = useState<string | null>(null);
+  const [openListDetail, setOpenListDetail] = useState<CustomListDetail | null>(null);
+  const [newListName, setNewListName] = useState("");
+  const [editingListId, setEditingListId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
 
   useEffect(() => {
     if (authStatus === "unauthenticated") router.push("/login");
@@ -121,6 +153,63 @@ export default function MyListPage() {
       });
   }, [session]);
 
+  // Fetch custom lists
+  const refreshCustomLists = () => {
+    fetch("/api/user/custom-lists")
+      .then((r) => r.json())
+      .then((data) => Array.isArray(data) && setCustomLists(data));
+  };
+
+  useEffect(() => {
+    if (!session?.user) return;
+    refreshCustomLists();
+  }, [session]);
+
+  // Open a specific custom list
+  useEffect(() => {
+    if (!openListId) { setOpenListDetail(null); return; }
+    fetch(`/api/user/custom-lists/${openListId}`)
+      .then((r) => r.json())
+      .then(setOpenListDetail);
+  }, [openListId]);
+
+  async function createCustomList() {
+    if (!newListName.trim()) return;
+    await fetch("/api/user/custom-lists", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newListName.trim() }),
+    });
+    setNewListName("");
+    refreshCustomLists();
+  }
+
+  async function deleteCustomList(id: string) {
+    if (!confirm("Delete this list?")) return;
+    await fetch(`/api/user/custom-lists/${id}`, { method: "DELETE" });
+    if (openListId === id) setOpenListId(null);
+    refreshCustomLists();
+  }
+
+  async function renameCustomList(id: string) {
+    if (!editingName.trim()) return;
+    await fetch(`/api/user/custom-lists/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: editingName.trim() }),
+    });
+    setEditingListId(null);
+    refreshCustomLists();
+  }
+
+  async function removeFromCustomList(listId: string, seriesId: string) {
+    await fetch(`/api/user/custom-lists/${listId}/entries?seriesId=${seriesId}`, { method: "DELETE" });
+    // Refresh detail
+    const updated = await fetch(`/api/user/custom-lists/${listId}`).then((r) => r.json());
+    setOpenListDetail(updated);
+    refreshCustomLists();
+  }
+
   // Filter and sort
   const displayEntries = useMemo(() => {
     if (activeTab === "following") {
@@ -182,7 +271,7 @@ export default function MyListPage() {
   if (authStatus === "loading") return null;
   if (!session?.user) return null;
 
-  const tabs: (ListStatus | "all" | "following" | "in_progress")[] = [
+  const tabs: (ListStatus | "all" | "following" | "in_progress" | "custom_lists")[] = [
     "all",
     "following",
     "in_progress",
@@ -191,12 +280,14 @@ export default function MyListPage() {
     "completed",
     "on_hold",
     "dropped",
+    "custom_lists",
   ];
 
   const tabLabels: Record<string, string> = {
     all: "All",
     following: "Following",
     in_progress: "In Progress",
+    custom_lists: "Custom Lists",
     ...LIST_STATUS_LABELS,
   };
 
@@ -210,7 +301,7 @@ export default function MyListPage() {
       </div>
 
       {/* Search + Sort */}
-      <div className="flex flex-wrap gap-3">
+      {activeTab !== "custom_lists" && <div className="flex flex-wrap gap-3">
         <input
           type="text"
           placeholder="Filter by title..."
@@ -227,7 +318,7 @@ export default function MyListPage() {
           <option value="title">Title A-Z</option>
           <option value="type">Type</option>
         </select>
-      </div>
+      </div>}
 
       {/* Tabs */}
       <div className="flex flex-wrap gap-1 overflow-x-auto rounded-lg border border-border bg-bg-card p-1" style={{ scrollbarWidth: "none" }}>
@@ -246,16 +337,145 @@ export default function MyListPage() {
         ))}
       </div>
 
-      {/* List */}
-      {loading ? (
+      {/* Custom Lists tab content */}
+      {activeTab === "custom_lists" && (
+        <div className="space-y-4">
+          {/* Create new list */}
+          <div className="flex gap-2">
+            <input
+              type="text"
+              placeholder="New list name..."
+              value={newListName}
+              onChange={(e) => setNewListName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && createCustomList()}
+              className="flex-1 rounded-lg border border-border bg-bg-primary px-4 py-2 text-sm focus:border-accent focus:outline-none sm:max-w-xs"
+            />
+            <button
+              onClick={createCustomList}
+              disabled={!newListName.trim()}
+              className="rounded-lg bg-accent px-4 py-2 text-sm text-white disabled:opacity-40"
+            >
+              Create List
+            </button>
+          </div>
+
+          {openListId && openListDetail ? (
+            /* Opened list — show its series */
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={() => setOpenListId(null)}
+                  className="rounded p-1 text-text-secondary hover:text-text-primary"
+                >
+                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                  </svg>
+                </button>
+                {editingListId === openListId ? (
+                  <div className="flex flex-1 gap-2">
+                    <input
+                      autoFocus
+                      type="text"
+                      value={editingName}
+                      onChange={(e) => setEditingName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") renameCustomList(openListId);
+                        if (e.key === "Escape") setEditingListId(null);
+                      }}
+                      className="flex-1 rounded-lg border border-accent bg-bg-primary px-3 py-1 text-base font-semibold focus:outline-none"
+                    />
+                    <button onClick={() => renameCustomList(openListId)} className="text-sm text-accent">Save</button>
+                    <button onClick={() => setEditingListId(null)} className="text-sm text-text-secondary">Cancel</button>
+                  </div>
+                ) : (
+                  <>
+                    <h2 className="flex-1 text-lg font-semibold">{openListDetail.name}</h2>
+                    <button
+                      onClick={() => { setEditingListId(openListId); setEditingName(openListDetail.name); }}
+                      className="text-xs text-text-secondary hover:text-text-primary"
+                    >
+                      Rename
+                    </button>
+                    <button
+                      onClick={() => deleteCustomList(openListId)}
+                      className="text-xs text-red-400 hover:text-red-300"
+                    >
+                      Delete
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {openListDetail.entries.length === 0 ? (
+                <p className="py-8 text-center text-text-secondary">No series in this list yet.</p>
+              ) : (
+                <div className="space-y-2">
+                  {openListDetail.entries.map((entry) => (
+                    <div key={entry.id} className="flex items-center gap-4 rounded-lg border border-border p-3">
+                      <Link href={`/series/${entry.series.id}`} className="flex flex-1 items-center gap-4 hover:opacity-80 min-w-0">
+                        {entry.series.coverPath ? (
+                          <img src={entry.series.coverPath} alt="" className="h-16 w-11 rounded object-cover shrink-0" />
+                        ) : (
+                          <div className="h-16 w-11 shrink-0 rounded bg-bg-hover" />
+                        )}
+                        <div className="min-w-0">
+                          <h3 className="font-medium truncate">{entry.series.title}</h3>
+                          <div className="mt-1 text-xs text-text-secondary">
+                            {entry.series.type} &middot; {entry.series.chapterCount} chapters
+                          </div>
+                        </div>
+                      </Link>
+                      <button
+                        onClick={() => removeFromCustomList(openListId, entry.seriesId)}
+                        className="shrink-0 rounded p-1 text-text-secondary hover:text-red-400"
+                        title="Remove from list"
+                      >
+                        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            /* List grid */
+            customLists.length === 0 ? (
+              <p className="py-12 text-center text-text-secondary">No custom lists yet. Create one above.</p>
+            ) : (
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {customLists.map((list) => (
+                  <button
+                    key={list.id}
+                    onClick={() => setOpenListId(list.id)}
+                    className="group flex items-center justify-between rounded-xl border border-border bg-bg-card p-4 text-left hover:border-accent"
+                  >
+                    <div>
+                      <h3 className="font-medium group-hover:text-accent">{list.name}</h3>
+                      <p className="mt-1 text-sm text-text-secondary">{list.entryCount} series</p>
+                    </div>
+                    <svg className="h-5 w-5 text-text-secondary group-hover:text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                  </button>
+                ))}
+              </div>
+            )
+          )}
+        </div>
+      )}
+
+      {/* Regular list content (hidden when custom_lists tab active) */}
+      {activeTab !== "custom_lists" && loading ? (
         <div className="py-12 text-center text-text-secondary">Loading...</div>
-      ) : displayEntries.length === 0 ? (
+      ) : activeTab !== "custom_lists" && displayEntries.length === 0 ? (
         <div className="py-12 text-center text-text-secondary">
           {search
             ? "No series match your filter."
             : "No entries yet. Browse series to add them to your list."}
         </div>
-      ) : (
+      ) : activeTab !== "custom_lists" ? (
         <div className="space-y-2">
           {displayEntries.map((entry) => {
             const prog = progressMap.get(entry.series.id);
@@ -334,7 +554,7 @@ export default function MyListPage() {
             );
           })}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }

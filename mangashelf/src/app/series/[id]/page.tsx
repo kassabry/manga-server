@@ -1,9 +1,16 @@
 "use client";
 
-import { useEffect, useState, useMemo, use } from "react";
+import { useEffect, useState, useMemo, use, useRef } from "react";
 import { useSession } from "next-auth/react";
 import Link from "next/link";
 import { LIST_STATUS_LABELS, type ListStatus } from "@/lib/types";
+
+interface CustomList {
+  id: string;
+  name: string;
+  entryCount: number;
+  entries: { seriesId: string }[];
+}
 
 interface Chapter {
   id: string;
@@ -55,6 +62,10 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
   const [sortDesc, setSortDesc] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<string>("all");
   const [deduping, setDeduping] = useState(false);
+  const [customLists, setCustomLists] = useState<CustomList[]>([]);
+  const [showListsPopover, setShowListsPopover] = useState(false);
+  const [newListName, setNewListName] = useState("");
+  const listsPopoverRef = useRef<HTMLDivElement>(null);
 
   const uniqueSources = useMemo(() => {
     const sources = new Set<string>();
@@ -127,7 +138,25 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
         }
         setProgress(map);
       });
+
+    fetch("/api/user/custom-lists")
+      .then((r) => r.json())
+      .then((d) => Array.isArray(d) && setCustomLists(d));
   }, [session, id]);
+
+  useEffect(() => {
+    function handleOutside(e: MouseEvent | TouchEvent) {
+      if (listsPopoverRef.current && !listsPopoverRef.current.contains(e.target as Node)) {
+        setShowListsPopover(false);
+      }
+    }
+    document.addEventListener("mousedown", handleOutside);
+    document.addEventListener("touchstart", handleOutside, { passive: true });
+    return () => {
+      document.removeEventListener("mousedown", handleOutside);
+      document.removeEventListener("touchstart", handleOutside);
+    };
+  }, []);
 
   async function toggleFollow() {
     await fetch(`/api/user/follow/${id}`, { method: "POST" });
@@ -154,6 +183,42 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       }
       return next;
     });
+  }
+
+  async function toggleCustomList(listId: string, inList: boolean) {
+    if (inList) {
+      await fetch(`/api/user/custom-lists/${listId}/entries?seriesId=${id}`, { method: "DELETE" });
+    } else {
+      await fetch(`/api/user/custom-lists/${listId}/entries`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seriesId: id }),
+      });
+    }
+    // Refresh lists
+    const updated = await fetch("/api/user/custom-lists").then((r) => r.json());
+    if (Array.isArray(updated)) setCustomLists(updated);
+  }
+
+  async function createCustomList() {
+    if (!newListName.trim()) return;
+    const res = await fetch("/api/user/custom-lists", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newListName.trim() }),
+    });
+    if (res.ok) {
+      const newList = await res.json();
+      // Add series to the new list immediately
+      await fetch(`/api/user/custom-lists/${newList.id}/entries`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seriesId: id }),
+      });
+      const updated = await fetch("/api/user/custom-lists").then((r) => r.json());
+      if (Array.isArray(updated)) setCustomLists(updated);
+      setNewListName("");
+    }
   }
 
   async function updateListStatus(status: string) {
@@ -283,6 +348,78 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                   </option>
                 ))}
               </select>
+
+              {/* Custom lists popover */}
+              <div ref={listsPopoverRef} className="relative">
+                <button
+                  onClick={() => setShowListsPopover((s) => !s)}
+                  className={`flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm transition ${
+                    showListsPopover
+                      ? "border-accent text-accent"
+                      : "border-border bg-bg-card text-text-primary hover:border-accent"
+                  }`}
+                  title="Add to custom list"
+                >
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
+                  </svg>
+                  Lists
+                </button>
+
+                {showListsPopover && (
+                  <div className="absolute left-0 top-full z-50 mt-1 w-60 rounded-xl border border-border bg-bg-secondary shadow-xl">
+                    <div className="border-b border-border px-3 py-2">
+                      <span className="text-xs font-semibold text-text-secondary uppercase tracking-wide">Custom Lists</span>
+                    </div>
+                    <div className="max-h-56 overflow-y-auto">
+                      {customLists.length === 0 && (
+                        <p className="px-3 py-3 text-xs text-text-secondary">No lists yet. Create one below.</p>
+                      )}
+                      {customLists.map((list) => {
+                        const inList = list.entries?.some((e) => e.seriesId === id);
+                        return (
+                          <button
+                            key={list.id}
+                            onClick={() => toggleCustomList(list.id, !!inList)}
+                            className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-bg-hover"
+                          >
+                            <span className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
+                              inList ? "border-accent bg-accent" : "border-border"
+                            }`}>
+                              {inList && (
+                                <svg className="h-3 w-3 text-white" viewBox="0 0 20 20" fill="currentColor">
+                                  <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
+                                </svg>
+                              )}
+                            </span>
+                            <span className="flex-1 truncate">{list.name}</span>
+                            <span className="text-xs text-text-secondary">{list.entryCount}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="border-t border-border p-2">
+                      <div className="flex gap-1">
+                        <input
+                          type="text"
+                          placeholder="New list name..."
+                          value={newListName}
+                          onChange={(e) => setNewListName(e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && createCustomList()}
+                          className="flex-1 rounded-md border border-border bg-bg-primary px-2 py-1 text-xs focus:border-accent focus:outline-none"
+                        />
+                        <button
+                          onClick={createCustomList}
+                          disabled={!newListName.trim()}
+                          className="rounded-md bg-accent px-2 py-1 text-xs text-white disabled:opacity-40"
+                        >
+                          Create
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
