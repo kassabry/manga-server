@@ -21,7 +21,8 @@ interface ChapterData {
   pages: PageInfo[];
   prevChapter: { id: string; number: number } | null;
   nextChapter: { id: string; number: number } | null;
-  allChapters: { id: string; number: number; title: string | null }[];
+  source: string | null;
+  allChapters: { id: string; number: number; title: string | null; source: string | null }[];
 }
 
 type LayoutMode = "single" | "double" | "double-manga" | "longstrip";
@@ -99,6 +100,8 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   // Reload: incrementing forces a fresh fetch of all images (cache-busts error-cached URLs)
   const [reloadKey, setReloadKey] = useState(0);
   const [isReloading, setIsReloading] = useState(false);
+  const [showSourcePicker, setShowSourcePicker] = useState(false);
+  const [selectedSource, setSelectedSource] = useState<string | null>(null);
 
   // Touch/swipe state
   const touchStartX = useRef(0);
@@ -157,6 +160,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       .then((r) => r.json())
       .then((data) => {
         setChapter(data);
+        setSelectedSource((prev) => prev ?? data.source ?? null);
         const startPage = data.pages?.[0]?.name?.toLowerCase().includes("cover")
           ? Math.max(initialPage, 1)
           : initialPage;
@@ -477,6 +481,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
           setShowToolbar((s) => !s);
           setShowSettings(false);
           setShowChapterPicker(false);
+          setShowSourcePicker(false);
           break;
         case "m":
           setShowSettings((s) => !s);
@@ -523,6 +528,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       setShowToolbar((s) => !s);
       setShowSettings(false);
       setShowChapterPicker(false);
+      setShowSourcePicker(false);
     }
   }
 
@@ -533,6 +539,25 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       </div>
     );
   }
+
+  // Unique sources available for this series
+  const uniqueSources = Array.from(
+    new Set(chapter.allChapters.map((c) => c.source ?? "Unknown"))
+  ).sort();
+
+  // Active source: fall back to first available if selectedSource not present
+  const activeSource =
+    selectedSource && uniqueSources.includes(selectedSource)
+      ? selectedSource
+      : uniqueSources[0] ?? null;
+
+  // Deduplicated chapters for active source (one entry per chapter number)
+  const filteredChapters = chapter.allChapters
+    .filter((c) => (c.source ?? "Unknown") === activeSource)
+    .reduce<typeof chapter.allChapters>((acc, c) => {
+      if (!acc.find((x) => x.number === c.number)) acc.push(c);
+      return acc;
+    }, []);
 
   const bgStyle = { backgroundColor: BG_COLORS[settings.bgColor] };
   const brightnessStyle = settings.brightness !== 100
@@ -624,9 +649,23 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
+          {/* Source picker button — only shown when multiple sources exist */}
+          {uniqueSources.length > 1 && (
+            <button
+              onClick={() => { setShowSourcePicker(!showSourcePicker); setShowChapterPicker(false); setShowSettings(false); }}
+              className={`rounded px-2 py-1 text-xs font-medium transition ${
+                showSourcePicker
+                  ? "bg-accent text-white"
+                  : "bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
+              }`}
+              title="Select source site"
+            >
+              {activeSource ?? "Source"}
+            </button>
+          )}
           {/* Chapter picker button */}
           <button
-            onClick={() => { setShowChapterPicker(!showChapterPicker); setShowSettings(false); }}
+            onClick={() => { setShowChapterPicker(!showChapterPicker); setShowSourcePicker(false); setShowSettings(false); }}
             className="rounded p-1.5 text-white/70 hover:bg-white/10 hover:text-white"
             title="Jump to chapter"
           >
@@ -656,7 +695,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             </svg>
           </button>
           <button
-            onClick={() => { setShowSettings(!showSettings); setShowChapterPicker(false); }}
+            onClick={() => { setShowSettings(!showSettings); setShowChapterPicker(false); setShowSourcePicker(false); }}
             className="rounded p-1.5 text-white/70 hover:bg-white/10 hover:text-white"
             title="Reader settings (M)"
           >
@@ -668,6 +707,35 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         </div>
       </div>
 
+      {/* Source picker panel */}
+      {showSourcePicker && uniqueSources.length > 1 && (
+        <div className="absolute left-0 right-0 top-12 z-50 mx-auto max-w-xs">
+          <div className="m-2 rounded-xl border border-white/10 bg-black/95 shadow-2xl backdrop-blur-xl">
+            <div className="border-b border-white/10 px-4 py-2">
+              <h3 className="text-sm font-semibold text-white">Source Site</h3>
+            </div>
+            <div className="p-2">
+              {uniqueSources.map((src) => (
+                <button
+                  key={src}
+                  onClick={() => {
+                    setSelectedSource(src);
+                    setShowSourcePicker(false);
+                  }}
+                  className={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
+                    src === activeSource
+                      ? "bg-accent text-white"
+                      : "text-white/70 hover:bg-white/10 hover:text-white"
+                  }`}
+                >
+                  {src}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Chapter picker panel */}
       {showChapterPicker && (
         <div className="absolute left-0 right-0 top-12 z-50 mx-auto max-w-md">
@@ -676,14 +744,13 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               <h3 className="text-sm font-semibold text-white">Chapters</h3>
             </div>
             <div className="p-2">
-              {chapter.allChapters.map((ch) => (
+              {filteredChapters.map((ch) => (
                 <button
                   key={ch.id}
-                  ref={ch.id === chapter.id ? activeChapterBtnRef : undefined}
+                  ref={ch.number === chapter.number ? activeChapterBtnRef : undefined}
                   onClick={() => {
                     setShowChapterPicker(false);
                     if (ch.id !== chapter.id) {
-                      // Save current progress before navigating away
                       const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
                       const isLast = page >= chapter.pages.length - 1;
                       saveProgress(page, isLast);
@@ -691,7 +758,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                     }
                   }}
                   className={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
-                    ch.id === chapter.id
+                    ch.number === chapter.number
                       ? "bg-accent text-white"
                       : "text-white/70 hover:bg-white/10 hover:text-white"
                   }`}
