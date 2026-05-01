@@ -83,6 +83,42 @@ function sanitizeEpubHtml(html: string): string {
     .replace(/\s*on\w+='[^']*'/gi, "");
 }
 
+// Returns the deduped chapter list for a given source, ordered by number asc.
+function getFilteredChapters(
+  allChapters: ChapterData["allChapters"],
+  source: string | null
+): ChapterData["allChapters"] {
+  const src = source ?? allChapters[0]?.source ?? "Unknown";
+  return allChapters
+    .filter((c) => (c.source ?? "Unknown") === src)
+    .reduce<ChapterData["allChapters"]>((acc, c) => {
+      if (!acc.find((x) => x.number === c.number)) acc.push(c);
+      return acc;
+    }, []);
+}
+
+function getEffectivePrev(
+  chapter: ChapterData,
+  selectedSource: string | null
+): { id: string; number: number } | null {
+  const filtered = getFilteredChapters(chapter.allChapters, selectedSource);
+  const idx = filtered.findIndex((c) => c.number === chapter.number);
+  if (idx > 0) return filtered[idx - 1];
+  if (idx === 0) return null;
+  return chapter.prevChapter; // current chapter not in filtered list — fall back
+}
+
+function getEffectiveNext(
+  chapter: ChapterData,
+  selectedSource: string | null
+): { id: string; number: number } | null {
+  const filtered = getFilteredChapters(chapter.allChapters, selectedSource);
+  const idx = filtered.findIndex((c) => c.number === chapter.number);
+  if (idx >= 0 && idx < filtered.length - 1) return filtered[idx + 1];
+  if (idx >= 0) return null;
+  return chapter.nextChapter; // fall back
+}
+
 function ReaderContent({ chapterId }: { chapterId: string }) {
   const { data: session } = useSession();
   const searchParams = useSearchParams();
@@ -385,8 +421,11 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
     const observers: IntersectionObserver[] = [];
 
-    if (topSentinel && chapter.prevChapter) {
-      const prevId = chapter.prevChapter.id;
+    const effPrev = getEffectivePrev(chapter, selectedSource);
+    const effNext = getEffectiveNext(chapter, selectedSource);
+
+    if (topSentinel && effPrev) {
+      const prevId = effPrev.id;
       const obs = new IntersectionObserver(([entry]) => {
         if (entry.isIntersecting && readyForNavRef.current) {
           readyForNavRef.current = false;
@@ -399,14 +438,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
     if (bottomSentinel) {
       const obs = new IntersectionObserver(([entry]) => {
-        // Require nav guard AND minimum 500px of scrolling to prevent
-        // auto-advance when images haven't loaded yet
         if (entry.isIntersecting && readyForNavRef.current && scrollDistanceRef.current > 500) {
           readyForNavRef.current = false;
           saveProgress(chapter.pages.length - 1, true);
-          if (chapter.nextChapter) {
-            router.push(`/read/${chapter.nextChapter.id}`);
-          }
+          if (effNext) router.push(`/read/${effNext.id}`);
         }
       }, { threshold: 0.5 });
       obs.observe(bottomSentinel);
@@ -414,7 +449,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     }
 
     return () => observers.forEach(obs => obs.disconnect());
-  }, [chapter, settings.layout, router, saveProgress]);
+  }, [chapter, settings.layout, router, saveProgress, selectedSource]);
 
   // Page navigation helpers
   const totalPages = chapter?.pages.length || 0;
@@ -434,24 +469,24 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     const nextPage = currentPage + step;
     if (nextPage >= chapter.pages.length) {
       saveProgress(currentPage, true);
-      if (chapter.nextChapter) {
-        router.push(`/read/${chapter.nextChapter.id}`);
-      }
+      const next = getEffectiveNext(chapter, selectedSource);
+      if (next) router.push(`/read/${next.id}`);
     } else {
       goToPage(nextPage);
     }
-  }, [chapter, currentPage, settings.layout, goToPage, router, saveProgress]);
+  }, [chapter, currentPage, settings.layout, goToPage, router, saveProgress, selectedSource]);
 
   const goBack = useCallback(() => {
     if (!chapter) return;
     const step = settings.layout === "double" || settings.layout === "double-manga" ? 2 : 1;
     const newPage = currentPage - step;
-    if (newPage < 0 && chapter.prevChapter) {
-      router.push(`/read/${chapter.prevChapter.id}`);
+    if (newPage < 0) {
+      const prev = getEffectivePrev(chapter, selectedSource);
+      if (prev) router.push(`/read/${prev.id}`);
     } else {
       goToPage(currentPage - step);
     }
-  }, [currentPage, settings.layout, goToPage, chapter, router]);
+  }, [currentPage, settings.layout, goToPage, chapter, router, selectedSource]);
 
   const navigateForward = settings.direction === "rtl" ? goBack : goForward;
   const navigateBack = settings.direction === "rtl" ? goForward : goBack;
@@ -552,12 +587,11 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       : uniqueSources[0] ?? null;
 
   // Deduplicated chapters for active source (one entry per chapter number)
-  const filteredChapters = chapter.allChapters
-    .filter((c) => (c.source ?? "Unknown") === activeSource)
-    .reduce<typeof chapter.allChapters>((acc, c) => {
-      if (!acc.find((x) => x.number === c.number)) acc.push(c);
-      return acc;
-    }, []);
+  const filteredChapters = getFilteredChapters(chapter.allChapters, activeSource);
+
+  // Source-aware prev/next for all navigation in JSX
+  const effectivePrev = getEffectivePrev(chapter, selectedSource);
+  const effectiveNext = getEffectiveNext(chapter, selectedSource);
 
   const bgStyle = { backgroundColor: BG_COLORS[settings.bgColor] };
   const brightnessStyle = settings.brightness !== 100
@@ -593,15 +627,15 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
           <button
             onClick={(e) => {
               e.stopPropagation();
-              if (chapter.prevChapter) {
+              if (effectivePrev) {
                 const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
                 saveProgress(page, false);
-                router.push(`/read/${chapter.prevChapter.id}`);
+                router.push(`/read/${effectivePrev.id}`);
               }
             }}
-            disabled={!chapter.prevChapter}
+            disabled={!effectivePrev}
             className="shrink-0 rounded p-1 text-white/70 hover:text-white disabled:opacity-30"
-            title={chapter.prevChapter ? `Previous chapter (${chapter.prevChapter.number})` : "No previous chapter"}
+            title={effectivePrev ? `Previous chapter (${effectivePrev.number})` : "No previous chapter"}
           >
             <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
@@ -632,15 +666,15 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
           <button
             onClick={(e) => {
               e.stopPropagation();
-              if (chapter.nextChapter) {
+              if (effectiveNext) {
                 const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
                 saveProgress(page, true);
-                router.push(`/read/${chapter.nextChapter.id}`);
+                router.push(`/read/${effectiveNext.id}`);
               }
             }}
-            disabled={!chapter.nextChapter}
+            disabled={!effectiveNext}
             className="shrink-0 rounded p-1 text-white/70 hover:text-white disabled:opacity-30"
-            title={chapter.nextChapter ? `Next chapter (${chapter.nextChapter.number})` : "No next chapter"}
+            title={effectiveNext ? `Next chapter (${effectiveNext.number})` : "No next chapter"}
           >
             <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
@@ -719,8 +753,20 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 <button
                   key={src}
                   onClick={() => {
-                    setSelectedSource(src);
                     setShowSourcePicker(false);
+                    if (src === activeSource) return;
+                    setSelectedSource(src);
+                    // Navigate to the same chapter number in the new source
+                    const sameChapter = chapter.allChapters.find(
+                      (c) => (c.source ?? "Unknown") === src && c.number === chapter.number
+                    );
+                    if (sameChapter && sameChapter.id !== chapter.id) {
+                      const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
+                      saveProgress(page, page >= chapter.pages.length - 1);
+                      router.push(`/read/${sameChapter.id}`);
+                    }
+                    // If no matching chapter in new source, selectedSource is updated
+                    // so subsequent prev/next navigation uses the new source
                   }}
                   className={`w-full rounded-lg px-3 py-2 text-left text-sm transition ${
                     src === activeSource
@@ -955,13 +1001,13 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         {chapter.isEpub ? (
           /* EPUB text reader mode */
           <div className="mx-auto max-w-2xl px-4 py-8">
-            {chapter.prevChapter && (
+            {effectivePrev && (
               <div className="flex items-center justify-center py-6 text-white/40">
-                <Link href={`/read/${chapter.prevChapter.id}`} className="flex flex-col items-center gap-2 hover:text-white/60" onClick={(e) => e.stopPropagation()}>
+                <Link href={`/read/${effectivePrev.id}`} className="flex flex-col items-center gap-2 hover:text-white/60" onClick={(e) => e.stopPropagation()}>
                   <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
                   </svg>
-                  <span className="text-sm">Previous Volume ({chapter.prevChapter.number})</span>
+                  <span className="text-sm">Previous Volume ({effectivePrev.number})</span>
                 </Link>
               </div>
             )}
@@ -982,18 +1028,18 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             )}
 
             <div className="flex items-center justify-center gap-4 py-12">
-              {chapter.prevChapter && (
+              {effectivePrev && (
                 <Link
-                  href={`/read/${chapter.prevChapter.id}`}
+                  href={`/read/${effectivePrev.id}`}
                   className="rounded-lg bg-white/10 px-6 py-3 text-white hover:bg-white/20"
                   onClick={(e) => e.stopPropagation()}
                 >
                   &larr; Previous
                 </Link>
               )}
-              {chapter.nextChapter && (
+              {effectiveNext && (
                 <Link
-                  href={`/read/${chapter.nextChapter.id}`}
+                  href={`/read/${effectiveNext.id}`}
                   className="rounded-lg bg-accent px-6 py-3 text-white hover:bg-accent/80"
                   onClick={(e) => e.stopPropagation()}
                 >
@@ -1004,13 +1050,13 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
           </div>
         ) : settings.layout === "longstrip" ? (
           <div className="mx-auto max-w-3xl">
-            {chapter.prevChapter && (
+            {effectivePrev && (
               <div data-sentinel="prev" className="flex items-center justify-center py-8 text-white/40">
                 <div className="flex flex-col items-center gap-2">
                   <svg className="h-6 w-6 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
                   </svg>
-                  <span className="text-sm">Previous Chapter ({chapter.prevChapter.number})</span>
+                  <span className="text-sm">Previous Chapter ({effectivePrev.number})</span>
                 </div>
               </div>
             )}
@@ -1028,18 +1074,18 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             ))}
 
             <div className="flex items-center justify-center gap-4 py-12">
-              {chapter.prevChapter && (
+              {effectivePrev && (
                 <Link
-                  href={`/read/${chapter.prevChapter.id}`}
+                  href={`/read/${effectivePrev.id}`}
                   className="rounded-lg bg-white/10 px-6 py-3 text-white hover:bg-white/20"
                   onClick={(e) => e.stopPropagation()}
                 >
                   &larr; Previous
                 </Link>
               )}
-              {chapter.nextChapter && (
+              {effectiveNext && (
                 <Link
-                  href={`/read/${chapter.nextChapter.id}`}
+                  href={`/read/${effectiveNext.id}`}
                   className="rounded-lg bg-accent px-6 py-3 text-white hover:bg-accent/80"
                   onClick={(e) => e.stopPropagation()}
                 >
@@ -1048,7 +1094,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               )}
             </div>
 
-            {chapter.nextChapter && (
+            {effectiveNext && (
               <div data-sentinel="next" className="flex items-center justify-center py-8 text-white/40">
                 <div className="flex flex-col items-center gap-2">
                   <span className="text-sm">Loading next chapter...</span>
@@ -1126,9 +1172,9 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                if (chapter.prevChapter) router.push(`/read/${chapter.prevChapter.id}`);
+                if (effectivePrev) router.push(`/read/${effectivePrev.id}`);
               }}
-              disabled={!chapter.prevChapter}
+              disabled={!effectivePrev}
               className="rounded p-1 text-white/60 hover:text-white disabled:opacity-30"
             >
               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1153,9 +1199,9 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                if (chapter.nextChapter) router.push(`/read/${chapter.nextChapter.id}`);
+                if (effectiveNext) router.push(`/read/${effectiveNext.id}`);
               }}
-              disabled={!chapter.nextChapter}
+              disabled={!effectiveNext}
               className="rounded p-1 text-white/60 hover:text-white disabled:opacity-30"
             >
               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
