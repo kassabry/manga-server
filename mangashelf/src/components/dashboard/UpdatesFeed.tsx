@@ -20,6 +20,7 @@ interface Update {
   } | null;
   totalNewChapters: number;
   minNewChapter: number;
+  firstChapterId: string;
 }
 
 export function UpdatesFeed() {
@@ -88,7 +89,7 @@ export function UpdatesFeed() {
         {updates.map((update) => (
           <Link
             key={update.id}
-            href={`/read/${update.id}`}
+            href={`/read/${update.firstChapterId}`}
             className="group flex w-36 shrink-0 flex-col sm:w-40"
           >
             <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-bg-card">

@@ -27,6 +27,7 @@ interface SeriesGroup {
   latestDate: string;
   chapterCount: number;
   chapters: ChapterUpdate[];
+  firstChapterId: string;
 }
 
 export default function UpdatesPage() {
@@ -193,46 +194,50 @@ function SeriesUpdateGroup({
         allRead ? "border-border/50 opacity-60" : "border-border"
       }`}
     >
-      {/* Series header — always visible, clickable to expand */}
-      <button
-        onClick={onToggle}
-        className="flex w-full items-center gap-3 bg-bg-secondary p-3 text-left hover:bg-bg-hover"
-      >
-        {group.series.coverPath ? (
-          <img
-            src={group.series.coverPath}
-            alt=""
-            className="h-14 w-10 rounded object-cover"
-          />
-        ) : (
-          <div className="flex h-14 w-10 items-center justify-center rounded bg-bg-hover text-xs text-text-secondary">
-            ?
+      {/* Series header: left area links to oldest batch chapter; right chevron toggles expand */}
+      <div className="flex w-full items-center bg-bg-secondary hover:bg-bg-hover">
+        <Link
+          href={`/read/${group.firstChapterId}`}
+          className="flex flex-1 items-center gap-3 p-3 text-left"
+        >
+          {group.series.coverPath ? (
+            <img
+              src={group.series.coverPath}
+              alt=""
+              className="h-14 w-10 rounded object-cover"
+            />
+          ) : (
+            <div className="flex h-14 w-10 items-center justify-center rounded bg-bg-hover text-xs text-text-secondary">
+              ?
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <h3 className="truncate text-sm font-semibold">{group.series.title}</h3>
+            <div className="flex items-center gap-2 text-xs text-text-secondary">
+              <span className="rounded bg-bg-primary px-1.5 py-0.5">
+                {group.series.type}
+              </span>
+              <span>{chapterRange}</span>
+              <span>&middot;</span>
+              <span>
+                {group.chapterCount} chapter{group.chapterCount !== 1 ? "s" : ""}
+              </span>
+            </div>
           </div>
-        )}
-        <div className="min-w-0 flex-1">
-          <h3 className="truncate text-sm font-semibold">{group.series.title}</h3>
-          <div className="flex items-center gap-2 text-xs text-text-secondary">
-            <span className="rounded bg-bg-primary px-1.5 py-0.5">
-              {group.series.type}
-            </span>
-            <span>{chapterRange}</span>
-            <span>&middot;</span>
-            <span>
-              {group.chapterCount} chapter{group.chapterCount !== 1 ? "s" : ""}
-            </span>
-          </div>
-        </div>
+        </Link>
 
-        <div className="flex items-center gap-2">
+        <button
+          onClick={onToggle}
+          className="flex items-center gap-2 px-3 py-3 text-text-secondary hover:text-text-primary"
+          aria-label={expanded ? "Collapse" : "Expand"}
+        >
           {unreadChapters.length > 0 && (
             <span className="flex h-5 min-w-[20px] items-center justify-center rounded-full bg-accent px-1.5 text-[10px] font-bold text-white">
               {unreadChapters.length}
             </span>
           )}
           <svg
-            className={`h-4 w-4 text-text-secondary transition-transform ${
-              expanded ? "rotate-180" : ""
-            }`}
+            className={`h-4 w-4 transition-transform ${expanded ? "rotate-180" : ""}`}
             fill="none"
             viewBox="0 0 24 24"
             stroke="currentColor"
@@ -244,8 +249,8 @@ function SeriesUpdateGroup({
               d="M19 9l-7 7-7-7"
             />
           </svg>
-        </div>
-      </button>
+        </button>
+      </div>
 
       {/* Expanded chapter list */}
       {expanded && (
