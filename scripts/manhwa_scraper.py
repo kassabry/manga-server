@@ -566,6 +566,36 @@ class BaseSiteScraper:
         return False
 
     @staticmethod
+    def _is_server_error_page(soup) -> bool:
+        """Detect HTTP 503/429/500 server error pages returned as page content.
+
+        Some sites (and Cloudflare itself) return structured error pages with a
+        5xx/429 status that the browser renders as normal HTML.  Checking the
+        page title is the most reliable cross-site detection method.
+        """
+        title_tag = soup.find('title')
+        if title_tag:
+            title_text = title_tag.get_text(strip=True).lower()
+            error_phrases = (
+                '503', '429', '500', '502', '504',
+                'service unavailable',
+                'service temporarily unavailable',
+                'too many requests',
+                'internal server error',
+                'bad gateway',
+                'gateway timeout',
+                'error 503',
+                'error 429',
+                'origin error',
+            )
+            if any(p in title_text for p in error_phrases):
+                return True
+        # Cloudflare's 1xxx error pages have a distinctive class / div
+        if soup.select_one('.cf-error-type'):
+            return True
+        return False
+
+    @staticmethod
     def _is_cloudflare_challenge(html: str) -> bool:
         """Detect Cloudflare challenge/block pages that aren't real content."""
         markers = [
@@ -3438,18 +3468,46 @@ class DrakeFullScraper(BaseSiteScraper):
         return False
 
     def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
-        """Override to handle Cloudflare wait on non-FlareSolverr path"""
-        if self._use_flaresolverr:
-            return super()._get_soup(url, use_selenium=True)
+        """Override to handle Cloudflare wait on non-FlareSolverr path.
 
-        # Non-ARM path: use Selenium with UC + Cloudflare wait
-        self._delay()
-        self._init_driver()
-        self.driver.get(url)
-        self._wait_for_cloudflare()
-        time.sleep(2)
-        html = self.driver.page_source
-        return BeautifulSoup(html, 'html.parser')
+        Retries up to 3 times with exponential back-off when the server returns
+        a 503 / 429 error page — these are transient rate-limit responses and
+        usually resolve within 30-60 seconds.
+        """
+        max_attempts = 3
+        last_soup = BeautifulSoup("", 'html.parser')
+
+        for attempt in range(max_attempts):
+            if self._use_flaresolverr:
+                soup = super()._get_soup(url, use_selenium=True)
+            else:
+                # Non-ARM path: use Selenium with UC + Cloudflare wait
+                self._delay()
+                self._init_driver()
+                self.driver.get(url)
+                self._wait_for_cloudflare()
+                time.sleep(2)
+                html = self.driver.page_source
+                soup = BeautifulSoup(html, 'html.parser')
+
+            last_soup = soup
+
+            # Retry on transient server errors (503, 429, etc.)
+            if self._is_server_error_page(soup):
+                if attempt < max_attempts - 1:
+                    wait = 30 * (attempt + 1)
+                    logger.warning(
+                        f"Server error page for {url} "
+                        f"(attempt {attempt + 1}/{max_attempts}) — "
+                        f"retrying in {wait}s"
+                    )
+                    time.sleep(wait)
+                    continue
+                else:
+                    logger.warning(f"Server error page persisted after {max_attempts} attempts: {url}")
+            break  # Success (or non-retryable page)
+
+        return last_soup
 
     def _extract_title_from_soup(self, soup) -> str:
         """Drake-specific title extraction.
@@ -4337,6 +4395,26 @@ class ManhuaFastScraper(DrakeFullScraper):
             if not href or '{' in href:
                 return None
             full_url = href if href.startswith('http') else self.BASE_URL + href
+            # Normalize domain aliases: manhuafast.com ↔ manhuafast.net
+            # AJAX responses sometimes include chapter links with the .com domain
+            # even when the scraper is configured for .net (or vice versa).
+            # Normalizing them to BASE_URL prevents these chapters from being
+            # silently discarded by the startswith checks below.
+            try:
+                from urllib.parse import urlparse as _up, urlunparse as _uu
+                _ch = _up(full_url)
+                _base = _up(self.BASE_URL)
+                if _ch.netloc and _ch.netloc != _base.netloc:
+                    # Check if same site name (e.g. manhuafast.com == manhuafast.net)
+                    _ch_site = _ch.netloc.replace('www.', '').rsplit('.', 1)[0].lower()
+                    _base_site = _base.netloc.replace('www.', '').rsplit('.', 1)[0].lower()
+                    if _ch_site == _base_site:
+                        full_url = _uu(_ch._replace(
+                            scheme=_base.scheme,
+                            netloc=_base.netloc,
+                        ))
+            except Exception:
+                pass
             if not full_url.startswith(self.BASE_URL):
                 return None
             # Reject chapters that belong to other series (sidebar widgets)

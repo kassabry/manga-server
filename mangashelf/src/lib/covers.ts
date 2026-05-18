@@ -36,10 +36,38 @@ export function getCoversDir(): string {
   return COVERS_DIR;
 }
 
+/** Normalize a source name to a safe filename component (lowercase, alphanumeric only). */
+export function normalizeSourceForFilename(source: string): string {
+  return source.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Return the filesystem path for a source-specific cover file. */
+export function sourceCoverPath(seriesSlug: string, source: string): string {
+  return join(COVERS_DIR, `${seriesSlug}-${normalizeSourceForFilename(source)}.dat`);
+}
+
+/**
+ * Save image data to both the main cover ({slug}.dat) and an optional
+ * source-specific cover ({slug}-{source}.dat).
+ */
+async function writeCoverData(
+  seriesSlug: string,
+  data: Buffer,
+  source?: string | null
+): Promise<void> {
+  await ensureDir(COVERS_DIR);
+  const mainPath = join(COVERS_DIR, `${seriesSlug}.dat`);
+  await writeFile(mainPath, data);
+  if (source) {
+    await writeFile(sourceCoverPath(seriesSlug, source), data);
+  }
+}
+
 export async function extractCover(
   seriesSlug: string,
   seriesDirPath: string,
-  firstCbzPath?: string
+  firstCbzPath?: string,
+  source?: string | null
 ): Promise<string | null> {
   const coverOutputPath = join(COVERS_DIR, `${seriesSlug}.dat`);
 
@@ -55,7 +83,7 @@ export async function extractCover(
     try {
       await access(coverPath);
       const coverData = await readFile(coverPath);
-      await writeFile(coverOutputPath, coverData);
+      await writeCoverData(seriesSlug, coverData, source);
       return `/api/covers/${seriesSlug}`;
     } catch {
       continue;
@@ -64,6 +92,18 @@ export async function extractCover(
 
   // If cached version exists and no cover.* in series dir, use it
   if (await fileExists(coverOutputPath)) {
+    // Still save the source-specific copy if it doesn't exist yet
+    if (source) {
+      const srcPath = sourceCoverPath(seriesSlug, source);
+      if (!(await fileExists(srcPath))) {
+        try {
+          const existing = await readFile(coverOutputPath);
+          await writeFile(srcPath, existing);
+        } catch {
+          // Non-fatal
+        }
+      }
+    }
     return `/api/covers/${seriesSlug}`;
   }
 
@@ -91,7 +131,7 @@ export async function extractCover(
 
       if (targetFile) {
         const imgData = await zip.file(targetFile)!.async("nodebuffer");
-        await writeFile(coverOutputPath, imgData);
+        await writeCoverData(seriesSlug, imgData, source);
         return `/api/covers/${seriesSlug}`;
       }
     } catch {
@@ -107,12 +147,11 @@ export async function extractCover(
  */
 export async function extractCoverFromBuffer(
   seriesSlug: string,
-  coverData: Buffer
+  coverData: Buffer,
+  source?: string | null
 ): Promise<string | null> {
   try {
-    const coverOutputPath = join(COVERS_DIR, `${seriesSlug}.dat`);
-    await ensureDir(COVERS_DIR);
-    await writeFile(coverOutputPath, coverData);
+    await writeCoverData(seriesSlug, coverData, source);
     return `/api/covers/${seriesSlug}`;
   } catch {
     return null;

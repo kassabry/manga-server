@@ -63,7 +63,8 @@ model Series {
   type           String
   genres         String?
   rating         Float?
-  coverPath      String?
+  coverPath           String?
+  preferredCoverSource String?
   libraryPath    String       @unique
   publisher      String?
   ageRating      String?

@@ -5,6 +5,11 @@ import { useSession } from "next-auth/react";
 import Link from "next/link";
 import { LIST_STATUS_LABELS, type ListStatus } from "@/lib/types";
 
+interface AvailableCover {
+  source: string;
+  url: string;
+}
+
 interface CustomList {
   id: string;
   name: string;
@@ -34,10 +39,12 @@ interface SeriesDetail {
   genres: string | null;
   rating: number | null;
   coverPath: string | null;
+  preferredCoverSource: string | null;
   publisher: string | null;
   ageRating: string | null;
   chapterCount: number;
   chapters: Chapter[];
+  availableCovers: AvailableCover[];
 }
 
 interface ProgressMap {
@@ -65,7 +72,9 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
   const [customLists, setCustomLists] = useState<CustomList[]>([]);
   const [showListsPopover, setShowListsPopover] = useState(false);
   const [newListName, setNewListName] = useState("");
+  const [showCoverPicker, setShowCoverPicker] = useState(false);
   const listsPopoverRef = useRef<HTMLDivElement>(null);
+  const coverPickerRef = useRef<HTMLDivElement>(null);
 
   const uniqueSources = useMemo(() => {
     const sources = new Set<string>();
@@ -149,6 +158,9 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       if (listsPopoverRef.current && !listsPopoverRef.current.contains(e.target as Node)) {
         setShowListsPopover(false);
       }
+      if (coverPickerRef.current && !coverPickerRef.current.contains(e.target as Node)) {
+        setShowCoverPicker(false);
+      }
     }
     document.addEventListener("mousedown", handleOutside);
     document.addEventListener("touchstart", handleOutside, { passive: true });
@@ -221,6 +233,18 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
     }
   }
 
+  async function selectCover(source: string | null) {
+    await fetch(`/api/series/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preferredCoverSource: source }),
+    });
+    // Refresh series data to reflect new cover preference
+    const updated = await fetch(`/api/series/${id}`).then((r) => r.json());
+    setSeries(updated);
+    setShowCoverPicker(false);
+  }
+
   async function updateListStatus(status: string) {
     if (!status) {
       await fetch(`/api/user/list/${id}`, { method: "DELETE" });
@@ -255,17 +279,77 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       <div className="flex flex-col gap-6 sm:flex-row">
         {/* Cover */}
         <div className="w-48 shrink-0">
-          {series.coverPath ? (
-            <img
-              src={series.coverPath}
-              alt={series.title}
-              className="w-full rounded-xl shadow-lg"
-            />
-          ) : (
-            <div className="flex aspect-[2/3] items-center justify-center rounded-xl bg-bg-card text-text-secondary">
-              No Cover
-            </div>
-          )}
+          <div ref={coverPickerRef} className="relative">
+            {series.coverPath ? (
+              <img
+                src={series.coverPath}
+                alt={series.title}
+                className="w-full rounded-xl shadow-lg"
+              />
+            ) : (
+              <div className="flex aspect-[2/3] items-center justify-center rounded-xl bg-bg-card text-text-secondary">
+                No Cover
+              </div>
+            )}
+
+            {/* Cover picker button — only shown when multiple source covers exist */}
+            {session?.user && series.availableCovers.length > 1 && (
+              <button
+                onClick={() => setShowCoverPicker((v) => !v)}
+                className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-lg border border-border bg-bg-secondary/90 px-2 py-1 text-[11px] text-text-secondary backdrop-blur-sm hover:border-accent hover:text-accent"
+                title="Choose cover image"
+              >
+                Choose Cover
+              </button>
+            )}
+
+            {/* Cover picker popover */}
+            {showCoverPicker && (
+              <div className="absolute left-0 top-full z-50 mt-2 w-64 rounded-xl border border-border bg-bg-secondary shadow-xl">
+                <div className="border-b border-border px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary">
+                  Choose Cover Source
+                </div>
+                <div className="grid grid-cols-2 gap-2 p-2">
+                  {series.availableCovers.map((cover) => {
+                    const isActive = series.preferredCoverSource === cover.source;
+                    return (
+                      <button
+                        key={cover.source}
+                        onClick={() => selectCover(isActive ? null : cover.source)}
+                        className={`group relative overflow-hidden rounded-lg border-2 transition-colors ${
+                          isActive ? "border-accent" : "border-transparent hover:border-border"
+                        }`}
+                        title={cover.source}
+                      >
+                        <img
+                          src={cover.url}
+                          alt={cover.source}
+                          className="aspect-[2/3] w-full object-cover"
+                          loading="lazy"
+                        />
+                        <div className={`absolute bottom-0 left-0 right-0 bg-bg-secondary/90 py-1 text-center text-[10px] font-medium backdrop-blur-sm ${
+                          isActive ? "text-accent" : "text-text-secondary"
+                        }`}>
+                          {cover.source}
+                          {isActive && " ✓"}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+                {series.preferredCoverSource && (
+                  <div className="border-t border-border p-2">
+                    <button
+                      onClick={() => selectCover(null)}
+                      className="w-full rounded-lg border border-border px-2 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-accent"
+                    >
+                      Reset to Default
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Info */}

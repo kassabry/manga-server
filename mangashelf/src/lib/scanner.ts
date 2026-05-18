@@ -435,19 +435,19 @@ async function scanSeries(
       // Extract cover from EPUB
       const coverBuffer = await extractEpubCover(firstBookPath);
       if (coverBuffer) {
-        coverPath = await extractCoverFromBuffer(seriesSlug, coverBuffer);
+        coverPath = await extractCoverFromBuffer(seriesSlug, coverBuffer, sourceTag);
       } else {
         // Try directory-level cover files only
-        coverPath = await extractCover(seriesSlug, seriesDirPath);
+        coverPath = await extractCover(seriesSlug, seriesDirPath, undefined, sourceTag);
       }
     } else {
-      coverPath = await extractCover(seriesSlug, seriesDirPath, firstBookPath);
+      coverPath = await extractCover(seriesSlug, seriesDirPath, firstBookPath, sourceTag);
     }
   } else if (!firstIsEpub) {
     // Even without new chapters, check if a directory-level cover was added or updated.
     // Omitting firstCbzPath avoids expensive CBZ extraction; extractCover handles
     // the mtime comparison so this is a no-op when the cache is already current.
-    const dirCover = await extractCover(seriesSlug, seriesDirPath);
+    const dirCover = await extractCover(seriesSlug, seriesDirPath, undefined, sourceTag);
     if (dirCover) coverPath = dirCover;
   }
 
