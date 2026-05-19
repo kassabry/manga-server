@@ -158,6 +158,9 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   // Longstrip initial-scroll guard: only scroll to initialPage once per chapter load
   const scrolledToInitialRef = useRef(false);
 
+  // EPUB / longstrip bottom sentinel ref — fires chapter completion when scrolled into view
+  const bottomCompleteRef = useRef<HTMLDivElement>(null);
+
   // Load settings from localStorage first, then override from server
   useEffect(() => {
     const local = loadReaderSettings();
@@ -450,6 +453,31 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
     return () => observers.forEach(obs => obs.disconnect());
   }, [chapter, settings.layout, router, saveProgress, selectedSource]);
+
+  // Bottom-sentinel completion: fires saveProgress(completed=true) when the reader bottom
+  // scrolls into view. Covers:
+  //   • Longstrip last chapter (no data-sentinel="next" rendered, so sentinel above never fires)
+  //   • EPUB (currentPage stays 0 regardless of how many sections exist)
+  useEffect(() => {
+    if (!chapter || !bottomCompleteRef.current) return;
+    // Only needed for layouts where the page-change debounce can't detect "last page"
+    if (settings.layout !== "longstrip" && !chapter.isEpub) return;
+    const el = bottomCompleteRef.current;
+    let fired = false;
+    const obs = new IntersectionObserver(
+      ([entry]) => {
+        if (entry.isIntersecting && !fired) {
+          // Longstrip: also require the user has actually scrolled (not just loaded a short chapter)
+          if (settings.layout === "longstrip" && scrollDistanceRef.current < 200) return;
+          fired = true;
+          saveProgress(chapter.pages.length - 1, true);
+        }
+      },
+      { threshold: 0.5 }
+    );
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [chapter, settings.layout, saveProgress]);
 
   // Page navigation helpers
   const totalPages = chapter?.pages.length || 0;
@@ -1027,7 +1055,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               </div>
             )}
 
-            <div className="flex items-center justify-center gap-4 py-12">
+            <div ref={bottomCompleteRef} className="flex items-center justify-center gap-4 py-12">
               {effectivePrev && (
                 <Link
                   href={`/read/${effectivePrev.id}`}
@@ -1078,6 +1106,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 data-page-index={page.index}
               />
             ))}
+
+            {/* Always-present sentinel — fires completion when user scrolls to bottom,
+                even when there is no next chapter (effectiveNext === null) */}
+            <div ref={bottomCompleteRef} className="h-px" />
 
             <div className="flex items-center justify-center gap-4 py-12">
               {effectivePrev && (
