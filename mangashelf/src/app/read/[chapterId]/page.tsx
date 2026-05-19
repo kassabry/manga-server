@@ -1032,7 +1032,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 <Link
                   href={`/read/${effectivePrev.id}`}
                   className="rounded-lg bg-white/10 px-6 py-3 text-white hover:bg-white/20"
-                  onClick={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    saveProgress(currentPage, currentPage >= chapter.pages.length - 1);
+                  }}
                 >
                   &larr; Previous
                 </Link>
@@ -1041,7 +1044,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 <Link
                   href={`/read/${effectiveNext.id}`}
                   className="rounded-lg bg-accent px-6 py-3 text-white hover:bg-accent/80"
-                  onClick={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    saveProgress(chapter.pages.length - 1, true);
+                  }}
                 >
                   Next &rarr;
                 </Link>
@@ -1078,7 +1084,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 <Link
                   href={`/read/${effectivePrev.id}`}
                   className="rounded-lg bg-white/10 px-6 py-3 text-white hover:bg-white/20"
-                  onClick={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    saveProgress(currentPage, currentPage >= chapter.pages.length - 1);
+                  }}
                 >
                   &larr; Previous
                 </Link>
@@ -1087,7 +1096,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 <Link
                   href={`/read/${effectiveNext.id}`}
                   className="rounded-lg bg-accent px-6 py-3 text-white hover:bg-accent/80"
-                  onClick={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    saveProgress(chapter.pages.length - 1, true);
+                  }}
                 >
                   Next &rarr;
                 </Link>
@@ -1172,7 +1184,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                if (effectivePrev) router.push(`/read/${effectivePrev.id}`);
+                if (effectivePrev) {
+                  saveProgress(currentPage, currentPage >= chapter.pages.length - 1);
+                  router.push(`/read/${effectivePrev.id}`);
+                }
               }}
               disabled={!effectivePrev}
               className="rounded p-1 text-white/60 hover:text-white disabled:opacity-30"
@@ -1199,7 +1214,12 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                if (effectiveNext) router.push(`/read/${effectiveNext.id}`);
+                if (effectiveNext) {
+                  // Navigating forward from the bottom bar always means the current
+                  // chapter is done — mark it complete regardless of page position.
+                  saveProgress(chapter.pages.length - 1, true);
+                  router.push(`/read/${effectiveNext.id}`);
+                }
               }}
               disabled={!effectiveNext}
               className="rounded p-1 text-white/60 hover:text-white disabled:opacity-30"
