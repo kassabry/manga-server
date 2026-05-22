@@ -454,30 +454,46 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     return () => observers.forEach(obs => obs.disconnect());
   }, [chapter, settings.layout, router, saveProgress, selectedSource]);
 
-  // Bottom-sentinel completion: fires saveProgress(completed=true) when the reader bottom
-  // scrolls into view. Covers:
-  //   • Longstrip last chapter (no data-sentinel="next" rendered, so sentinel above never fires)
-  //   • EPUB (currentPage stays 0 regardless of how many sections exist)
+  // Longstrip scroll-to-bottom completion: fires once the user scrolls within 100px
+  // of the container bottom. Uses scroll events rather than IntersectionObserver so
+  // it works reliably in an overflow-auto container regardless of element height.
   useEffect(() => {
-    if (!chapter || !bottomCompleteRef.current) return;
-    // Only needed for layouts where the page-change debounce can't detect "last page"
-    if (settings.layout !== "longstrip" && !chapter.isEpub) return;
+    if (!chapter || settings.layout !== "longstrip") return;
+    const container = containerRef.current;
+    if (!container) return;
+    let fired = false;
+    const check = () => {
+      if (fired) return;
+      // readyForNavRef becomes true after 2s + first scroll, preventing immediate trigger on load
+      if (!readyForNavRef.current) return;
+      const { scrollTop, clientHeight, scrollHeight } = container;
+      if (scrollTop + clientHeight >= scrollHeight - 100) {
+        fired = true;
+        saveProgress(chapter.pages.length - 1, true);
+      }
+    };
+    container.addEventListener("scroll", check, { passive: true });
+    return () => container.removeEventListener("scroll", check);
+  }, [chapter, settings.layout, saveProgress]);
+
+  // EPUB bottom completion: IntersectionObserver on the bottom nav div.
+  // threshold: 0 fires as soon as any pixel of it enters the viewport.
+  useEffect(() => {
+    if (!chapter?.isEpub || !bottomCompleteRef.current) return;
     const el = bottomCompleteRef.current;
     let fired = false;
     const obs = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting && !fired) {
-          // Longstrip: also require the user has actually scrolled (not just loaded a short chapter)
-          if (settings.layout === "longstrip" && scrollDistanceRef.current < 200) return;
           fired = true;
           saveProgress(chapter.pages.length - 1, true);
         }
       },
-      { threshold: 0.5 }
+      { threshold: 0 }
     );
     obs.observe(el);
     return () => obs.disconnect();
-  }, [chapter, settings.layout, saveProgress]);
+  }, [chapter, saveProgress]);
 
   // Page navigation helpers
   const totalPages = chapter?.pages.length || 0;
@@ -1107,10 +1123,6 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               />
             ))}
 
-            {/* Always-present sentinel — fires completion when user scrolls to bottom,
-                even when there is no next chapter (effectiveNext === null) */}
-            <div ref={bottomCompleteRef} className="h-px" />
-
             <div className="flex items-center justify-center gap-4 py-12">
               {effectivePrev && (
                 <Link
@@ -1124,7 +1136,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                   &larr; Previous
                 </Link>
               )}
-              {effectiveNext && (
+              {effectiveNext ? (
                 <Link
                   href={`/read/${effectiveNext.id}`}
                   className="rounded-lg bg-accent px-6 py-3 text-white hover:bg-accent/80"
@@ -1135,6 +1147,17 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
                 >
                   Next &rarr;
                 </Link>
+              ) : (
+                <button
+                  className="rounded-lg bg-accent px-6 py-3 text-white hover:bg-accent/80"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    await saveProgress(chapter.pages.length - 1, true);
+                    router.push("/");
+                  }}
+                >
+                  ✓ Done — Back to Home
+                </button>
               )}
             </div>
 
