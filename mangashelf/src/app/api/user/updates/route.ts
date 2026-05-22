@@ -31,6 +31,32 @@ export async function GET(request: NextRequest) {
     (min, f) => (f.createdAt < min ? f.createdAt : min),
     follows[0].createdAt
   );
+  const latestFollow = follows.reduce(
+    (max, f) => (f.createdAt > max ? f.createdAt : max),
+    follows[0].createdAt
+  );
+
+  // Build per-series sets of chapter numbers that already existed at follow time.
+  // A number is "pre-existing" if ANY source had that chapter in the DB at or before
+  // the user's follow date for that series. This prevents a newly-added source from
+  // surfacing backlog chapters as "new" when those chapter numbers were already present.
+  const preFollowRows = await prisma.chapter.findMany({
+    where: {
+      seriesId: { in: seriesIds },
+      // Upper-bound by the latest follow date to avoid fetching the entire chapter history.
+      // Per-series filtering against the correct followedAt is done in the loop below.
+      createdAt: { lte: latestFollow },
+    },
+    select: { seriesId: true, number: true, createdAt: true },
+  });
+
+  const preFollowNums = new Map<string, Set<number>>();
+  for (const row of preFollowRows) {
+    const followedAt = followedAtMap.get(row.seriesId);
+    if (!followedAt || new Date(row.createdAt) > followedAt) continue;
+    if (!preFollowNums.has(row.seriesId)) preFollowNums.set(row.seriesId, new Set());
+    preFollowNums.get(row.seriesId)!.add(row.number);
+  }
 
   // Fetch all post-follow chapters for followed series, oldest first.
   // Ascending order ensures dedup by chapter number keeps the first-uploaded copy
@@ -65,7 +91,12 @@ export async function GET(request: NextRequest) {
   for (const ch of chapters) {
     const followedAt = followedAtMap.get(ch.seriesId);
     // Skip chapters that existed before the user followed this series
-    if (!followedAt || ch.createdAt <= followedAt) continue;
+    if (!followedAt || new Date(ch.createdAt) <= followedAt) continue;
+
+    // Skip chapter numbers that already existed at follow time (from any source).
+    // This stops a re-added or newly-added source from flooding "New from Followed"
+    // with backlog chapters the user already knew about.
+    if (preFollowNums.get(ch.seriesId)?.has(ch.number)) continue;
 
     const chDate = new Date(ch.createdAt);
     const chDateStr = toUTCDateStr(chDate);
