@@ -16,9 +16,9 @@ interface SeriesData {
   type: string;
   status: string | null;
   chapterCount: number;
+  displayChapterCount?: number | null;
   updatedAt?: string;
   lastChapterAt?: string;
-  latestChapterNumber?: number | null;
 }
 
 export default function HomePage() {
@@ -146,8 +146,8 @@ export default function HomePage() {
                   <div className="bg-gradient-to-t from-black/80 to-transparent px-2 pb-1.5 pt-4">
                     <div className="flex items-center justify-between text-[10px] text-white/90">
                       <span>
-                        {s.latestChapterNumber != null
-                          ? `Ch. ${s.latestChapterNumber}`
+                        {s.displayChapterCount != null
+                          ? `${s.displayChapterCount} ch`
                           : `${s.chapterCount} ch`}
                       </span>
                       {s.lastChapterAt && (
