@@ -149,8 +149,9 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       });
 
     fetch("/api/user/custom-lists")
-      .then((r) => r.json())
-      .then((d) => Array.isArray(d) && setCustomLists(d));
+      .then((r) => r.ok ? r.json() : [])
+      .then((d) => Array.isArray(d) && setCustomLists(d))
+      .catch(() => {});
   }, [session, id]);
 
   useEffect(() => {
@@ -208,7 +209,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       });
     }
     // Refresh lists
-    const updated = await fetch("/api/user/custom-lists").then((r) => r.json());
+    const updated = await fetch("/api/user/custom-lists").then((r) => r.ok ? r.json() : []).catch(() => []);
     if (Array.isArray(updated)) setCustomLists(updated);
   }
 
@@ -227,7 +228,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ seriesId: id }),
       });
-      const updated = await fetch("/api/user/custom-lists").then((r) => r.json());
+      const updated = await fetch("/api/user/custom-lists").then((r) => r.ok ? r.json() : []).catch(() => []);
       if (Array.isArray(updated)) setCustomLists(updated);
       setNewListName("");
     }

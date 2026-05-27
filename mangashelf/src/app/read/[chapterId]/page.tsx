@@ -126,6 +126,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   const initialPage = parseInt(searchParams.get("page") || "0");
 
   const [chapter, setChapter] = useState<ChapterData | null>(null);
+  const [chapterError, setChapterError] = useState<{ status: number; message: string } | null>(null);
   const [currentPage, setCurrentPage] = useState(initialPage);
   const [settings, setSettings] = useState<ReaderSettings>(DEFAULT_SETTINGS);
   const [showToolbar, setShowToolbar] = useState(true);
@@ -187,7 +188,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     }
   }, [session]);
 
-  // Fetch chapter data
+  // Fetch chapter data — also re-runs when reloadKey increments (Retry button)
   useEffect(() => {
     // Reset nav guard and initial-scroll flag on chapter change
     readyForNavRef.current = false;
@@ -195,9 +196,21 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     scrollDistanceRef.current = 0;
     scrolledToInitialRef.current = false;
 
+    setChapterError(null);
     fetch(`/api/chapters/${chapterId}`)
-      .then((r) => r.json())
+      .then(async (r) => {
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}));
+          setChapterError({
+            status: r.status,
+            message: body.error || `Failed to load chapter (HTTP ${r.status})`,
+          });
+          return null;
+        }
+        return r.json();
+      })
       .then((data) => {
+        if (!data) return; // error already handled above
         setChapter(data);
         setSelectedSource((prev) => prev ?? data.source ?? null);
         const startPage = data.pages?.[0]?.name?.toLowerCase().includes("cover")
@@ -233,7 +246,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
           }, 1000);
         }, 2000);
       });
-  }, [chapterId, initialPage]);
+  }, [chapterId, initialPage, reloadKey]);
 
   // Fetch EPUB HTML content when chapter is EPUB (re-runs when reloadKey increments)
   useEffect(() => {
@@ -649,6 +662,46 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       setShowChapterPicker(false);
       setShowSourcePicker(false);
     }
+  }
+
+  if (chapterError) {
+    const isMissing = chapterError.status === 410;
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-5 bg-black px-4 text-center">
+        <svg className="h-12 w-12 text-text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+        </svg>
+        <div>
+          <p className="text-lg font-semibold text-white">
+            {isMissing ? "Chapter file not found" : "Failed to load chapter"}
+          </p>
+          <p className="mt-1 max-w-sm text-sm text-text-secondary">
+            {isMissing
+              ? "The chapter file is missing from disk. Try rescanning the library, or the file may have been deleted."
+              : chapterError.message}
+          </p>
+        </div>
+        <div className="flex gap-3">
+          <button
+            onClick={() => router.back()}
+            className="rounded-lg bg-bg-card px-4 py-2 text-sm text-text-primary hover:bg-bg-hover"
+          >
+            ← Go back
+          </button>
+          <button
+            onClick={() => {
+              setChapterError(null);
+              setChapter(null);
+              // Re-trigger the fetch by incrementing reloadKey
+              setReloadKey((k) => k + 1);
+            }}
+            className="rounded-lg bg-accent px-4 py-2 text-sm text-white hover:bg-accent/80"
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
   }
 
   if (!chapter) {
