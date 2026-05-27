@@ -137,14 +137,29 @@ export async function GET(request: NextRequest) {
   };
   const batchData: BatchEntry[] = [];
 
+  // When a series is re-imported (e.g. directory renamed, scanner wipes and recreates
+  // chapters), all chapters get fresh createdAt timestamps that are > followedAt, and
+  // preFollowNums is empty because the old records no longer exist. Every chapter then
+  // passes the filters and floods the feed.  Cap each series' visible batch to the
+  // MAX_BATCH_PER_SERIES highest-numbered chapters so a flood shows at most a handful
+  // of entries rather than the entire back-catalogue, while single genuine releases
+  // are completely unaffected.
+  const MAX_BATCH_PER_SERIES = 5;
+
   for (const entry of seriesMap.values()) {
     // Each chapter is included only if its date matches its own source's latest date
-    const batchChapters = Array.from(entry.byNumber.values()).filter((ch) => {
+    const dateBatch = Array.from(entry.byNumber.values()).filter((ch) => {
       const srcKey = ch.source ?? "__none__";
       const srcLatest = entry.latestDateBySource.get(srcKey);
       return srcLatest && toUTCDateStr(new Date(ch.createdAt)) === srcLatest.dateStr;
     });
-    if (batchChapters.length === 0) continue;
+    if (dateBatch.length === 0) continue;
+
+    // Apply flood cap: keep only the highest-numbered chapters.
+    // Sort descending by chapter number, take the first MAX_BATCH_PER_SERIES.
+    const batchChapters = dateBatch.length > MAX_BATCH_PER_SERIES
+      ? [...dateBatch].sort((a, b) => b.number - a.number).slice(0, MAX_BATCH_PER_SERIES)
+      : dateBatch;
 
     // For display/sorting: use the latest date across all sources for this series
     const latestDate = Array.from(entry.latestDateBySource.values()).reduce(
