@@ -4012,6 +4012,83 @@ class DrakeFullScraper(BaseSiteScraper):
         return False
 
 
+def _align_manhuafast_chapter_numbers(
+    chapters: List['Chapter'], existing_cbzs: set, series_title: str
+) -> List['Chapter']:
+    """Renumber ManhuaFast chapters that use raw Chinese numbering.
+
+    ManhuaFast publishes chapters with the original Chinese source numbers
+    (e.g. Ch.531, Ch.904) rather than English translation numbers (Ch.1–Ch.146).
+    When the series already has chapters from other sources with sequential English
+    numbers, the ManhuaFast numbers produce massive gaps in the chapter list and
+    flood "New from Followed" with phantom entries.
+
+    Detection: if the existing series has chapters up to number N, and the incoming
+    ManhuaFast chapters are mostly greater than N * 2 (and N >= 10 to avoid
+    false-positives on new series), we renumber the out-of-range chapters
+    sequentially starting from N+1, preserving their relative order.
+    """
+    if not chapters or not existing_cbzs:
+        return chapters
+
+    # Parse existing chapter numbers from CBZ filenames
+    # Expected format: "{Series Title} - Chapter {number}.cbz"
+    existing_nums: set = set()
+    for name in existing_cbzs:
+        m = re.search(r' - Chapter (\d+(?:\.\d+)?)\.cbz$', name, re.IGNORECASE)
+        if m:
+            try:
+                existing_nums.add(float(m.group(1)))
+            except ValueError:
+                pass
+
+    if not existing_nums:
+        return chapters
+
+    max_existing = max(existing_nums)
+    if max_existing < 10:
+        # Too short a series to reliably detect numbering mismatch
+        return chapters
+
+    threshold = max_existing + 10  # allow a small grace window beyond max
+
+    # Count how many incoming chapters are beyond the threshold
+    out_of_range = [ch for ch in chapters if float(ch.number) > threshold]
+    if len(out_of_range) < len(chapters) * 0.5:
+        # Fewer than half out-of-range — probably legitimate chapter numbers
+        return chapters
+
+    logger.info(
+        f"[ManhuaFast] Detected numbering mismatch for '{series_title}': "
+        f"max existing={max_existing:.0f}, "
+        f"{len(out_of_range)}/{len(chapters)} incoming chapters out of range. "
+        f"Renumbering sequentially from {max_existing+1:.0f}."
+    )
+
+    # Sort all chapters by raw number to preserve their original relative order
+    sorted_chapters = sorted(chapters, key=lambda c: float(c.number))
+
+    # Keep in-range chapters as-is; renumber out-of-range ones sequentially
+    in_range = [ch for ch in sorted_chapters if float(ch.number) <= threshold]
+    to_renumber = [ch for ch in sorted_chapters if float(ch.number) > threshold]
+
+    used_nums = existing_nums | {float(c.number) for c in in_range}
+    next_num = max_existing + 1.0
+
+    for ch in to_renumber:
+        while next_num in used_nums:
+            next_num += 1.0
+        new_num_str = str(int(next_num)) if next_num == int(next_num) else str(next_num)
+        logger.debug(
+            f"[ManhuaFast] Renumber Ch.{ch.number} -> Ch.{new_num_str}"
+        )
+        ch.number = new_num_str
+        used_nums.add(next_num)
+        next_num += 1.0
+
+    return in_range + to_renumber
+
+
 class ManhuaFastScraper(DrakeFullScraper):
     """Full site scraper for manhuafast.net (Madara/WP-manga theme).
 
@@ -5477,6 +5554,14 @@ Examples:
                 # Scan the series directory once so per-chapter checks are O(1)
                 # set lookups instead of individual stat() calls on the NFS mount.
                 existing_cbzs = scraper._scan_series_dir(display_title, output_path)
+
+                # ManhuaFast uses raw Chinese chapter numbers that can be 3-6×
+                # higher than the English translation numbers used by other sources.
+                # Detect the mismatch and renumber out-of-range chapters sequentially.
+                if isinstance(scraper, ManhuaFastScraper):
+                    chapters = _align_manhuafast_chapter_numbers(
+                        chapters, existing_cbzs, display_title
+                    )
 
                 # Backfill missing cover — do this before the chapter loop so
                 # it runs even when every chapter is already in the tracker
