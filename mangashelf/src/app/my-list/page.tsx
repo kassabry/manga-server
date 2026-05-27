@@ -13,6 +13,17 @@ interface CustomListSummary {
   updatedAt: string;
 }
 
+interface SeriesSummary {
+  id: string;
+  title: string;
+  slug: string;
+  type: string;
+  coverPath: string | null;
+  chapterCount: number;
+  displayChapterCount?: number | null;
+  status: string | null;
+}
+
 interface CustomListDetail {
   id: string;
   name: string;
@@ -20,15 +31,7 @@ interface CustomListDetail {
     id: string;
     seriesId: string;
     addedAt: string;
-    series: {
-      id: string;
-      title: string;
-      slug: string;
-      type: string;
-      coverPath: string | null;
-      chapterCount: number;
-      status: string | null;
-    };
+    series: SeriesSummary;
   }[];
 }
 
@@ -37,28 +40,12 @@ interface ListEntryData {
   status: string;
   rating: number | null;
   updatedAt: string;
-  series: {
-    id: string;
-    title: string;
-    slug: string;
-    type: string;
-    coverPath: string | null;
-    chapterCount: number;
-    status: string | null;
-  };
+  series: SeriesSummary;
 }
 
 interface FollowEntry {
   seriesId: string;
-  series: {
-    id: string;
-    title: string;
-    slug: string;
-    type: string;
-    coverPath: string | null;
-    chapterCount: number;
-    status: string | null;
-  };
+  series: SeriesSummary;
 }
 
 interface ProgressInfo {
@@ -121,13 +108,19 @@ export default function MyListPage() {
       const progressPromises = merged.map(async (entry: ListEntryData) => {
         const pRes = await fetch(`/api/user/progress/${entry.series.id}`);
         const pData = await pRes.json();
-        const completed = (pData.progress || []).filter(
-          (p: { completed: boolean }) => p.completed
-        ).length;
+        // Count distinct completed chapter NUMBERS (not total records) so that
+        // duplicate chapters across sources don't inflate the "read" count.
+        const completedNums = new Set(
+          (pData.progress || [])
+            .filter((p: { completed: boolean }) => p.completed)
+            .map((p: { chapter: { number: number } }) => p.chapter.number)
+        );
+        const displayTotal =
+          entry.series.displayChapterCount ?? entry.series.chapterCount;
         return {
           seriesId: entry.series.id,
-          chaptersRead: completed,
-          totalChapters: entry.series.chapterCount,
+          chaptersRead: completedNums.size,
+          totalChapters: displayTotal,
         };
       });
 
@@ -421,7 +414,7 @@ export default function MyListPage() {
                         <div className="min-w-0">
                           <h3 className="font-medium truncate">{entry.series.title}</h3>
                           <div className="mt-1 text-xs text-text-secondary">
-                            {entry.series.type} &middot; {entry.series.chapterCount} chapters
+                            {entry.series.type} &middot; {entry.series.displayChapterCount ?? entry.series.chapterCount} chapters
                           </div>
                         </div>
                       </Link>
@@ -507,7 +500,7 @@ export default function MyListPage() {
                     <div className="mt-1 flex items-center gap-2 text-xs text-text-secondary">
                       <span>{entry.series.type}</span>
                       <span>&middot;</span>
-                      <span>{entry.series.chapterCount} chapters</span>
+                      <span>{entry.series.displayChapterCount ?? entry.series.chapterCount} chapters</span>
                       {entry.series.status && (
                         <>
                           <span>&middot;</span>

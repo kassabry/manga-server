@@ -1,9 +1,18 @@
 import { readdir, stat } from "fs/promises";
 import { join, resolve } from "path";
+import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 import { extractComicInfo, getPageCount } from "./cbz";
 import { extractEpubMetadata, getEpubPageCount, extractEpubCover } from "./epub";
 import { extractCover, extractCoverFromBuffer } from "./covers";
+
+/** Count distinct chapter numbers for a series (ignores duplicate chapters across sources). */
+async function countDistinctChapters(seriesId: string): Promise<number> {
+  const rows = await prisma.$queryRaw<{ cnt: bigint }[]>(
+    Prisma.sql`SELECT COUNT(DISTINCT number) AS cnt FROM "Chapter" WHERE seriesId = ${seriesId}`
+  );
+  return Number(rows[0]?.cnt ?? 0);
+}
 
 function slugify(text: string): string {
   return text
@@ -247,7 +256,7 @@ async function repairCrossTypeChapterCounts(): Promise<void> {
       // Recount all affected series (including the LN series itself)
       const affectedIds = [...new Set([ln.id, ...stray.map((c) => c.seriesId)])];
       for (const sid of affectedIds) {
-        const count = await prisma.chapter.count({ where: { seriesId: sid } });
+        const count = await countDistinctChapters(sid);
         await prisma.series.update({
           where: { id: sid },
           data: { chapterCount: count },
@@ -580,7 +589,7 @@ async function scanSeries(
       // Recount chapters for every series that just lost some chapters
       const affectedSeriesIds = [...new Set(strayChapters.map((c) => c.seriesId))];
       for (const sid of affectedSeriesIds) {
-        const newCount = await prisma.chapter.count({ where: { seriesId: sid } });
+        const newCount = await countDistinctChapters(sid);
         await prisma.series.update({
           where: { id: sid },
           data: { chapterCount: newCount },
@@ -716,11 +725,12 @@ async function scanSeries(
     });
   }
 
-  // Update chapterCount to reflect total chapters across ALL source directories
+  // Update chapterCount to reflect distinct chapter numbers across ALL source
+  // directories. Using COUNT(DISTINCT number) rather than COUNT(*) prevents
+  // multi-source series from showing inflated chapter counts (e.g. source A
+  // ch1-100 + source B ch1-80 → 100 unique chapters, not 180 total records).
   if (seriesChaptersAdded > 0 || staleChapters.length > 0) {
-    const totalChapters = await prisma.chapter.count({
-      where: { seriesId: series.id },
-    });
+    const totalChapters = await countDistinctChapters(series.id);
     await prisma.series.update({
       where: { id: series.id },
       data: {

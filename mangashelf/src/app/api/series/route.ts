@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/db";
 
 export async function GET(request: NextRequest) {
@@ -118,28 +119,31 @@ export async function GET(request: NextRequest) {
         publisher: true,
         updatedAt: true,
         lastChapterAt: true,
-        chapters: {
-          orderBy: { number: "desc" },
-          take: 1,
-          select: { number: true },
-        },
       },
     }),
     prisma.series.count({ where }),
   ]);
 
-  // Flatten latest chapter number into each series object
-  const seriesWithLatest = series.map((s) => {
-    const { chapters, ...rest } = s;
-    return {
-      ...rest,
-      latestChapterNumber: chapters[0]?.number ?? null,
-    };
-  });
+  // Compute count of distinct chapter numbers per series so multi-source
+  // series don't show inflated counts (e.g. source A ch1-146 + ManhuaFast
+  // ch531-904 should show 520 unique chapters, not 520+146=666 total records).
+  let displayCountMap = new Map<string, number>();
+  if (series.length > 0) {
+    const ids = series.map((s) => s.id);
+    const rows = await prisma.$queryRaw<{ seriesId: string; cnt: bigint }[]>(
+      Prisma.sql`SELECT seriesId, COUNT(DISTINCT number) AS cnt FROM "Chapter" WHERE seriesId IN (${Prisma.join(ids)}) GROUP BY seriesId`
+    );
+    displayCountMap = new Map(rows.map((r) => [r.seriesId, Number(r.cnt)]));
+  }
+
+  const seriesWithDisplay = series.map((s) => ({
+    ...s,
+    displayChapterCount: displayCountMap.get(s.id) ?? s.chapterCount,
+  }));
 
   return NextResponse.json(
     {
-      series: seriesWithLatest,
+      series: seriesWithDisplay,
       total,
       page,
       totalPages: Math.ceil(total / limit),

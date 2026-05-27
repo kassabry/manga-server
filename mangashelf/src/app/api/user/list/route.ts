@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
+
+/** Compute distinct chapter counts for a set of series in one query. */
+async function getDisplayCounts(seriesIds: string[]): Promise<Map<string, number>> {
+  if (seriesIds.length === 0) return new Map();
+  const rows = await prisma.$queryRaw<{ seriesId: string; cnt: bigint }[]>(
+    Prisma.sql`SELECT seriesId, COUNT(DISTINCT number) AS cnt FROM "Chapter" WHERE seriesId IN (${Prisma.join(seriesIds)}) GROUP BY seriesId`
+  );
+  return new Map(rows.map((r) => [r.seriesId, Number(r.cnt)]));
+}
 
 export async function GET(request: NextRequest) {
   const session = await auth();
@@ -68,7 +78,16 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    return NextResponse.json(result);
+    const displayMap = await getDisplayCounts(result.map((e) => e.series.id));
+    return NextResponse.json(
+      result.map((e) => ({
+        ...e,
+        series: {
+          ...e.series,
+          displayChapterCount: displayMap.get(e.series.id) ?? e.series.chapterCount,
+        },
+      }))
+    );
   }
 
   const where: Record<string, unknown> = { userId: session.user.id };
@@ -87,7 +106,16 @@ export async function GET(request: NextRequest) {
     orderBy: { updatedAt: "desc" },
   });
 
-  return NextResponse.json(entries);
+  const displayMap = await getDisplayCounts(entries.map((e) => e.series.id));
+  return NextResponse.json(
+    entries.map((e) => ({
+      ...e,
+      series: {
+        ...e.series,
+        displayChapterCount: displayMap.get(e.series.id) ?? e.series.chapterCount,
+      },
+    }))
+  );
 }
 
 export async function PUT(request: NextRequest) {

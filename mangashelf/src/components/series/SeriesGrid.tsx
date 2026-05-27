@@ -9,7 +9,7 @@ interface SeriesData {
   type: string;
   status: string | null;
   chapterCount: number;
-  latestChapterNumber?: number | null;
+  displayChapterCount?: number | null;
 }
 
 interface SeriesGridProps {
