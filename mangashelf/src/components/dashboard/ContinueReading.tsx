@@ -26,12 +26,21 @@ export function ContinueReading({ columns = 6 }: { columns?: number }) {
         for (const entry of entries.slice(0, 20)) {
           const res = await fetch(`/api/user/progress/${entry.series.id}`);
           const data = await res.json();
-          const latest = data.progress?.sort(
-            (a: { readAt: string }, b: { readAt: string }) =>
-              new Date(b.readAt).getTime() - new Date(a.readAt).getTime()
-          )[0];
+          // Find the most recently read chapter that is still in-progress.
+        // Previously we found the most-recently-touched chapter and then
+        // checked completed — but that hides the series whenever any completed
+        // chapter was touched more recently (e.g. just after finishing ch99,
+        // ch100 not started yet, or if a false completion fired from a short
+        // chapter). Filtering to incomplete-only first is more correct.
+        const incomplete = (data.progress ?? []).filter(
+          (p: { completed: boolean }) => !p.completed
+        );
+        const latest = incomplete.sort(
+          (a: { readAt: string }, b: { readAt: string }) =>
+            new Date(b.readAt).getTime() - new Date(a.readAt).getTime()
+        )[0];
 
-          if (latest && !latest.completed) {
+          if (latest) {
             continueItems.push({
               chapterId: latest.chapterId,
               chapterNumber: latest.chapter.number,

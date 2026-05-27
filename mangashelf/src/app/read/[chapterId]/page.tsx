@@ -349,19 +349,50 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   useEffect(() => {
     if (!chapter) return;
     const timer = setTimeout(() => {
-      const isLast = currentPage >= chapter.pages.length - 1;
+      // Guard: never treat a chapter with 0 or 1 pages as trivially "complete"
+      // (pages.length=0 → last=-1, any page≥-1 is always true;
+      //  pages.length=1 → last=0, page 0 is always ≥ 0)
+      const safeLastPage = Math.max(chapter.pages.length - 1, 1);
+      let isLast: boolean;
+      if (settings.layout === "longstrip") {
+        // For longstrip use scroll geometry, not visible-image index.
+        // currentPage becomes pages.length-1 as soon as the last image is
+        // the most-visible one — which can happen before the user is actually
+        // done reading. Scroll position is the correct signal.
+        const container = containerRef.current;
+        isLast = container
+          ? container.scrollTop + container.clientHeight >= container.scrollHeight - 100
+          : currentPage >= safeLastPage;
+      } else {
+        isLast = currentPage >= safeLastPage;
+      }
       saveProgress(currentPage, isLast);
     }, 2000);
     return () => clearTimeout(timer);
-  }, [currentPage, chapter, saveProgress]);
+  }, [currentPage, chapter, saveProgress, settings.layout]);
 
   // Save progress on page unload (tab close, browser back, etc.)
+  // beforeunload  → desktop browsers, most Android Chrome navigation
+  // visibilitychange hidden → PWA backgrounded (app-switch, screen lock) on iOS & Android
+  // pagehide      → iOS Safari PWA when the page is actually terminated
   useEffect(() => {
     if (!chapter || !session?.user) return;
     const handleUnload = () => {
       const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
-      const isLast = page >= chapter.pages.length - 1;
-      // Use sendBeacon for reliable delivery during unload
+      // Guard against empty page list (pages.length=0 → last=-1, always "complete")
+      const safeLastPage = Math.max(chapter.pages.length - 1, 1);
+      // For longstrip use scroll geometry rather than visible-image index so we
+      // don't falsely mark a chapter complete when the last image briefly scrolls
+      // into view while the user is still reading.
+      let isLast: boolean;
+      if (settings.layout === "longstrip") {
+        const container = containerRef.current;
+        isLast = container
+          ? container.scrollTop + container.clientHeight >= container.scrollHeight - 100
+          : page >= safeLastPage;
+      } else {
+        isLast = page >= safeLastPage;
+      }
       navigator.sendBeacon(
         "/api/user/progress",
         new Blob(
@@ -370,8 +401,17 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         )
       );
     };
+
+    const handleVisibility = () => { if (document.hidden) handleUnload(); };
+
     window.addEventListener("beforeunload", handleUnload);
-    return () => window.removeEventListener("beforeunload", handleUnload);
+    window.addEventListener("pagehide", handleUnload);
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.removeEventListener("beforeunload", handleUnload);
+      window.removeEventListener("pagehide", handleUnload);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, [chapter, session, settings.layout, currentPage]);
 
   // Auto-hide toolbar
