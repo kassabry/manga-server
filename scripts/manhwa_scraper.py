@@ -4142,11 +4142,16 @@ class ManhuaFastScraper(DrakeFullScraper):
         so only the first ~18 series would ever be scraped.
 
         order_by: Madara sort key — one of latest, views, trending, rating,
-                  alphabet/az, new.  Defaults to site default (latest).
+                  alphabet/az, new.  Defaults to 'latest' (most recently
+                  updated) so the limited page budget captures actively-updating
+                  series. The bare /manga/ archive uses Madara's default order
+                  (newest series added, NOT newest chapters), which buries
+                  recently-updated series far past the first few pages.
         """
-        sort_param = self.SORT_KEYS.get((order_by or '').lower().strip(), '')
+        sort_param = self.SORT_KEYS.get((order_by or 'latest').lower().strip(), '')
         if order_by and not sort_param:
-            logger.warning(f"Unknown sort key '{order_by}' — using site default. Valid: {', '.join(self.SORT_KEYS)}")
+            logger.warning(f"Unknown sort key '{order_by}' — using 'latest'. Valid: {', '.join(self.SORT_KEYS)}")
+            sort_param = 'latest'
         if sort_param:
             logger.info(f"Fetching all series from ManhuaFast (sort={sort_param})...")
         else:
