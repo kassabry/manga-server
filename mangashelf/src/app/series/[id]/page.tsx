@@ -377,6 +377,15 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                 ★ {series.rating.toFixed(1)}
               </span>
             )}
+            {uniqueSources.map((s) => (
+              <span
+                key={s}
+                className="rounded border border-accent/40 bg-accent/10 px-2 py-1 text-accent"
+                title={`Scraped from ${s}`}
+              >
+                {s}
+              </span>
+            ))}
           </div>
 
           {(series.author || series.artist) && (
