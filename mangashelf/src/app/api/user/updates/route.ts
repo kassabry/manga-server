@@ -78,16 +78,13 @@ export async function GET(request: NextRequest) {
   });
 
   // Per-series: dedup chapters by number (keeping the first-uploaded copy, since
-  // chapters are sorted ascending by createdAt) and track the single newest upload
-  // date across ALL sources. The feed shows only that newest calendar day's batch,
-  // so a series normally surfaces just its latest chapter — and surfaces multiple
-  // only when several chapters landed on the same (newest) day.
+  // chapters are sorted ascending by createdAt). The batch the feed shows is anchored
+  // on the HIGHEST CHAPTER NUMBER, not on whatever landed on the most recent calendar
+  // day — see the batch loop below for why.
   type ChapterRow = (typeof chapters)[0];
   type SeriesEntry = {
     series: ChapterRow["series"];
     byNumber: Map<number, ChapterRow>; // deduped: number -> first-uploaded chapter
-    latestDate: Date; // newest createdAt seen across all sources
-    latestDateStr: string; // UTC calendar day of latestDate
   };
 
   const seriesMap = new Map<string, SeriesEntry>();
@@ -102,53 +99,53 @@ export async function GET(request: NextRequest) {
     // with backlog chapters the user already knew about.
     if (preFollowNums.get(ch.seriesId)?.has(ch.number)) continue;
 
-    const chDate = new Date(ch.createdAt);
-    const chDateStr = toUTCDateStr(chDate);
     const entry = seriesMap.get(ch.seriesId);
-
     if (!entry) {
       seriesMap.set(ch.seriesId, {
         series: ch.series,
         byNumber: new Map([[ch.number, ch]]),
-        latestDate: chDate,
-        latestDateStr: chDateStr,
       });
-    } else {
+    } else if (!entry.byNumber.has(ch.number)) {
       // Dedup by chapter number: ascending order guarantees first-seen = first-uploaded
-      if (!entry.byNumber.has(ch.number)) {
-        entry.byNumber.set(ch.number, ch);
-      }
-      if (chDate > entry.latestDate) {
-        entry.latestDate = chDate;
-        entry.latestDateStr = chDateStr;
-      }
+      entry.byNumber.set(ch.number, ch);
     }
   }
 
-  // For each series: keep only chapters uploaded on the single newest calendar day.
-  // Normal weekly release → only the latest chapter survives. Same-day multi-release
-  // (e.g. a simulcast catch-up) → all of that day's chapters survive. Older chapters
-  // from any source are excluded because they fall on an earlier day.
+  // For each series: anchor the batch on the HIGHEST-NUMBERED new chapter, then keep
+  // only chapters released on that same calendar day. Anchoring on the highest number
+  // (rather than the latest createdAt across all sources) is critical for multi-source
+  // series: a slow mirror re-uploading an OLD chapter (e.g. Ch.135) days after the
+  // newest one (Ch.137) must NOT make Ch.135's day the "latest", which would hide the
+  // genuinely-new Ch.137 from the feed. Normal weekly release → only the latest chapter
+  // survives. Genuine same-day multi-release → all of that day's top chapters survive.
   const batchChapterIds: string[] = [];
   type BatchEntry = {
     series: ChapterRow["series"];
     batchChapters: ChapterRow[];
-    latestDate: Date;
+    latestDate: Date; // createdAt of the highest-numbered chapter (used for feed sorting)
   };
   const batchData: BatchEntry[] = [];
 
   // When a series is re-imported (e.g. directory renamed, scanner wipes and recreates
   // chapters), every chapter gets a fresh createdAt on the same day and lands in the
-  // newest-day batch, flooding the feed. Cap each series' visible batch to the
+  // anchor-day batch, flooding the feed. Cap each series' visible batch to the
   // MAX_BATCH_PER_SERIES highest-numbered chapters so a flood shows at most a handful
   // of entries rather than the entire back-catalogue. Genuine same-day releases (a
   // handful of chapters) are unaffected.
   const MAX_BATCH_PER_SERIES = 5;
 
   for (const entry of seriesMap.values()) {
-    // Keep only chapters whose upload day equals the series' newest upload day.
-    const dateBatch = Array.from(entry.byNumber.values()).filter(
-      (ch) => toUTCDateStr(new Date(ch.createdAt)) === entry.latestDateStr
+    const deduped = Array.from(entry.byNumber.values());
+    if (deduped.length === 0) continue;
+
+    // Anchor on the highest-numbered new chapter and its upload day.
+    const anchor = deduped.reduce((hi, ch) => (ch.number > hi.number ? ch : hi));
+    const anchorDate = new Date(anchor.createdAt);
+    const anchorDateStr = toUTCDateStr(anchorDate);
+
+    // Keep only chapters released on the anchor chapter's day.
+    const dateBatch = deduped.filter(
+      (ch) => toUTCDateStr(new Date(ch.createdAt)) === anchorDateStr
     );
     if (dateBatch.length === 0) continue;
 
@@ -159,7 +156,7 @@ export async function GET(request: NextRequest) {
       : dateBatch;
 
     batchChapterIds.push(...batchChapters.map((ch) => ch.id));
-    batchData.push({ series: entry.series, batchChapters, latestDate: entry.latestDate });
+    batchData.push({ series: entry.series, batchChapters, latestDate: anchorDate });
   }
 
   // Fetch read progress for all batch chapters in one query

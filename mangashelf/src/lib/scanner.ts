@@ -14,6 +14,102 @@ async function countDistinctChapters(seriesId: string): Promise<number> {
   return Number(rows[0]?.cnt ?? 0);
 }
 
+/**
+ * A user's read progress, snapshotted by chapter NUMBER so it can survive the
+ * deletion of the underlying chapter row.
+ */
+interface ProgressSnapshot {
+  number: number;
+  userId: string;
+  page: number;
+  completed: boolean;
+  readAt: Date;
+}
+
+/**
+ * Read progress is keyed by chapterId, and Chapter -> ReadProgress is ON DELETE CASCADE.
+ * So whenever the scanner deletes a chapter row — a re-downloaded/renamed file (its old
+ * filePath goes "stale"), or a removed source directory — the user's history for that
+ * chapter is silently wiped. Re-scrapes happen every 30 min for active series, which is
+ * why progress for the series a user actively reads seems to vanish "randomly".
+ *
+ * Call this BEFORE deleting chapter rows to snapshot their progress by (seriesId, number),
+ * then call restoreProgress() AFTER the replacement rows exist to re-link it. For a pure
+ * deletion with no replacement, restore is a harmless no-op.
+ */
+export async function snapshotProgress(
+  chaptersToDelete: { id: string; number: number }[]
+): Promise<ProgressSnapshot[]> {
+  if (chaptersToDelete.length === 0) return [];
+  const numberById = new Map(chaptersToDelete.map((c) => [c.id, c.number]));
+  const records = await prisma.readProgress.findMany({
+    where: { chapterId: { in: chaptersToDelete.map((c) => c.id) } },
+  });
+  return records.map((r) => ({
+    number: numberById.get(r.chapterId)!,
+    userId: r.userId,
+    page: r.page,
+    completed: r.completed,
+    readAt: r.readAt,
+  }));
+}
+
+/**
+ * Re-link snapshotted progress onto every current chapter row of the same
+ * (seriesId, number) — covering both a renamed/re-downloaded replacement and any
+ * surviving sibling source. Never downgrades existing progress: a row already marked
+ * completed (or further along) is left untouched.
+ */
+export async function restoreProgress(
+  seriesId: string,
+  snapshots: ProgressSnapshot[]
+): Promise<void> {
+  if (snapshots.length === 0) return;
+
+  const numbers = [...new Set(snapshots.map((s) => s.number))];
+  const targets = await prisma.chapter.findMany({
+    where: { seriesId, number: { in: numbers } },
+    select: { id: true, number: true },
+  });
+  if (targets.length === 0) return;
+
+  const idsByNumber = new Map<number, string[]>();
+  for (const t of targets) {
+    const list = idsByNumber.get(t.number) ?? [];
+    list.push(t.id);
+    idsByNumber.set(t.number, list);
+  }
+
+  // Existing progress on target rows, so we don't clobber more-advanced reads.
+  const existing = await prisma.readProgress.findMany({
+    where: { chapterId: { in: targets.map((t) => t.id) } },
+  });
+  const existingByKey = new Map(existing.map((e) => [`${e.userId}:${e.chapterId}`, e]));
+
+  const ops = [];
+  for (const snap of snapshots) {
+    for (const chapterId of idsByNumber.get(snap.number) ?? []) {
+      const ex = existingByKey.get(`${snap.userId}:${chapterId}`);
+      // Skip when an equal-or-better record already exists.
+      if (ex && (ex.completed || (!snap.completed && ex.page >= snap.page))) continue;
+      ops.push(
+        prisma.readProgress.upsert({
+          where: { userId_chapterId: { userId: snap.userId, chapterId } },
+          update: { page: snap.page, completed: snap.completed, readAt: snap.readAt },
+          create: {
+            userId: snap.userId,
+            chapterId,
+            page: snap.page,
+            completed: snap.completed,
+            readAt: snap.readAt,
+          },
+        })
+      );
+    }
+  }
+  if (ops.length > 0) await prisma.$transaction(ops);
+}
+
 function slugify(text: string): string {
   return text
     .toLowerCase()
@@ -284,6 +380,15 @@ async function cleanupDeletedSeries(
 
   for (const sp of allSeriesPaths) {
     if (!validPaths.has(sp.path)) {
+      // Snapshot progress before deleting so it can move to a surviving sibling source
+      // (e.g. user read via ManhuaTo, ManhuaTo folder removed → keep their history on
+      // the AsuraScans copy of the same chapter numbers).
+      const removedChapters = await prisma.chapter.findMany({
+        where: { seriesId: sp.seriesId, filePath: { startsWith: sp.path } },
+        select: { id: true, number: true },
+      });
+      const preserved = await snapshotProgress(removedChapters);
+
       // Delete chapters from this specific directory
       const deleted = await prisma.chapter.deleteMany({
         where: {
@@ -292,6 +397,9 @@ async function cleanupDeletedSeries(
         },
       });
       chaptersRemoved += deleted.count;
+
+      // Re-link onto surviving same-number chapters from other sources, if any.
+      await restoreProgress(sp.seriesId, preserved);
 
       console.log(`Removing deleted path: ${sp.path} (${deleted.count} chapters)`);
       await prisma.seriesPath.delete({ where: { id: sp.id } });
@@ -622,8 +730,13 @@ async function scanSeries(
   const staleChapters = series.chapters.filter(
     (c) => c.filePath.startsWith(seriesDirPath) && !diskFiles.has(c.filePath)
   );
+  // Read progress snapshotted from deleted rows, re-linked after new chapters are added.
+  // A re-downloaded/renamed file produces a stale row here AND a fresh row in the scan
+  // loop below; without this the user's history would be lost to the cascade delete.
+  let preservedProgress: ProgressSnapshot[] = [];
   if (staleChapters.length > 0) {
     const staleIds = staleChapters.map((c) => c.id);
+    preservedProgress = await snapshotProgress(staleChapters);
     // Delete read progress first (foreign key constraint)
     await prisma.readProgress.deleteMany({ where: { chapterId: { in: staleIds } } });
     await prisma.chapter.deleteMany({ where: { id: { in: staleIds } } });
@@ -739,6 +852,10 @@ async function scanSeries(
       },
     });
   }
+
+  // Re-link read progress from any deleted (renamed/re-downloaded) chapters onto the
+  // freshly-created replacement rows, now that they exist.
+  await restoreProgress(series.id, preservedProgress);
 }
 
 function parseStatus(notes?: string): string | null {

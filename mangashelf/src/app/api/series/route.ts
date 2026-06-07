@@ -124,16 +124,18 @@ export async function GET(request: NextRequest) {
     prisma.series.count({ where }),
   ]);
 
-  // Compute count of distinct chapter numbers per series so multi-source
-  // series don't show inflated counts (e.g. source A ch1-146 + ManhuaFast
-  // ch531-904 should show 520 unique chapters, not 520+146=666 total records).
+  // Display the highest chapter number per series (e.g. "Ch. 137"), NOT a count of
+  // chapter records. Counting records (even distinct numbers) inflates the figure for
+  // multi-source series and for series with decimal/bonus chapters — a series whose
+  // newest chapter is 137 could otherwise show "148". MAX(number) always matches the
+  // latest chapter the reader sees.
   let displayCountMap = new Map<string, number>();
   if (series.length > 0) {
     const ids = series.map((s) => s.id);
-    const rows = await prisma.$queryRaw<{ seriesId: string; cnt: bigint }[]>(
-      Prisma.sql`SELECT seriesId, COUNT(DISTINCT number) AS cnt FROM "Chapter" WHERE seriesId IN (${Prisma.join(ids)}) GROUP BY seriesId`
+    const rows = await prisma.$queryRaw<{ seriesId: string; maxNum: number }[]>(
+      Prisma.sql`SELECT seriesId, MAX(number) AS maxNum FROM "Chapter" WHERE seriesId IN (${Prisma.join(ids)}) GROUP BY seriesId`
     );
-    displayCountMap = new Map(rows.map((r) => [r.seriesId, Number(r.cnt)]));
+    displayCountMap = new Map(rows.map((r) => [r.seriesId, Number(r.maxNum)]));
   }
 
   const seriesWithDisplay = series.map((s) => ({

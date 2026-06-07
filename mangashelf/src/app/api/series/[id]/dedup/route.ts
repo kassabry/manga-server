@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
+import { snapshotProgress, restoreProgress } from "@/lib/scanner";
 
 // POST /api/series/[id]/dedup
 // Finds duplicate chapters (same seriesId + number + source) and removes all but
@@ -19,19 +20,23 @@ export async function POST(
 
   // Walk through in order — first occurrence of (number, source) is the keeper
   const kept = new Set<string>();
-  const toDelete: string[] = [];
+  const toDelete: { id: string; number: number }[] = [];
 
   for (const ch of chapters) {
     const key = `${ch.number}:${ch.source ?? ""}`;
     if (kept.has(key)) {
-      toDelete.push(ch.id);
+      toDelete.push({ id: ch.id, number: ch.number });
     } else {
       kept.add(key);
     }
   }
 
   if (toDelete.length > 0) {
-    await prisma.chapter.deleteMany({ where: { id: { in: toDelete } } });
+    // Preserve read progress: move it off the duplicates being removed onto the
+    // surviving copy of the same chapter number before deleting.
+    const preserved = await snapshotProgress(toDelete);
+    await prisma.chapter.deleteMany({ where: { id: { in: toDelete.map((c) => c.id) } } });
+    await restoreProgress(id, preserved);
 
     // Recalculate and update the series chapterCount
     const remaining = await prisma.chapter.count({ where: { seriesId: id } });

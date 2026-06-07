@@ -271,8 +271,13 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
 
   const chapters = isGrouped ? [] : (sortDesc ? [...filteredChapters].reverse() : filteredChapters);
 
-  // Unique chapter count: number of grouped rows when multi-source, else filtered list length
-  const displayChapterCount = isGrouped ? groupedChapters.length : filteredChapters.length;
+  // Show the highest chapter number (e.g. "Chapters (137)"), not a record count.
+  // Counting rows/groups inflates the figure for multi-source series and series with
+  // decimal/bonus chapters; the highest number always matches the newest chapter shown.
+  const displayChapterCount = filteredChapters.reduce(
+    (max: number, ch: Chapter) => (ch.number > max ? ch.number : max),
+    0
+  );
 
   return (
     <div className="space-y-6">
