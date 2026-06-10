@@ -124,6 +124,9 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   const searchParams = useSearchParams();
   const router = useRouter();
   const initialPage = parseInt(searchParams.get("page") || "0");
+  // Fractional position within initialPage's image (0..1), for exact long-strip resume
+  // from links that carry it (e.g. Continue Reading, series page).
+  const initialOffset = parseFloat(searchParams.get("offset") || "0");
 
   const [chapter, setChapter] = useState<ChapterData | null>(null);
   const [chapterError, setChapterError] = useState<{ status: number; message: string } | null>(null);
@@ -161,6 +164,52 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
   // EPUB / longstrip bottom sentinel ref — fires chapter completion when scrolled into view
   const bottomCompleteRef = useRef<HTMLDivElement>(null);
+
+  // Compute the precise long-strip position: the index of the image crossing the top
+  // of the viewport, plus how far (0..1) the viewport top sits into that image. This is
+  // what lets resume land at the exact spot instead of snapping to an image's top.
+  const getLongstripPosition = useCallback((): { page: number; offset: number } => {
+    const container = containerRef.current;
+    if (!container) return { page: longstripPageRef.current, offset: 0 };
+    const imgs = container.querySelectorAll<HTMLElement>("img[data-page-index]");
+    if (imgs.length === 0) return { page: longstripPageRef.current, offset: 0 };
+    const containerTop = container.getBoundingClientRect().top;
+    for (const img of imgs) {
+      const r = img.getBoundingClientRect();
+      // First image whose bottom is below the viewport top is the one being read.
+      if (r.bottom > containerTop + 1) {
+        const page = parseInt(img.dataset.pageIndex || "0");
+        const offset =
+          r.height > 0 ? Math.min(1, Math.max(0, (containerTop - r.top) / r.height)) : 0;
+        return { page, offset };
+      }
+    }
+    const last = imgs[imgs.length - 1];
+    return { page: parseInt(last.dataset.pageIndex || "0"), offset: 1 };
+  }, []);
+
+  // Scroll the long-strip container so the viewport top lands `offset` (0..1) into the
+  // image at `page`. Retries while lazy-loaded images settle their heights.
+  const restoreLongstripScroll = useCallback((page: number, offset: number) => {
+    let attempts = 0;
+    const tryScroll = () => {
+      const container = containerRef.current;
+      const target = container?.querySelector<HTMLElement>(
+        `img[data-page-index="${page}"]`
+      );
+      if (target && container) {
+        target.scrollIntoView({ behavior: "instant" });
+        if (offset > 0) {
+          const h = target.getBoundingClientRect().height;
+          if (h > 0) container.scrollBy({ top: offset * h, behavior: "instant" });
+        }
+      } else if (attempts < 20) {
+        attempts++;
+        setTimeout(tryScroll, 150);
+      }
+    };
+    setTimeout(tryScroll, 150);
+  }, []);
 
   // Load settings from localStorage first, then override from server
   useEffect(() => {
@@ -274,15 +323,14 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         const chapterProgress = (data.progress || []).find(
           (p: { chapterId: string }) => p.chapterId === chapter.id
         );
-        if (chapterProgress && !chapterProgress.completed && chapterProgress.page > 0) {
+        if (!chapterProgress || chapterProgress.completed) return;
+        const savedOffset = chapterProgress.pageOffset ?? 0;
+        // Resume if we have any saved position — including being partway into the very
+        // first image (page 0), which matters for tall single-image webtoon chapters.
+        if (chapterProgress.page > 0 || savedOffset > 0) {
           setCurrentPage(chapterProgress.page);
-          if (settings.layout === "longstrip" && containerRef.current) {
-            setTimeout(() => {
-              const imgs = containerRef.current?.querySelectorAll("img");
-              if (imgs && imgs[chapterProgress.page]) {
-                imgs[chapterProgress.page].scrollIntoView({ behavior: "smooth" });
-              }
-            }, 500);
+          if (settings.layout === "longstrip") {
+            restoreLongstripScroll(chapterProgress.page, savedOffset);
           }
         }
       })
@@ -295,28 +343,14 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   useEffect(() => {
     if (
       !chapter ||
-      initialPage <= 0 ||
+      (initialPage <= 0 && initialOffset <= 0) ||
       settings.layout !== "longstrip" ||
       scrolledToInitialRef.current
     ) return;
 
     scrolledToInitialRef.current = true;
-    let attempts = 0;
-
-    const tryScroll = () => {
-      const target = containerRef.current?.querySelector<HTMLElement>(
-        `img[data-page-index="${initialPage}"]`
-      );
-      if (target) {
-        target.scrollIntoView({ behavior: "instant" });
-      } else if (attempts < 20) {
-        attempts++;
-        setTimeout(tryScroll, 150);
-      }
-    };
-    // Short initial delay so images can start rendering
-    setTimeout(tryScroll, 150);
-  }, [chapter, initialPage, settings.layout]);
+    restoreLongstripScroll(initialPage, initialOffset);
+  }, [chapter, initialPage, initialOffset, settings.layout, restoreLongstripScroll]);
 
   // Chapter picker: scroll the active chapter into view when the panel opens
   useEffect(() => {
@@ -348,12 +382,12 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
   // Save reading progress
   const saveProgress = useCallback(
-    async (page: number, completed: boolean) => {
+    async (page: number, completed: boolean, pageOffset = 0) => {
       if (!session?.user || !chapter) return;
       fetch("/api/user/progress", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chapterId: chapter.id, page, completed }),
+        body: JSON.stringify({ chapterId: chapter.id, page, completed, pageOffset }),
       });
     },
     [session, chapter]
@@ -366,23 +400,24 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       // (pages.length=0 → last=-1, any page≥-1 is always true;
       //  pages.length=1 → last=0, page 0 is always ≥ 0)
       const safeLastPage = Math.max(chapter.pages.length - 1, 1);
-      let isLast: boolean;
       if (settings.layout === "longstrip") {
         // For longstrip use scroll geometry, not visible-image index.
         // currentPage becomes pages.length-1 as soon as the last image is
         // the most-visible one — which can happen before the user is actually
         // done reading. Scroll position is the correct signal.
         const container = containerRef.current;
-        isLast = container
+        const isLast = container
           ? container.scrollTop + container.clientHeight >= container.scrollHeight - 100
           : currentPage >= safeLastPage;
+        const pos = getLongstripPosition();
+        saveProgress(pos.page, isLast, isLast ? 0 : pos.offset);
       } else {
-        isLast = currentPage >= safeLastPage;
+        const isLast = currentPage >= safeLastPage;
+        saveProgress(currentPage, isLast, 0);
       }
-      saveProgress(currentPage, isLast);
     }, 2000);
     return () => clearTimeout(timer);
-  }, [currentPage, chapter, saveProgress, settings.layout]);
+  }, [currentPage, chapter, saveProgress, settings.layout, getLongstripPosition]);
 
   // Save progress on page unload (tab close, browser back, etc.)
   // beforeunload  → desktop browsers, most Android Chrome navigation
@@ -391,25 +426,30 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   useEffect(() => {
     if (!chapter || !session?.user) return;
     const handleUnload = () => {
-      const page = settings.layout === "longstrip" ? longstripPageRef.current : currentPage;
       // Guard against empty page list (pages.length=0 → last=-1, always "complete")
       const safeLastPage = Math.max(chapter.pages.length - 1, 1);
       // For longstrip use scroll geometry rather than visible-image index so we
       // don't falsely mark a chapter complete when the last image briefly scrolls
       // into view while the user is still reading.
+      let page: number;
+      let offset = 0;
       let isLast: boolean;
       if (settings.layout === "longstrip") {
+        const pos = getLongstripPosition();
+        page = pos.page;
+        offset = pos.offset;
         const container = containerRef.current;
         isLast = container
           ? container.scrollTop + container.clientHeight >= container.scrollHeight - 100
           : page >= safeLastPage;
       } else {
+        page = currentPage;
         isLast = page >= safeLastPage;
       }
       navigator.sendBeacon(
         "/api/user/progress",
         new Blob(
-          [JSON.stringify({ chapterId: chapter.id, page, completed: isLast })],
+          [JSON.stringify({ chapterId: chapter.id, page, completed: isLast, pageOffset: isLast ? 0 : offset })],
           { type: "application/json" }
         )
       );
@@ -425,7 +465,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       window.removeEventListener("pagehide", handleUnload);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [chapter, session, settings.layout, currentPage]);
+  }, [chapter, session, settings.layout, currentPage, getLongstripPosition]);
 
   // Auto-hide toolbar
   useEffect(() => {

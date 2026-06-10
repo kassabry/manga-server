@@ -136,6 +136,9 @@ model ReadProgress {
   userId    String
   chapterId String
   page      Int      @default(0)
+  // How far the viewport top sits INTO the current page image, 0..1. Lets the
+  // long-strip reader resume at the exact spot rather than snapping to the image top.
+  pageOffset Float   @default(0)
   completed Boolean  @default(false)
   readAt    DateTime @default(now())
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)

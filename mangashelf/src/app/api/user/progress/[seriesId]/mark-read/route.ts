@@ -42,6 +42,7 @@ export async function POST(
         update: {
           completed,
           page: completed ? Math.max(0, ch.pageCount - 1) : 0,
+          pageOffset: 0,
           readAt: new Date(),
         },
         create: {
@@ -49,6 +50,7 @@ export async function POST(
           chapterId: ch.id,
           completed,
           page: completed ? Math.max(0, ch.pageCount - 1) : 0,
+          pageOffset: 0,
         },
       })
     )

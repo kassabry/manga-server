@@ -9,11 +9,16 @@ async function upsertProgress(request: NextRequest) {
   }
 
   const body = await request.json();
-  const { chapterId, page, completed } = body;
+  const { chapterId, page, completed, pageOffset } = body;
 
   if (!chapterId) {
     return NextResponse.json({ error: "Missing chapterId" }, { status: 400 });
   }
+
+  // Clamp the within-image offset to 0..1; a completed chapter has no meaningful offset.
+  const safeOffset = completed
+    ? 0
+    : Math.min(1, Math.max(0, typeof pageOffset === "number" ? pageOffset : 0));
 
   const progress = await prisma.readProgress.upsert({
     where: {
@@ -21,6 +26,7 @@ async function upsertProgress(request: NextRequest) {
     },
     update: {
       page: page ?? 0,
+      pageOffset: safeOffset,
       completed: completed ?? false,
       readAt: new Date(),
     },
@@ -28,6 +34,7 @@ async function upsertProgress(request: NextRequest) {
       userId: session.user.id,
       chapterId,
       page: page ?? 0,
+      pageOffset: safeOffset,
       completed: completed ?? false,
     },
   });

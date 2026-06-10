@@ -48,7 +48,7 @@ interface SeriesDetail {
 }
 
 interface ProgressMap {
-  [chapterId: string]: { completed: boolean; page: number };
+  [chapterId: string]: { completed: boolean; page: number; pageOffset: number };
 }
 
 interface ChapterGroup {
@@ -143,7 +143,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       .then((d) => {
         const map: ProgressMap = {};
         for (const p of d.progress || []) {
-          map[p.chapterId] = { completed: p.completed, page: p.page };
+          map[p.chapterId] = { completed: p.completed, page: p.page, pageOffset: p.pageOffset ?? 0 };
         }
         setProgress(map);
       });
@@ -190,8 +190,8 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
       for (const ch of series!.chapters) {
         if (ch.number <= chapterNumber) {
           next[ch.id] = completed
-            ? { completed: true, page: Math.max(0, ch.pageCount - 1) }
-            : { completed: false, page: 0 };
+            ? { completed: true, page: Math.max(0, ch.pageCount - 1), pageOffset: 0 }
+            : { completed: false, page: 0, pageOffset: 0 };
         }
       }
       return next;
@@ -619,7 +619,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                           return (
                             <Link
                               key={ch.id}
-                              href={`/read/${ch.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
+                              href={`/read/${ch.id}${prog && !prog.completed ? `?page=${prog.page}${prog.pageOffset > 0 ? `&offset=${prog.pageOffset}` : ""}` : ""}`}
                               className={`rounded px-2 py-0.5 text-[11px] font-medium border transition-colors hover:border-accent hover:text-accent ${
                                 prog?.completed
                                   ? "border-green-700/40 bg-green-900/20 text-green-500"
@@ -667,7 +667,7 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                         )
                       )}
                       <Link
-                        href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}` : ""}`}
+                        href={`/read/${chapter.id}${prog && !prog.completed ? `?page=${prog.page}${prog.pageOffset > 0 ? `&offset=${prog.pageOffset}` : ""}` : ""}`}
                         className="flex flex-1 items-center gap-3 min-w-0"
                       >
                         <span className="font-medium shrink-0">Chapter {chapter.number}</span>

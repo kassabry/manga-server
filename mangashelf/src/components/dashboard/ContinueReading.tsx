@@ -8,6 +8,7 @@ interface ContinueItem {
   chapterId: string;
   chapterNumber: number;
   page: number;
+  pageOffset: number;
   seriesId: string;
   seriesTitle: string;
   coverPath: string | null;
@@ -45,6 +46,7 @@ export function ContinueReading({ columns = 6 }: { columns?: number }) {
               chapterId: latest.chapterId,
               chapterNumber: latest.chapter.number,
               page: latest.page,
+              pageOffset: latest.pageOffset ?? 0,
               seriesId: entry.series.id,
               seriesTitle: entry.series.title,
               coverPath: entry.series.coverPath,
@@ -70,7 +72,7 @@ export function ContinueReading({ columns = 6 }: { columns?: number }) {
           <CarouselItem key={item.chapterId}>
             <div className="group relative">
               <Link
-                href={`/read/${item.chapterId}?page=${item.page}`}
+                href={`/read/${item.chapterId}?page=${item.page}${item.pageOffset > 0 ? `&offset=${item.pageOffset}` : ""}`}
                 className="block"
               >
                 <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-bg-card">
