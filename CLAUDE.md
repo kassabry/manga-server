@@ -42,6 +42,18 @@
 - Drake debug: if 0 series returned, check page title and body classes logged at DEBUG level (`--debug` flag)
 - ManhuaTo uses FlareSolverr on ARM; `_fs_cookies_applied` caches session cookies after first solve
 
+## MangaDot Scraper (`MangaDotScraper`)
+- Discovery uses the JSON API `GET /api/search`, not DOM scraping — each list item already has `country_of_origin`, `genres`, `tag_list`, `chapter_count` and `alt_titles`, so no per-series detail fetch is needed
+- CRITICAL: origin must be passed as `origin[]=KR&origin[]=CN`. The plain repeated form `origin=KR&origin=CN` (which the site's own search URL uses) is **last-wins** on the API and silently returns CN only — dropping all ~6400 KR series
+- `genre=` is ignored server-side; tag filtering is client-side against `genres` + `tag_list` (Shounen appears in one or the other depending on the series)
+- `chapter_count` is the *latest chapter number*, not the count of available chapters — a 406 series may have only ~350 posted. Use it for coarse filtering only
+- Chapter list and page images are client-rendered — Selenium required. The `/api/manga/{id}/chapters` endpoint is 401 without an account, but the rendered page is fully readable logged-out
+- Chapter list: click `SHOW N MORE CHAPTERS` to expand. Do NOT click the `N VERSIONS` buttons — toggling them collapses the list (127 links → 11)
+- Hydration gotcha: the SSR page ships one chapter anchor ("Start Reading") plus an inert copy of the expander button. Waiting on "any chapter anchor exists" fires the click before React attaches handlers and silently yields a collapsed list — wait for `> 3` anchors instead
+- Multi-group chapters put "Ch. N" on an ancestor, not the anchor (only ~10 of 127 anchors carry it) — walk up 4 levels when parsing the number
+- Origin routing is per-invocation via `--origin KR -o library/Manhwa` / `--origin CN -o library/Manhua`
+- Alt-title merging: exact match on title or any "Other Names" entry auto-merges into the existing folder; near-matches go to `mangadot_merge_candidates.csv` for review (apply via `suggest_merges.py`). Disable with `--no-alias-merge`
+
 ## Maintenance Scripts
 - `scripts/fix_flame_chapters.py` — fixes wrong chapter numbers in already-downloaded Flame CBZs by sorting numerically and renumbering 1, 2, 3… Dry-run by default; use `--apply [--db path/to/mangashelf.db]`
 - Run after any FlameComics re-scrape where chapter numbers look wrong (e.g. Ch.14 instead of Ch.1)

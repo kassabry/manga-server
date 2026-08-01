@@ -32,6 +32,7 @@ Usage:
 
 import argparse
 import copy
+import csv
 import os
 import re
 import sys
@@ -40,6 +41,8 @@ import json
 import random
 import zipfile
 import logging
+import unicodedata
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 from dataclasses import dataclass, field
@@ -4774,6 +4777,521 @@ class ResetScansScraper(DrakeFullScraper):
         return super().get_chapters(series)
 
 
+# ---------------------------------------------------------------------------
+# MangaDot — alias-aware series matching
+#
+# MangaDot exposes an "Other Names" list per series (alt_titles in the API).
+# When a scraped series has no exact title match in the library we compare its
+# alt titles against existing folder names so translations/romanizations of the
+# same work land in one series directory instead of a near-duplicate one.
+# ---------------------------------------------------------------------------
+
+_MD_SOURCE_PREFIX_RE = re.compile(r'^\[[^\]]+\]\s*')
+
+# Stop-words dropped before comparison (mirrors suggest_merges.py).
+_MD_STOP_WORDS = frozenset({
+    'a', 'an', 'the',
+    'and', 'but', 'or', 'nor', 'for', 'so', 'yet',
+    'as', 'at', 'by', 'in', 'of', 'on', 'to', 'up', 'via',
+    'with', 'from', 'into', 'onto', 'upon',
+    'is', 'was', 'are', 'were',
+})
+
+
+def _md_bare_title(dir_name: str) -> str:
+    """Strip a leading [Source] prefix from a library folder name."""
+    return _MD_SOURCE_PREFIX_RE.sub('', dir_name).strip()
+
+
+def _md_norm(title: str) -> str:
+    """Comparison key: fold accents, drop punctuation and stop-words.
+
+    Folding accents matters here because MangaDot alt titles carry both
+    accented and bare romanizations of the same name ("Fei Renlei" vs
+    "Fēi Rénlèi"), which must collapse to the same key.
+    """
+    if not title:
+        return ''
+    folded = unicodedata.normalize('NFKD', title.lower())
+    folded = ''.join(c for c in folded if not unicodedata.combining(c))
+    folded = re.sub(r'[^\w\s]', ' ', folded)
+    words = [w for w in folded.split() if w not in _MD_STOP_WORDS]
+    return ' '.join(words)
+
+
+def _md_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+class MangaDotAliasIndex:
+    """Maps normalized titles (and alt titles) to existing library folders.
+
+    Exact matches auto-merge into the existing folder.  Near-matches are
+    reported as review candidates rather than merged, because alt-title
+    overlap alone regularly links sequels and spin-offs that should stay
+    separate (e.g. a season 2 sharing every romanization of season 1).
+    """
+
+    # Below this, two titles are unrelated and not worth reporting.
+    FUZZY_THRESHOLD = 0.88
+
+    CSV_FIELDS = ['new_title', 'new_url', 'existing_dir', 'existing_title',
+                  'similarity', 'matched_via', 'action']
+
+    def __init__(self, library_dirs: List[Path], threshold: float = None):
+        self.threshold = self.FUZZY_THRESHOLD if threshold is None else threshold
+        # normalized title -> directory path
+        self._exact: Dict[str, Path] = {}
+        # (normalized, bare title, path) for fuzzy scanning
+        self._entries: List[tuple] = []
+        self._candidates: List[dict] = []
+        self._seen_pairs: Set[tuple] = set()
+
+        for library_dir in library_dirs:
+            if not library_dir or not library_dir.is_dir():
+                continue
+            for entry in sorted(library_dir.iterdir()):
+                if not entry.is_dir():
+                    continue
+                bare = _md_bare_title(entry.name)
+                key = _md_norm(bare)
+                if not key:
+                    continue
+                self._exact.setdefault(key, entry)
+                self._entries.append((key, bare, entry))
+
+        logger.info(f"[MangaDot] Alias index built from {len(self._entries)} existing series folder(s)")
+
+    def resolve(self, title: str, alt_titles: List[str], series_url: str = ''):
+        """Return (existing_dir, matched_via) for an exact hit, else None.
+
+        Near-matches are recorded for CSV review and return None so the
+        caller creates a new folder.
+        """
+        # Exact match on the primary title wins outright.
+        primary_key = _md_norm(title)
+        if primary_key in self._exact:
+            return self._exact[primary_key], 'title'
+
+        # Then any exact match on an alt title ("Other Names").
+        for alt in alt_titles or []:
+            alt_key = _md_norm(alt)
+            if alt_key and alt_key in self._exact:
+                return self._exact[alt_key], f'alt:{alt}'
+
+        self._record_fuzzy(title, alt_titles, series_url, primary_key)
+        return None
+
+    def _record_fuzzy(self, title, alt_titles, series_url, primary_key):
+        """Record the best near-match (if any) for later human review."""
+        best = None
+        keys = [(primary_key, 'title')]
+        for alt in alt_titles or []:
+            alt_key = _md_norm(alt)
+            if alt_key:
+                keys.append((alt_key, f'alt:{alt}'))
+
+        for key, via in keys:
+            if not key:
+                continue
+            for existing_key, existing_bare, existing_path in self._entries:
+                score = _md_similarity(key, existing_key)
+                if score >= self.threshold and (best is None or score > best['similarity']):
+                    best = {
+                        'new_title': title,
+                        'new_url': series_url,
+                        'existing_dir': existing_path.name,
+                        'existing_title': existing_bare,
+                        'similarity': round(score, 4),
+                        'matched_via': via,
+                        'action': '',
+                    }
+
+        if best:
+            pair = (best['new_title'], best['existing_dir'])
+            if pair not in self._seen_pairs:
+                self._seen_pairs.add(pair)
+                self._candidates.append(best)
+                logger.info(
+                    f"[MangaDot] Possible merge (needs review): {title!r} ~ "
+                    f"{best['existing_title']!r} ({int(best['similarity'] * 100)}%, via {best['matched_via']})"
+                )
+
+    def register(self, title: str, alt_titles: List[str], directory: Path):
+        """Add a newly created series folder so later series can match it."""
+        for name in [title] + list(alt_titles or []):
+            key = _md_norm(name)
+            if key:
+                self._exact.setdefault(key, directory)
+        bare = _md_bare_title(directory.name)
+        self._entries.append((_md_norm(bare), bare, directory))
+
+    @property
+    def candidates(self) -> List[dict]:
+        return self._candidates
+
+    def write_csv(self, path: Path) -> int:
+        """Write review candidates. Returns the number of rows written."""
+        if not self._candidates:
+            return 0
+        rows = sorted(self._candidates, key=lambda r: r['similarity'], reverse=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=self.CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info(f"[MangaDot] Wrote {len(rows)} merge candidate(s) for review to {path}")
+        return len(rows)
+
+
+class MangaDotScraper(BaseSiteScraper):
+    """Full site scraper for mangadot.net.
+
+    Discovery uses the site's JSON search API, which returns origin, genres,
+    tags, chapter count and alt titles inline — so every filter is applied
+    without a per-series detail request.  Chapter lists and page images are
+    only rendered client-side, so those two steps need Selenium.
+    """
+
+    BASE_URL = "https://mangadot.net"
+    SITE_NAME = "mangadot"
+
+    # country_of_origin -> library subfolder
+    ORIGIN_FOLDER = {'KR': 'Manhwa', 'CN': 'Manhua'}
+
+    # A series is kept when any of these appears in its genres or tag_list.
+    DEFAULT_TAGS = ('Action', 'Adventure', 'Shounen')
+
+    DEFAULT_MIN_CHAPTERS = 50
+
+    API_SEARCH = "/api/search"
+
+    # Chapter page images live under this path prefix.
+    _PAGE_PREFIX = "/chapters/manga_"
+
+    def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None,
+                 origins: List[str] = None, required_tags: List[str] = None,
+                 min_chapters: int = None):
+        super().__init__(headless=headless, limit=limit, max_pages=max_pages)
+        self.origins = [o.upper() for o in (origins or list(self.ORIGIN_FOLDER))]
+        tags = required_tags if required_tags else self.DEFAULT_TAGS
+        self.required_tags = frozenset(t.strip().lower() for t in tags if t.strip())
+        self.min_chapters = (self.DEFAULT_MIN_CHAPTERS
+                             if min_chapters is None else min_chapters)
+
+    # -- discovery ---------------------------------------------------------
+
+    @classmethod
+    def folder_for_origin(cls, origin: str) -> str:
+        """Library subfolder for a country_of_origin code."""
+        return cls.ORIGIN_FOLDER.get((origin or '').upper(), 'Manhwa')
+
+    def _matches_tags(self, item: dict) -> bool:
+        """True when the series carries one of the required tags.
+
+        MangaDot splits these across two fields — "Shounen" shows up in
+        `genres` for some series and only in `tag_list` for others — so both
+        are checked.
+        """
+        if not self.required_tags:
+            return True
+        have = {str(g).strip().lower() for g in (item.get('genres') or [])}
+        have |= {str(t).strip().lower() for t in (item.get('tag_list') or [])}
+        return bool(have & self.required_tags)
+
+    def _item_to_series(self, item: dict) -> Series:
+        genres = list(item.get('genres') or [])
+        for tag in (item.get('tag_list') or []):
+            if tag not in genres:
+                genres.append(tag)
+
+        authors = item.get('authors') or []
+        artists = item.get('artists') or []
+        photo = item.get('photo') or ''
+
+        rating = 0.0
+        try:
+            # avg_rating is a 0-10 score; the library stores it out of 5.
+            raw = float(item.get('avg_rating') or 0)
+            rating = round(raw / 2.0, 2) if raw > 5 else round(raw, 2)
+        except (TypeError, ValueError):
+            pass
+
+        series = Series(
+            title=(item.get('title') or '').strip(),
+            url=f"{self.BASE_URL}/manga/{item.get('id')}",
+            source=self.SITE_NAME,
+            genres=genres,
+            status=(item.get('status') or '').strip(),
+            chapters_count=int(item.get('chapter_count') or 0),
+            rating=rating,
+            description=(item.get('description') or '').strip(),
+            author=', '.join(authors) if isinstance(authors, list) else str(authors or ''),
+            artist=', '.join(artists) if isinstance(artists, list) else str(artists or ''),
+            cover_url=f"{self.BASE_URL}{photo}" if photo.startswith('/') else photo,
+        )
+        # Carried for folder routing and alias matching; not part of Series.
+        series._md_origin = (item.get('country_of_origin') or '').upper()
+        series._md_alt_titles = list(item.get('alt_titles') or [])
+        series._md_id = item.get('id')
+        return series
+
+    def get_all_series(self) -> List[Series]:
+        """Page the JSON search API, applying origin/tag/chapter filters."""
+        all_series: List[Series] = []
+        seen_ids: Set[int] = set()
+        page = 1
+        total_pages = None
+        kept = skipped_tags = skipped_chapters = skipped_origin = 0
+
+        # NOTE: the array form is required. A repeated plain `origin=KR&origin=CN`
+        # is last-wins on this API (returns CN only, silently dropping every KR
+        # series) even though that is the form the site's own search URL uses.
+        origin_qs = '&'.join(f"origin[]={o}" for o in self.origins)
+        logger.info(
+            f"Fetching MangaDot series (origins={self.origins}, "
+            f"tags={sorted(self.required_tags)}, min_chapters={self.min_chapters})"
+        )
+
+        while True:
+            if page > (self.max_pages or 500):
+                logger.info(f"Reached page cap ({self.max_pages})")
+                break
+
+            url = f"{self.BASE_URL}{self.API_SEARCH}?page={page}&{origin_qs}"
+            try:
+                resp = self.session.get(url, timeout=30)
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                logger.warning(f"MangaDot search page {page} failed: {e}")
+                break
+
+            items = payload.get('manga_list') or []
+            if not items:
+                break
+
+            if total_pages is None:
+                pagination = payload.get('pagination') or {}
+                total_pages = pagination.get('total_pages')
+                logger.info(
+                    f"MangaDot reports {pagination.get('total_results')} series "
+                    f"across {total_pages} page(s)"
+                )
+
+            for item in items:
+                series_id = item.get('id')
+                if series_id in seen_ids:
+                    continue
+                seen_ids.add(series_id)
+
+                origin = (item.get('country_of_origin') or '').upper()
+                if origin not in self.origins:
+                    skipped_origin += 1
+                    continue
+                if not self._matches_tags(item):
+                    skipped_tags += 1
+                    continue
+                # chapter_count tracks the latest chapter NUMBER, so it can
+                # overstate how many chapters are actually posted when the
+                # source has gaps. get_chapters() reports the real count.
+                if int(item.get('chapter_count') or 0) < self.min_chapters:
+                    skipped_chapters += 1
+                    continue
+
+                all_series.append(self._item_to_series(item))
+                kept += 1
+
+                if self.limit and kept >= self.limit:
+                    logger.info(f"Reached series limit ({self.limit})")
+                    return all_series
+
+            logger.info(f"  Page {page}/{total_pages or '?'} — kept {kept} so far")
+
+            if total_pages and page >= total_pages:
+                break
+            page += 1
+            self._delay()
+
+        logger.info(
+            f"MangaDot: kept {kept} series "
+            f"(skipped {skipped_tags} on tags, {skipped_chapters} on chapter count, "
+            f"{skipped_origin} on origin)"
+        )
+        return all_series
+
+    # -- chapters ----------------------------------------------------------
+
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        """Expand the lazy chapter list and collect every chapter link.
+
+        The list renders ~9 rows and hides the rest behind a
+        "SHOW N MORE CHAPTERS" button, so it must be clicked before the
+        links exist in the DOM.
+        """
+        self._init_driver()
+        driver = self.driver
+
+        try:
+            driver.get(series.url)
+        except Exception as e:
+            logger.warning(f"MangaDot: could not load {series.url}: {e}")
+            return []
+
+        # Wait for hydration before touching the expander.  The server-rendered
+        # page already contains one chapter anchor ("Start Reading") and an
+        # inert copy of the button, so their mere presence is not a readiness
+        # signal — clicking then does nothing and the list stays collapsed.
+        # Wait for the several chapter rows that only React renders.
+        time.sleep(4)
+        for _ in range(30):
+            try:
+                ready = driver.execute_script("""
+                    return document.querySelectorAll('a[href*="/chapter/"]').length > 3;
+                """)
+            except Exception:
+                ready = False
+            if ready:
+                break
+            time.sleep(1)
+
+        # Click through the expander until no more rows are hidden.  Note that
+        # chapters with several scanlation groups render as "N VERSIONS"
+        # buttons — those must NOT be clicked, as toggling them collapses the
+        # list back down.  Expanding alone already exposes their links.
+        for _ in range(15):
+            try:
+                clicked = driver.execute_script("""
+                    const b = Array.from(document.querySelectorAll('button'))
+                        .find(x => /SHOW\\s+[\\d,]+\\s+MORE\\s+CHAPTER/i.test(x.innerText || ''));
+                    if (b) { b.scrollIntoView({block: 'center'}); b.click(); return true; }
+                    return false;
+                """)
+            except Exception:
+                break
+            if not clicked:
+                break
+            # Give the newly revealed rows time to render before re-checking.
+            time.sleep(2.5)
+
+        # A chapter posted by several scanlation groups renders as a "N
+        # VERSIONS" group: the number lives on an ancestor element and only
+        # the group name sits on the anchor itself.  Only ~10 of ~127 anchors
+        # carry "Ch. N" in their own text, so walk up a few levels to find it.
+        try:
+            raw = driver.execute_script("""
+                return Array.from(document.querySelectorAll('a[href*="/chapter/"]'))
+                    .map(a => {
+                        const texts = [];
+                        let el = a;
+                        for (let i = 0; i < 4 && el; i++) {
+                            texts.push((el.innerText || '').replace(/\\s+/g, ' ').trim());
+                            el = el.parentElement;
+                        }
+                        return [a.getAttribute('href'), texts];
+                    });
+            """) or []
+        except Exception as e:
+            logger.warning(f"MangaDot: could not read chapter list: {e}")
+            return []
+
+        # Several scanlation groups may post the same chapter number; keep the
+        # first listing for each number (the site orders them best-first).
+        by_number: Dict[str, Chapter] = {}
+        for href, texts in raw:
+            if not href or '/chapter/' not in href:
+                continue
+            # "Start Reading" is a duplicate link to the first chapter.
+            if texts and texts[0].strip().lower() == 'start reading':
+                continue
+            match = None
+            text = texts[0] if texts else ''
+            for candidate in texts:
+                match = re.search(r'Ch\.\s*([\d.]+)', candidate)
+                if match:
+                    text = candidate
+                    break
+            if not match:
+                continue
+            number = match.group(1).rstrip('.')
+            try:
+                # Normalize "1.00" -> "1" so filenames stay stable.
+                as_float = float(number)
+                number = str(int(as_float)) if as_float.is_integer() else str(as_float)
+            except ValueError:
+                continue
+            if number in by_number:
+                continue
+
+            full_url = href if href.startswith('http') else self.BASE_URL + href
+            # Strip the trailing title/uploader metadata from the link text.
+            title = re.sub(r'^\W*Ch\.\s*[\d.]+\s*', '', text).strip()
+            title = re.split(r'\s+upload\b', title)[0].strip()
+            by_number[number] = Chapter(
+                number=number,
+                title=title or f"Chapter {number}",
+                url=full_url,
+            )
+
+        chapters = sorted(by_number.values(), key=lambda c: float(c.number))
+        logger.info(f"MangaDot: {len(chapters)} chapter(s) for {series.title!r}")
+        return chapters
+
+    # -- pages -------------------------------------------------------------
+
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        """Collect page images from the reader.
+
+        Images are injected by the reader after hydration and lazy-load on
+        scroll, so the page is scrolled to the bottom before reading them.
+        """
+        self._init_driver()
+        driver = self.driver
+
+        try:
+            driver.get(chapter.url)
+        except Exception as e:
+            logger.warning(f"MangaDot: could not load {chapter.url}: {e}")
+            return []
+
+        time.sleep(4)
+
+        pages: List[str] = []
+        stagnant = 0
+        for _ in range(40):
+            try:
+                found = driver.execute_script("""
+                    return Array.from(document.images)
+                        .map(i => i.currentSrc || i.src)
+                        .filter(Boolean);
+                """) or []
+            except Exception:
+                break
+
+            before = len(pages)
+            for src in found:
+                if self._PAGE_PREFIX in src and src not in pages:
+                    pages.append(src)
+
+            stagnant = stagnant + 1 if len(pages) == before else 0
+            if stagnant >= 4:
+                break
+
+            try:
+                driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
+            except Exception:
+                break
+            time.sleep(0.8)
+
+        # Reader order follows the numeric filename (…/001.webp).
+        def page_key(url: str):
+            match = re.search(r'/(\d+)\.\w+(?:\?|$)', url)
+            return int(match.group(1)) if match else 0
+
+        pages.sort(key=page_key)
+        return pages
+
+
 # Site registry
 SCRAPERS = {
     'asura': AsuraFullScraper,
@@ -4796,6 +5314,8 @@ SCRAPERS = {
     'resetscans': ResetScansScraper,
     'reset-scans': ResetScansScraper,
     'reset-scans.org': ResetScansScraper,
+    'mangadot': MangaDotScraper,
+    'mangadot.net': MangaDotScraper,
 }
 
 # Primary sites (canonical names only, no aliases) - used for --site all
@@ -4810,7 +5330,9 @@ PRIMARY_SITES = {
 }
 
 
-def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None, max_pages: int = None) -> BaseSiteScraper:
+def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None,
+                max_pages: int = None, origins: List[str] = None,
+                required_tags: List[str] = None, min_chapters: int = None) -> BaseSiteScraper:
     """Get scraper instance by site name"""
     site_lower = site.lower()
 
@@ -4819,6 +5341,11 @@ def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: i
             # Special handling for Webtoon canvas option
             if scraper_class == WebtoonScraper:
                 return scraper_class(headless=headless, canvas=canvas, limit=limit, max_pages=max_pages)
+            # MangaDot filters by origin/tags/chapter count during discovery
+            if scraper_class == MangaDotScraper:
+                return scraper_class(headless=headless, limit=limit, max_pages=max_pages,
+                                     origins=origins, required_tags=required_tags,
+                                     min_chapters=min_chapters)
             return scraper_class(headless=headless, limit=limit, max_pages=max_pages)
     
     raise ValueError(f"Unknown site: {site}. Available: {list(SCRAPERS.keys())}")
@@ -5162,6 +5689,11 @@ Examples:
     parser.add_argument('--source-prefix', action='store_true', help='Prefix series folders with [Source] for multi-source comparison')
     parser.add_argument('--sort', help='Sort order for Madara sites (manhuafast, resetscans): views, trending, rating, latest, az, new')
     parser.add_argument('--genre', help='Genre filter for Reset Scans (e.g. action, romance, fantasy) — uses /manga-genre/{slug}/ URL format')
+    parser.add_argument('--origin', help='For MangaDot: country of origin to keep — KR (Manhwa), CN (Manhua), or "KR,CN" (default: both)')
+    parser.add_argument('--tags', help='For MangaDot: comma-separated tags, series kept if it has ANY (default: Action,Adventure,Shounen)')
+    parser.add_argument('--merge-csv', help='For MangaDot: write near-duplicate merge candidates to this CSV for review (default: <output>/mangadot_merge_candidates.csv)')
+    parser.add_argument('--merge-threshold', type=int, default=88, help='For MangaDot: similarity %% (0-100) above which a near-match is flagged for review (default: 88)')
+    parser.add_argument('--no-alias-merge', action='store_true', help='For MangaDot: disable alt-title ("Other Names") matching against existing series')
     
     args = parser.parse_args()
     
@@ -5329,7 +5861,14 @@ Examples:
             return
         
         # Single site mode
-        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit, max_pages=getattr(args, 'pages', None))
+        md_origins = ([o.strip().upper() for o in args.origin.split(',') if o.strip()]
+                      if getattr(args, 'origin', None) else None)
+        md_tags = ([t.strip() for t in args.tags.split(',') if t.strip()]
+                   if getattr(args, 'tags', None) else None)
+        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit,
+                              max_pages=getattr(args, 'pages', None),
+                              origins=md_origins, required_tags=md_tags,
+                              min_chapters=args.min_chapters or None)
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
@@ -5477,7 +6016,14 @@ Examples:
             return
         
         # Single site mode
-        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit, max_pages=getattr(args, 'pages', None))
+        md_origins = ([o.strip().upper() for o in args.origin.split(',') if o.strip()]
+                      if getattr(args, 'origin', None) else None)
+        md_tags = ([t.strip() for t in args.tags.split(',') if t.strip()]
+                   if getattr(args, 'tags', None) else None)
+        scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit,
+                              max_pages=getattr(args, 'pages', None),
+                              origins=md_origins, required_tags=md_tags,
+                              min_chapters=args.min_chapters or None)
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
@@ -5523,7 +6069,21 @@ Examples:
             series_list = series_list[:args.limit]
         
         logger.info(f"Will download {len(series_list)} series")
-        
+
+        # MangaDot: index existing series so alt titles ("Other Names") can be
+        # matched against the library.  Sibling type folders are included so a
+        # Manhwa run can still merge into a series already filed under Manhua.
+        alias_index = None
+        if isinstance(scraper, MangaDotScraper) and not args.no_alias_merge:
+            index_dirs = [output_path]
+            for sibling in MangaDotScraper.ORIGIN_FOLDER.values():
+                candidate = output_path.parent / sibling
+                if candidate.is_dir() and candidate != output_path:
+                    index_dirs.append(candidate)
+            alias_index = MangaDotAliasIndex(
+                index_dirs, threshold=args.merge_threshold / 100.0
+            )
+
         # Download each series
         for i, series in enumerate(series_list, 1):
             logger.info(f"[{i}/{len(series_list)}] Processing: {series.title}")
@@ -5555,7 +6115,35 @@ Examples:
                     # Create copy with prefixed title for metadata
                     series_for_meta = copy.copy(series)
                     series_for_meta.title = display_title
-                
+
+                # MangaDot: route into an existing series folder when this title
+                # (or one of its "Other Names") already exists in the library.
+                # Only exact matches merge automatically — near-matches are
+                # collected for review instead, since alt-title overlap alone
+                # links sequels and spin-offs that should stay separate.
+                if alias_index is not None:
+                    matched = alias_index.resolve(
+                        series.title,
+                        getattr(series, '_md_alt_titles', []),
+                        series.url,
+                    )
+                    if matched:
+                        existing_dir, matched_via = matched
+                        if existing_dir.name != display_title:
+                            logger.info(
+                                f"  Merging into existing series folder "
+                                f"{existing_dir.name!r} (matched on {matched_via})"
+                            )
+                            display_title = existing_dir.name
+                            series_for_meta = copy.copy(series)
+                            series_for_meta.title = _md_bare_title(existing_dir.name)
+                    else:
+                        alias_index.register(
+                            series.title,
+                            getattr(series, '_md_alt_titles', []),
+                            output_path / scraper._sanitize_filename(display_title),
+                        )
+
                 # Scan the series directory once so per-chapter checks are O(1)
                 # set lookups instead of individual stat() calls on the NFS mount.
                 existing_cbzs = scraper._scan_series_dir(display_title, output_path)
@@ -5608,9 +6196,19 @@ Examples:
                 continue
         
         scraper._close_driver()
+
+        if alias_index is not None and alias_index.candidates:
+            merge_csv = Path(args.merge_csv) if args.merge_csv \
+                else output_path / 'mangadot_merge_candidates.csv'
+            alias_index.write_csv(merge_csv)
+            logger.info(
+                f"Review {merge_csv} — these titles look like existing series but "
+                f"were NOT merged. Apply approved rows with suggest_merges.py."
+            )
+
         logger.info("Download complete!")
         return
-    
+
     # Mode 3: Download from config file
     if args.config:
         series_list = load_series_list(Path(args.config))
