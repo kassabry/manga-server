@@ -6450,6 +6450,9 @@ Examples:
                 # Apply source prefix if requested
                 display_title = series.title
                 series_for_meta = series
+                # Where this series is written. Normally output_path, but a
+                # merge can redirect it into the sibling type folder.
+                series_output_path = output_path
                 if args.source_prefix:
                     source_name = series.source.title() if series.source else scraper.SITE_NAME.title()
                     display_title = f"[{source_name}] {series.title}"
@@ -6470,6 +6473,15 @@ Examples:
                     )
                     if matched:
                         existing_dir, matched_via = matched
+                        # Follow the match to wherever it actually lives. The
+                        # index spans both Manhwa and Manhua, so the two sites
+                        # can disagree on origin (MangaDot calls a series KR
+                        # that ManhuaTo filed under Manhua). Keeping the
+                        # original output_path here would scan an empty
+                        # directory, conclude nothing was downloaded, and
+                        # re-fetch the whole series into a duplicate folder
+                        # under the wrong type.
+                        series_output_path = existing_dir.parent
                         if existing_dir.name != display_title:
                             logger.info(
                                 f"  Merging into existing series folder "
@@ -6487,7 +6499,7 @@ Examples:
 
                 # Scan the series directory once so per-chapter checks are O(1)
                 # set lookups instead of individual stat() calls on the NFS mount.
-                existing_cbzs = scraper._scan_series_dir(display_title, output_path)
+                existing_cbzs = scraper._scan_series_dir(display_title, series_output_path)
 
                 # MangaDot: re-download chapters whose recorded version has been
                 # beaten by a better one.  The existing CBZ is removed and the
@@ -6495,7 +6507,7 @@ Examples:
                 version_manifest = {}
                 md_series_dir = None
                 if isinstance(scraper, MangaDotScraper):
-                    md_series_dir = output_path / scraper._sanitize_filename(display_title)
+                    md_series_dir = series_output_path / scraper._sanitize_filename(display_title)
                     version_manifest = scraper.load_version_manifest(md_series_dir)
                     for chapter in chapters:
                         if upgrades_done >= upgrade_budget:
@@ -6543,7 +6555,7 @@ Examples:
                 # reaches the cover-download code).
                 if series_for_meta.cover_url and series_for_meta.cover_url not in scraper._failed_cover_urls:
                     safe_title = scraper._sanitize_filename(display_title)
-                    series_dir = output_path / safe_title
+                    series_dir = series_output_path / safe_title
                     if series_dir.exists() and not list(series_dir.glob('cover.*')):
                         result = scraper._download_cover(
                             series_for_meta.cover_url, series_dir,
@@ -6553,7 +6565,7 @@ Examples:
 
                 counts = {'new': 0, 'exists': 0, 'skip': 0, 'fail': 0}
                 for chapter in chapters:
-                    status = scraper.download_chapter(chapter, display_title, output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
+                    status = scraper.download_chapter(chapter, display_title, series_output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
                     counts[status if status in counts else 'fail'] += 1
 
                 # Flush tracker to disk once per series instead of once per chapter.
