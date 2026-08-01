@@ -57,6 +57,8 @@ model Series {
   title          String
   slug           String       @unique
   description    String?
+  // JSON array of alternate titles ("Other Names"), English-looking only
+  altTitles      String?
   author         String?
   artist         String?
   status         String?

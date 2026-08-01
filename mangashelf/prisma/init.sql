@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS "Series" (
     "title" TEXT NOT NULL,
     "slug" TEXT NOT NULL,
     "description" TEXT,
+    "altTitles" TEXT,
     "author" TEXT,
     "artist" TEXT,
     "status" TEXT,
@@ -65,6 +66,11 @@ CREATE TABLE IF NOT EXISTS "Series" (
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
 );
+-- Additive column for databases created before altTitles existed. SQLite has
+-- no ADD COLUMN IF NOT EXISTS; on an already-migrated DB this errors with
+-- "duplicate column name" and is discarded by start.sh's 2>/dev/null.
+ALTER TABLE "Series" ADD COLUMN "altTitles" TEXT;
+
 CREATE UNIQUE INDEX IF NOT EXISTS "Series_slug_key" ON "Series"("slug");
 CREATE UNIQUE INDEX IF NOT EXISTS "Series_libraryPath_key" ON "Series"("libraryPath");
 

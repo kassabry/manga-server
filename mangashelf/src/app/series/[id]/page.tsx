@@ -5,6 +5,60 @@ import { useSession } from "next-auth/react";
 import Link from "next/link";
 import { LIST_STATUS_LABELS, type ListStatus } from "@/lib/types";
 
+const ALT_TITLE_PREVIEW = 4;
+
+/**
+ * "Other Names" for a series. Lists run long and are mostly romanizations of
+ * the same name, so only the first few are shown until expanded.
+ */
+function AlternateTitles({ raw }: { raw: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const titles = useMemo(() => {
+    if (!raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed)
+        ? parsed.filter((t): t is string => typeof t === "string" && t.trim().length > 0)
+        : [];
+    } catch {
+      return [];
+    }
+  }, [raw]);
+
+  if (titles.length === 0) return null;
+
+  const shown = expanded ? titles : titles.slice(0, ALT_TITLE_PREVIEW);
+  const hidden = titles.length - shown.length;
+
+  return (
+    <div className="space-y-1.5">
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
+        Other Names
+      </h2>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {shown.map((title) => (
+          <span
+            key={title}
+            className="rounded-full bg-surface-hover px-2.5 py-1 text-xs text-text-secondary"
+          >
+            {title}
+          </span>
+        ))}
+        {(hidden > 0 || expanded) && (
+          <button
+            type="button"
+            onClick={() => setExpanded(!expanded)}
+            className="px-1 text-xs font-medium text-accent hover:underline"
+          >
+            {expanded ? "Show less" : `+${hidden} more`}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 interface AvailableCover {
   source: string;
   url: string;
@@ -32,6 +86,7 @@ interface SeriesDetail {
   title: string;
   slug: string;
   description: string | null;
+  altTitles: string | null;
   author: string | null;
   artist: string | null;
   status: string | null;
@@ -420,6 +475,8 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
               {series.description}
             </p>
           )}
+
+          <AlternateTitles raw={series.altTitles} />
 
           {/* Action buttons */}
           {session?.user && (

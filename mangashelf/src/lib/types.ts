@@ -13,6 +13,8 @@ declare module "next-auth" {
 
 export interface ComicInfo {
   Series?: string;
+  /** Alternate titles, semicolon-separated. Written by the MangaDot scraper. */
+  AlternateSeries?: string;
   Number?: string;
   Title?: string;
   Genre?: string;

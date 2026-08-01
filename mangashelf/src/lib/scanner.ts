@@ -1,10 +1,49 @@
-import { readdir, stat } from "fs/promises";
+import { readdir, stat, readFile } from "fs/promises";
 import { join, resolve } from "path";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 import { extractComicInfo, getPageCount } from "./cbz";
 import { extractEpubMetadata, getEpubPageCount, extractEpubCover } from "./epub";
 import { extractCover, extractCoverFromBuffer } from "./covers";
+
+/**
+ * Read alternate titles ("Other Names") for a series.
+ *
+ * Prefers the scraper's sidecar over the ComicInfo tag: metadata is read from
+ * the first book only, so relying on AlternateSeries alone would leave every
+ * already-downloaded series without alt titles until one of its chapters
+ * happened to be re-fetched. Returns a JSON array string, or null.
+ */
+async function readAltTitles(
+  seriesDirPath: string,
+  alternateSeries?: string | null,
+): Promise<string | null> {
+  let titles: string[] = [];
+
+  try {
+    const raw = await readFile(join(seriesDirPath, ".mangadot_meta.json"), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.altTitles)) {
+      titles = parsed.altTitles.filter((t: unknown): t is string => typeof t === "string");
+    }
+  } catch {
+    // No sidecar, or unreadable — fall back to the ComicInfo tag.
+  }
+
+  if (titles.length === 0 && alternateSeries) {
+    titles = alternateSeries.split(";").map((t) => t.trim());
+  }
+
+  const seen = new Set<string>();
+  const unique = titles.filter((t) => {
+    const key = t.trim().toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return unique.length > 0 ? JSON.stringify(unique) : null;
+}
 
 /** Count distinct chapter numbers for a series (ignores duplicate chapters across sources). */
 async function countDistinctChapters(seriesId: string): Promise<number> {
@@ -587,6 +626,9 @@ async function scanSeries(
   const cleanAuthor = sanitizePersonName(comicInfo?.Writer);
   const cleanArtist = sanitizePersonName(comicInfo?.Penciller);
 
+  // Alternate titles from the scraper sidecar, falling back to ComicInfo
+  const altTitles = await readAltTitles(seriesDirPath, comicInfo?.AlternateSeries);
+
   // Normalize the publisher/source tag
   const normalizedPublisher = sourceTag
     ? normalizeSource(sourceTag)
@@ -602,6 +644,7 @@ async function scanSeries(
         title: cleanMetaTitle || seriesTitle,
         slug: seriesSlug,
         description: comicInfo?.Summary || null,
+        altTitles,
         author: cleanAuthor,
         artist: cleanArtist,
         status: parseStatus(comicInfo?.Notes),
@@ -633,6 +676,12 @@ async function scanSeries(
     // Force-normalize publisher if stale casing (e.g. "Manhuato" → "ManhuaTo")
     if (normalizedPublisher && series.publisher !== normalizedPublisher) {
       corrections.publisher = normalizedPublisher;
+    }
+
+    // Sync alt titles outside the hasNewChapters gate — the sidecar is written
+    // on every scrape, including runs where no new chapter was downloaded.
+    if (altTitles && altTitles !== series.altTitles) {
+      corrections.altTitles = altTitles;
     }
 
     // Fix garbage author/artist (e.g. "s:", single chars) — replace with clean value or null
