@@ -4988,7 +4988,9 @@ class MangaDotScraper(BaseSiteScraper):
                                   else self.DEFAULT_PREFER_GROUPS)
         self.origins = [o.upper() for o in (origins or list(self.ORIGIN_FOLDER))]
         tags = required_tags if required_tags else self.DEFAULT_TAGS
-        self.required_tags = frozenset(t.strip().lower() for t in tags if t.strip())
+        # Original casing is needed for the query string; lowercase for matching.
+        self.required_tags_raw = [t.strip() for t in tags if t.strip()]
+        self.required_tags = frozenset(t.lower() for t in self.required_tags_raw)
         self.min_chapters = (self.DEFAULT_MIN_CHAPTERS
                              if min_chapters is None else min_chapters)
 
@@ -5049,85 +5051,156 @@ class MangaDotScraper(BaseSiteScraper):
         series._md_id = item.get('id')
         return series
 
-    def get_all_series(self) -> List[Series]:
-        """Page the JSON search API, applying origin/tag/chapter filters."""
-        all_series: List[Series] = []
-        seen_ids: Set[int] = set()
-        page = 1
-        total_pages = None
-        kept = skipped_tags = skipped_chapters = skipped_origin = 0
-
+    @property
+    def _origin_qs(self) -> str:
         # NOTE: the array form is required. A repeated plain `origin=KR&origin=CN`
         # is last-wins on this API (returns CN only, silently dropping every KR
         # series) even though that is the form the site's own search URL uses.
-        origin_qs = '&'.join(f"origin[]={o}" for o in self.origins)
+        return '&'.join(f"origin[]={o}" for o in self.origins)
+
+    def _fetch_search_page(self, page: int, extra: str = '') -> Optional[dict]:
+        url = f"{self.BASE_URL}{self.API_SEARCH}?page={page}&{self._origin_qs}"
+        if extra:
+            url += f"&{extra}"
+        try:
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"MangaDot search failed ({extra or 'no filter'}, page {page}): {e}")
+            return None
+
+    def _resolve_tag_queries(self) -> List[str]:
+        """Work out which query parameter actually filters each required tag.
+
+        The taxonomy is split: Action/Adventure live in `genres`, Shounen in
+        `tags`, and querying the wrong one is not an error — `tags=Action`
+        returns 0 and `genre=Action` returns the *unfiltered* set.  So probe
+        each tag and keep the parameter that genuinely narrows the results.
+        Returns [] if any tag cannot be resolved, so the caller falls back to
+        the full walk rather than silently scraping a partial catalogue.
+        """
+        baseline = self._fetch_search_page(1)
+        if not baseline:
+            return []
+        unfiltered = (baseline.get('pagination') or {}).get('total_results') or 0
+
+        queries = []
+        for tag in self.required_tags_raw:
+            resolved = None
+            for param in ('genres', 'tags'):
+                extra = f"{param}={quote(tag)}"
+                payload = self._fetch_search_page(1, extra)
+                if not payload:
+                    continue
+                total = (payload.get('pagination') or {}).get('total_results') or 0
+                # 0 means the tag is not in this taxonomy; the full count means
+                # the parameter was ignored entirely.
+                if 0 < total < unfiltered:
+                    resolved = (extra, total)
+                    break
+            if not resolved:
+                logger.warning(
+                    f"MangaDot: could not resolve a server-side filter for {tag!r}; "
+                    f"falling back to scanning the full origin listing"
+                )
+                return []
+            logger.info(f"  {tag}: {resolved[0]} ({resolved[1]} series)")
+            queries.append(resolved[0])
+        return queries
+
+    def get_all_series(self) -> List[Series]:
+        """Page the JSON search API, applying origin/tag/chapter filters.
+
+        The required tags are OR-ed, but the API's comma form AND-s them, so
+        each tag is queried separately and the results unioned.  That scans
+        far fewer pages than walking the whole origin listing and discarding
+        most of it.  Every item is still checked client-side, so a change in
+        the server's filter semantics cannot let the wrong series through.
+        """
         logger.info(
             f"Fetching MangaDot series (origins={self.origins}, "
-            f"tags={sorted(self.required_tags)}, min_chapters={self.min_chapters})"
+            f"tags={self.required_tags_raw}, min_chapters={self.min_chapters})"
         )
 
-        while True:
-            if page > (self.max_pages or 500):
-                logger.info(f"Reached page cap ({self.max_pages})")
-                break
+        queries = self._resolve_tag_queries() or ['']
+        if queries == ['']:
+            logger.info("Scanning full origin listing (no server-side tag filter)")
 
-            url = f"{self.BASE_URL}{self.API_SEARCH}?page={page}&{origin_qs}"
-            try:
-                resp = self.session.get(url, timeout=30)
-                resp.raise_for_status()
-                payload = resp.json()
-            except Exception as e:
-                logger.warning(f"MangaDot search page {page} failed: {e}")
-                break
+        all_series: List[Series] = []
+        seen_ids: Set[int] = set()
+        kept = skipped_tags = skipped_chapters = skipped_origin = 0
+        pages_fetched = 0
+        page_cap = self.max_pages or 500
 
-            items = payload.get('manga_list') or []
-            if not items:
-                break
+        for extra in queries:
+            page = 1
+            total_pages = None
+            label = extra or 'all'
 
-            if total_pages is None:
-                pagination = payload.get('pagination') or {}
-                total_pages = pagination.get('total_pages')
-                logger.info(
-                    f"MangaDot reports {pagination.get('total_results')} series "
-                    f"across {total_pages} page(s)"
-                )
-
-            for item in items:
-                series_id = item.get('id')
-                if series_id in seen_ids:
-                    continue
-                seen_ids.add(series_id)
-
-                origin = (item.get('country_of_origin') or '').upper()
-                if origin not in self.origins:
-                    skipped_origin += 1
-                    continue
-                if not self._matches_tags(item):
-                    skipped_tags += 1
-                    continue
-                # chapter_count tracks the latest chapter NUMBER, so it can
-                # overstate how many chapters are actually posted when the
-                # source has gaps. get_chapters() reports the real count.
-                if int(item.get('chapter_count') or 0) < self.min_chapters:
-                    skipped_chapters += 1
-                    continue
-
-                all_series.append(self._item_to_series(item))
-                kept += 1
-
-                if self.limit and kept >= self.limit:
-                    logger.info(f"Reached series limit ({self.limit})")
+            while True:
+                # The cap is a budget across every query, so --pages keeps
+                # meaning "this much work" regardless of how many tags there are.
+                if pages_fetched >= page_cap:
+                    logger.info(f"Reached page cap ({self.max_pages})")
                     return all_series
 
-            logger.info(f"  Page {page}/{total_pages or '?'} — kept {kept} so far")
+                payload = self._fetch_search_page(page, extra)
+                if not payload:
+                    break
+                pages_fetched += 1
 
-            if total_pages and page >= total_pages:
-                break
-            page += 1
-            self._delay()
+                items = payload.get('manga_list') or []
+                if not items:
+                    break
+
+                if total_pages is None:
+                    pagination = payload.get('pagination') or {}
+                    total_pages = pagination.get('total_pages')
+                    logger.info(
+                        f"[{label}] {pagination.get('total_results')} series "
+                        f"across {total_pages} page(s)"
+                    )
+
+                for item in items:
+                    series_id = item.get('id')
+                    if series_id in seen_ids:
+                        continue
+                    seen_ids.add(series_id)
+
+                    origin = (item.get('country_of_origin') or '').upper()
+                    if origin not in self.origins:
+                        skipped_origin += 1
+                        continue
+                    if not self._matches_tags(item):
+                        skipped_tags += 1
+                        continue
+                    # chapter_count tracks the latest chapter NUMBER, so it can
+                    # overstate how many chapters are actually posted when the
+                    # source has gaps. get_chapters() reports the real count.
+                    if int(item.get('chapter_count') or 0) < self.min_chapters:
+                        skipped_chapters += 1
+                        continue
+
+                    all_series.append(self._item_to_series(item))
+                    kept += 1
+
+                    if self.limit and kept >= self.limit:
+                        logger.info(f"Reached series limit ({self.limit})")
+                        return all_series
+
+                logger.info(
+                    f"  [{label}] page {page}/{total_pages or '?'} — "
+                    f"kept {kept} so far ({pages_fetched} page(s) fetched)"
+                )
+
+                if total_pages and page >= total_pages:
+                    break
+                page += 1
+                self._delay()
 
         logger.info(
-            f"MangaDot: kept {kept} series "
+            f"MangaDot: kept {kept} series from {pages_fetched} page(s) "
             f"(skipped {skipped_tags} on tags, {skipped_chapters} on chapter count, "
             f"{skipped_origin} on origin)"
         )
