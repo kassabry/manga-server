@@ -1262,6 +1262,14 @@ class BaseSiteScraper:
         if series.chapters_count > 0:
             xml_parts.append(f'  <Count>{series.chapters_count}</Count>')
 
+        # Alternate titles ("Other Names"), English-looking ones only.
+        alt_titles = getattr(series, '_md_alt_titles', None)
+        if alt_titles:
+            english = MangaDotScraper.english_alt_titles(alt_titles, series.title)
+            if english:
+                xml_parts.append(
+                    f'  <AlternateSeries>{escape_xml("; ".join(english))}</AlternateSeries>')
+
         # Publisher - use the source site name for organizational purposes
         if series.source:
             source_publishers = {
@@ -1407,7 +1415,16 @@ class BaseSiteScraper:
         # Helper: O(1) set lookup when pre-scan is available, stat() fallback otherwise.
         def _exists():
             if existing_cbzs is not None:
-                return cbz_name in existing_cbzs
+                if cbz_name in existing_cbzs:
+                    return True
+                # Case-insensitive fallback: a merged series takes its display
+                # title from the existing folder, whose casing can differ from
+                # the casing used in the filenames inside it (ManhuaTo writes
+                # "The Boy of Death" but titles the folder "The Boy Of Death").
+                # On Linux an exact match then fails for every chapter and the
+                # whole series looks missing.
+                lowered = cbz_name.lower()
+                return any(name.lower() == lowered for name in existing_cbzs)
             return cbz_path.exists()
 
         # Check if already downloaded — but only trust the cache if the CBZ file
@@ -4980,6 +4997,13 @@ class MangaDotScraper(BaseSiteScraper):
     # Per-series sidecar recording which version each chapter came from.
     VERSION_MANIFEST = '.mangadot_versions.json'
 
+    # Per-series sidecar holding metadata the CBZs cannot carry retroactively.
+    META_SIDECAR = '.mangadot_meta.json'
+
+    # Tone marks that betray a romanization (pinyin "Fēi Rénlèi") rather than
+    # an English title.  Latin script alone cannot tell the two apart.
+    _TONE_MARKS = frozenset('āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜñ')
+
     def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None,
                  origins: List[str] = None, required_tags: List[str] = None,
                  min_chapters: int = None, prefer_groups: List[str] = None):
@@ -5457,6 +5481,68 @@ class MangaDotScraper(BaseSiteScraper):
         if not chosen or chosen.get('url') == recorded.get('url'):
             return False
         return self.version_score(chosen) < self.version_score(recorded)
+
+    # -- alternate titles --------------------------------------------------
+
+    @classmethod
+    def english_alt_titles(cls, titles: List[str], primary: str = '') -> List[str]:
+        """Keep the alt titles that look like English, in original order.
+
+        Script is detectable exactly; language is not.  Non-Latin scripts
+        (CJK, Cyrillic, Hangul, Thai) are dropped with confidence, and tone
+        marks reliably identify a romanization.  What survives is Latin-script
+        text, which still includes unaccented romanizations like "Fei Ren Zai"
+        that no cheap test separates from English.  Entries that normalize to
+        the same key as the primary title or an earlier entry are dropped, so
+        accent-stripped duplicates collapse into one.
+        """
+        kept: List[str] = []
+        seen = {_md_norm(primary)} if primary else set()
+
+        for raw in titles or []:
+            title = (raw or '').strip()
+            if not title:
+                continue
+
+            letters = [c for c in title if c.isalpha()]
+            if not letters:
+                continue
+            # Require the text to be overwhelmingly Latin script.
+            latin = sum(1 for c in letters if 'LATIN' in unicodedata.name(c, ''))
+            if latin / len(letters) < 0.9:
+                continue
+            # Tone marks mean romanized CJK, not English.
+            if any(c in cls._TONE_MARKS for c in title.lower()):
+                continue
+
+            key = _md_norm(title)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            kept.append(title)
+
+        return kept
+
+    def save_series_meta(self, series_dir: Path, series: Series) -> List[str]:
+        """Write the alt-title sidecar and return the titles kept.
+
+        A sidecar rather than only ComicInfo: the scanner reads metadata from
+        the first CBZ in a series, so relying on the tag alone would leave
+        every already-downloaded series without alt titles until one of its
+        chapters happened to be re-fetched.
+        """
+        alt = self.english_alt_titles(
+            getattr(series, '_md_alt_titles', []), series.title)
+        if not alt:
+            return []
+        try:
+            series_dir.mkdir(parents=True, exist_ok=True)
+            payload = {'title': series.title, 'altTitles': alt, 'source': self.SITE_NAME}
+            with open(series_dir / self.META_SIDECAR, 'w', encoding='utf-8') as f:
+                json.dump(payload, f, indent=1, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"MangaDot: could not write alt-title sidecar: {e}")
+        return alt
 
     # -- pages -------------------------------------------------------------
 
@@ -6531,7 +6617,7 @@ Examples:
                         except OSError as e:
                             logger.warning(f"  Could not remove {cbz.name}: {e}")
                             continue
-                        existing_cbzs.discard(stem)
+                        existing_cbzs.discard(f"{stem}.cbz")
                         tracker.downloaded.discard(old.get('url') or '')
                         tracker.downloaded.discard(chapter.url)
                         upgrades_done += 1
@@ -6588,6 +6674,12 @@ Examples:
                                 'pages': int(chosen.get('pages') or 0),
                             }
                     scraper.save_version_manifest(md_series_dir, version_manifest)
+                    # Alt titles go in a sidecar as well as ComicInfo, so the
+                    # scanner can pick them up for series whose CBZs were
+                    # downloaded before AlternateSeries was being written.
+                    alt = scraper.save_series_meta(md_series_dir, series)
+                    if alt:
+                        logger.info(f"  Recorded {len(alt)} alternate title(s)")
 
                 # Always log a per-series summary so silent skips are visible
                 parts = []
