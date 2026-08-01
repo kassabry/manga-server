@@ -5006,11 +5006,15 @@ class MangaDotScraper(BaseSiteScraper):
 
     def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None,
                  origins: List[str] = None, required_tags: List[str] = None,
-                 min_chapters: int = None, prefer_groups: List[str] = None):
+                 min_chapters: int = None, prefer_groups: List[str] = None,
+                 tag_mode: str = 'any'):
         super().__init__(headless=headless, limit=limit, max_pages=max_pages)
         self.prefer_groups = list(prefer_groups if prefer_groups is not None
                                   else self.DEFAULT_PREFER_GROUPS)
         self.origins = [o.upper() for o in (origins or list(self.ORIGIN_FOLDER))]
+        self.tag_mode = (tag_mode or 'any').strip().lower()
+        if self.tag_mode not in ('any', 'all'):
+            raise ValueError(f"tag_mode must be 'any' or 'all', got {tag_mode!r}")
         tags = required_tags if required_tags else self.DEFAULT_TAGS
         # Original casing is needed for the query string; lowercase for matching.
         self.required_tags_raw = [t.strip() for t in tags if t.strip()]
@@ -5036,6 +5040,8 @@ class MangaDotScraper(BaseSiteScraper):
             return True
         have = {str(g).strip().lower() for g in (item.get('genres') or [])}
         have |= {str(t).strip().lower() for t in (item.get('tag_list') or [])}
+        if self.tag_mode == 'all':
+            return self.required_tags <= have
         return bool(have & self.required_tags)
 
     def _item_to_series(self, item: dict) -> Series:
@@ -5130,7 +5136,7 @@ class MangaDotScraper(BaseSiteScraper):
                 )
                 return []
             logger.info(f"  {tag}: {resolved[0]} ({resolved[1]} series)")
-            queries.append(resolved[0])
+            queries.append(resolved)
         return queries
 
     def get_all_series(self) -> List[Series]:
@@ -5147,9 +5153,19 @@ class MangaDotScraper(BaseSiteScraper):
             f"tags={self.required_tags_raw}, min_chapters={self.min_chapters})"
         )
 
-        queries = self._resolve_tag_queries() or ['']
-        if queries == ['']:
+        resolved = self._resolve_tag_queries()
+        if not resolved:
+            queries = ['']
             logger.info("Scanning full origin listing (no server-side tag filter)")
+        elif self.tag_mode == 'all':
+            # Every required tag must be present, so any single tag's result
+            # set already contains every match. Query only the narrowest one
+            # and let the client-side check apply the AND.
+            narrowest = min(resolved, key=lambda r: r[1])
+            queries = [narrowest[0]]
+            logger.info(f"tag-mode=all — querying only {narrowest[0]} ({narrowest[1]} series)")
+        else:
+            queries = [extra for extra, _ in resolved]
 
         all_series: List[Series] = []
         seen_ids: Set[int] = set()
@@ -5728,7 +5744,7 @@ PRIMARY_SITES = {
 def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None,
                 max_pages: int = None, origins: List[str] = None,
                 required_tags: List[str] = None, min_chapters: int = None,
-                prefer_groups: List[str] = None) -> BaseSiteScraper:
+                prefer_groups: List[str] = None, tag_mode: str = 'any') -> BaseSiteScraper:
     """Get scraper instance by site name"""
     site_lower = site.lower()
 
@@ -5741,7 +5757,8 @@ def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: i
             if scraper_class == MangaDotScraper:
                 return scraper_class(headless=headless, limit=limit, max_pages=max_pages,
                                      origins=origins, required_tags=required_tags,
-                                     min_chapters=min_chapters, prefer_groups=prefer_groups)
+                                     min_chapters=min_chapters, prefer_groups=prefer_groups,
+                                     tag_mode=tag_mode)
             return scraper_class(headless=headless, limit=limit, max_pages=max_pages)
     
     raise ValueError(f"Unknown site: {site}. Available: {list(SCRAPERS.keys())}")
@@ -6091,6 +6108,7 @@ Examples:
     parser.add_argument('--merge-threshold', type=int, default=88, help='For MangaDot: similarity %% (0-100) above which a near-match is flagged for review (default: 88)')
     parser.add_argument('--no-alias-merge', action='store_true', help='For MangaDot: disable alt-title ("Other Names") matching against existing series')
     parser.add_argument('--prefer-groups', help='For MangaDot: comma-separated scanlation groups, best first, used to pick between multiple versions of a chapter (optional — omit to just drop stubs and prefer more pages)')
+    parser.add_argument('--tag-mode', choices=['any', 'all'], default='any', help='For MangaDot: keep a series if it has ANY of --tags (default) or requires ALL of them')
     parser.add_argument('--report-groups', action='store_true', help='For MangaDot: survey which scanlation groups post the best versions and write a CSV to --output, to build a --prefer-groups list')
     parser.add_argument('--max-upgrades', type=int, default=25, help='For MangaDot: max chapters per run to re-download because a better version appeared (default: 25, 0 disables)')
     
@@ -6286,7 +6304,8 @@ Examples:
                               max_pages=getattr(args, 'pages', None),
                               origins=md_origins, required_tags=md_tags,
                               min_chapters=args.min_chapters or None,
-                              prefer_groups=md_groups)
+                              prefer_groups=md_groups,
+                              tag_mode=getattr(args, 'tag_mode', 'any'))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
@@ -6444,7 +6463,8 @@ Examples:
                               max_pages=getattr(args, 'pages', None),
                               origins=md_origins, required_tags=md_tags,
                               min_chapters=args.min_chapters or None,
-                              prefer_groups=md_groups)
+                              prefer_groups=md_groups,
+                              tag_mode=getattr(args, 'tag_mode', 'any'))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
