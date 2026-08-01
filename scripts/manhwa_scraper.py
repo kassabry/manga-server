@@ -5304,8 +5304,9 @@ class MangaDotScraper(BaseSiteScraper):
     def _group_rank(self, group: str) -> int:
         """Position in the preferred-group list; unknown groups sort after."""
         name = (group or '').strip().lower()
-        if not name or name == 'no group':
-            # Ungrouped uploads are usually raw/placeholder dumps — last resort.
+        # The site spells ungrouped uploads several ways ("No Group",
+        # "No-group", "(no group)"); all are raw/placeholder dumps — last resort.
+        if not name or re.fullmatch(r'\(?no[\s_-]?group\)?', name):
             return len(self.prefer_groups) + 1
         for i, preferred in enumerate(self.prefer_groups):
             if preferred.strip().lower() == name:
@@ -5437,6 +5438,94 @@ class MangaDotScraper(BaseSiteScraper):
 
         pages.sort(key=page_key)
         return pages
+
+
+def report_mangadot_groups(scraper: 'MangaDotScraper', series_list: List[Series],
+                           output_file: Path) -> None:
+    """Tally which scanlation groups appear on MangaDot, to inform --prefer-groups.
+
+    Answers the question the flag otherwise leaves to guesswork: you cannot
+    know which groups are worth preferring until you have seen how they
+    actually behave on the series you scrape.  Groups are ranked by how often
+    they post the largest version of a chapter they compete for; a group that
+    only ever appears unopposed tells you nothing, so contested chapters are
+    counted separately.
+    """
+    stats: Dict[str, dict] = {}
+    contested_seen = 0
+
+    for i, series in enumerate(series_list, 1):
+        logger.info(f"[{i}/{len(series_list)}] Surveying: {series.title}")
+        try:
+            chapters = scraper.get_chapters(series)
+        except Exception as e:
+            logger.warning(f"  Skipped: {e}")
+            continue
+
+        for chapter in chapters:
+            versions = getattr(chapter, '_md_versions', []) or []
+            contested = len(versions) > 1
+            if contested:
+                contested_seen += 1
+                best_pages = max(int(v.get('pages') or 0) for v in versions)
+                floor = best_pages * scraper.PAGE_FLOOR_RATIO
+            for version in versions:
+                name = version.get('group') or '(no group)'
+                row = stats.setdefault(name, {
+                    'group': name, 'chapters': 0, 'contested': 0,
+                    'won': 0, 'stub': 0, 'total_pages': 0,
+                })
+                pages = int(version.get('pages') or 0)
+                row['chapters'] += 1
+                row['total_pages'] += pages
+                if contested:
+                    row['contested'] += 1
+                    if pages >= best_pages:
+                        row['won'] += 1
+                    if best_pages > 0 and pages < floor:
+                        row['stub'] += 1
+
+    if not stats:
+        logger.warning("No chapter versions found — nothing to report.")
+        return
+
+    rows = []
+    for row in stats.values():
+        row['avg_pages'] = round(row['total_pages'] / row['chapters'], 1) if row['chapters'] else 0
+        row['win_rate'] = round(row['won'] / row['contested'], 3) if row['contested'] else ''
+        row['stub_rate'] = round(row['stub'] / row['contested'], 3) if row['contested'] else ''
+        rows.append(row)
+
+    # Most-contested first: those are the groups the preference list decides between.
+    rows.sort(key=lambda r: (-r['contested'], -r['chapters']))
+
+    fields = ['group', 'chapters', 'contested', 'won', 'win_rate',
+              'stub', 'stub_rate', 'avg_pages']
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"Surveyed {len(series_list)} series, {contested_seen} contested chapter(s)")
+    logger.info(f"Wrote {len(rows)} group(s) to {output_file}")
+
+    # Ungrouped uploads are deprioritized by rank anyway, so never suggest
+    # them; and a group that mostly posts stubs is not worth preferring even
+    # if it happens to win the chapters it does contest.
+    ranked = [r for r in rows
+              if r['contested'] >= 3
+              and not re.fullmatch(r'\(?no[\s_-]?group\)?', r['group'].strip().lower())
+              and (r['stub_rate'] or 0) < 0.25]
+    ranked.sort(key=lambda r: (-(r['win_rate'] or 0), -r['contested']))
+    if ranked:
+        logger.info("Suggested --prefer-groups (win rate on contested chapters, "
+                    "stub-heavy groups excluded):")
+        logger.info('  --prefer-groups "%s"' % ','.join(r['group'] for r in ranked[:8]))
+        logger.info("Groups not listed still get used — they just lose ties.")
+    else:
+        logger.info("Too few contested chapters to suggest an order — "
+                    "the default (drop stubs, prefer more pages) is fine.")
 
 
 # Site registry
@@ -5842,7 +5931,8 @@ Examples:
     parser.add_argument('--merge-csv', help='For MangaDot: write near-duplicate merge candidates to this CSV for review (default: <output>/mangadot_merge_candidates.csv)')
     parser.add_argument('--merge-threshold', type=int, default=88, help='For MangaDot: similarity %% (0-100) above which a near-match is flagged for review (default: 88)')
     parser.add_argument('--no-alias-merge', action='store_true', help='For MangaDot: disable alt-title ("Other Names") matching against existing series')
-    parser.add_argument('--prefer-groups', help='For MangaDot: comma-separated scanlation groups, best first, used to pick between multiple versions of a chapter')
+    parser.add_argument('--prefer-groups', help='For MangaDot: comma-separated scanlation groups, best first, used to pick between multiple versions of a chapter (optional — omit to just drop stubs and prefer more pages)')
+    parser.add_argument('--report-groups', action='store_true', help='For MangaDot: survey which scanlation groups post the best versions and write a CSV to --output, to build a --prefer-groups list')
     parser.add_argument('--max-upgrades', type=int, default=25, help='For MangaDot: max chapters per run to re-download because a better version appeared (default: 25, 0 disables)')
     
     args = parser.parse_args()
@@ -5944,6 +6034,22 @@ Examples:
         logger.info(f"Done! Downloaded to: {output_path}")
         return
     
+    # Mode 0b: Survey MangaDot scanlation groups to build --prefer-groups
+    if getattr(args, 'report_groups', False) and args.site:
+        md_origins = ([o.strip().upper() for o in args.origin.split(',') if o.strip()]
+                      if getattr(args, 'origin', None) else None)
+        scraper = get_scraper(args.site, headless, limit=args.limit,
+                              max_pages=getattr(args, 'pages', None),
+                              origins=md_origins,
+                              min_chapters=args.min_chapters or None)
+        if not isinstance(scraper, MangaDotScraper):
+            logger.error("--report-groups is only supported for --site mangadot")
+            return
+        series_list = scraper.get_all_series()
+        report_mangadot_groups(scraper, series_list, output_path)
+        scraper._close_driver()
+        return
+
     # Mode 1: List all series from a site (or all sites)
     if args.list_all and args.site:
         all_series = []

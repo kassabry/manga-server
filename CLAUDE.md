@@ -61,6 +61,10 @@
 - `.mangadot_versions.json` per series dir records the chosen version's url/group/pages; `is_upgrade()` compares it on later runs
 - Chapters with no manifest entry are never upgraded — that's deliberate, otherwise the first run after adding version tracking re-downloads the whole back catalogue
 - `--max-upgrades` (default 25) caps re-downloads per run; upgrades delete the CBZ and clear the tracker entry so the normal path re-fetches it
+- `--prefer-groups` is OPTIONAL — with it empty, real groups beat ungrouped uploads and more pages wins the tie, which is already sensible
+- The site spells ungrouped uploads "No Group", "No-group" and "(no group)"; `_group_rank` matches all three and sorts them last
+- `--report-groups -o groups.csv` surveys which groups win contested chapters (win rate, stub rate, avg pages) and prints a suggested `--prefer-groups` line. Bound the survey with `--pages`/`--limit`; it needs a Selenium chapter-list load per series
+- Real signal from a 4-series survey: on the same 339 contested chapters Asura Scans won 94% with 0% stubs, Drake Scans 16% with 46% stubs — worth surveying before assuming page count alone is enough
 
 ## Maintenance Scripts
 - `scripts/fix_flame_chapters.py` — fixes wrong chapter numbers in already-downloaded Flame CBZs by sorting numerically and renumbering 1, 2, 3… Dry-run by default; use `--apply [--db path/to/mangashelf.db]`
