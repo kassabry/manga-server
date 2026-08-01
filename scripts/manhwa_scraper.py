@@ -4969,10 +4969,23 @@ class MangaDotScraper(BaseSiteScraper):
     # Chapter page images live under this path prefix.
     _PAGE_PREFIX = "/chapters/manga_"
 
+    # A version with fewer than this fraction of the best sibling's page count
+    # is treated as a stub upload (e.g. a 1p or 6p entry beside a 73p one).
+    PAGE_FLOOR_RATIO = 0.5
+
+    # Preferred scanlation groups, best first.  Unlisted groups sort after
+    # these; "No Group" sorts last.  Override with --prefer-groups.
+    DEFAULT_PREFER_GROUPS: List[str] = []
+
+    # Per-series sidecar recording which version each chapter came from.
+    VERSION_MANIFEST = '.mangadot_versions.json'
+
     def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None,
                  origins: List[str] = None, required_tags: List[str] = None,
-                 min_chapters: int = None):
+                 min_chapters: int = None, prefer_groups: List[str] = None):
         super().__init__(headless=headless, limit=limit, max_pages=max_pages)
+        self.prefer_groups = list(prefer_groups if prefer_groups is not None
+                                  else self.DEFAULT_PREFER_GROUPS)
         self.origins = [o.upper() for o in (origins or list(self.ORIGIN_FOLDER))]
         tags = required_tags if required_tags else self.DEFAULT_TAGS
         self.required_tags = frozenset(t.strip().lower() for t in tags if t.strip())
@@ -5195,9 +5208,11 @@ class MangaDotScraper(BaseSiteScraper):
             logger.warning(f"MangaDot: could not read chapter list: {e}")
             return []
 
-        # Several scanlation groups may post the same chapter number; keep the
-        # first listing for each number (the site orders them best-first).
-        by_number: Dict[str, Chapter] = {}
+        # A chapter posted by several groups contributes one anchor per
+        # version, so collect them all and choose afterwards rather than
+        # taking whichever happens to come first in the DOM.
+        versions_by_number: Dict[str, List[dict]] = {}
+        titles_by_number: Dict[str, str] = {}
         for href, texts in raw:
             if not href or '/chapter/' not in href:
                 continue
@@ -5220,22 +5235,154 @@ class MangaDotScraper(BaseSiteScraper):
                 number = str(int(as_float)) if as_float.is_integer() else str(as_float)
             except ValueError:
                 continue
-            if number in by_number:
-                continue
 
             full_url = href if href.startswith('http') else self.BASE_URL + href
-            # Strip the trailing title/uploader metadata from the link text.
-            title = re.sub(r'^\W*Ch\.\s*[\d.]+\s*', '', text).strip()
-            title = re.split(r'\s+upload\b', title)[0].strip()
-            by_number[number] = Chapter(
-                number=number,
-                title=title or f"Chapter {number}",
-                url=full_url,
-            )
+            # The anchor's own text describes this specific version; the
+            # ancestor text (used for the number) covers the whole group.
+            own = texts[0] if texts else ''
+            version = {
+                'url': full_url,
+                'group': self._parse_group(own),
+                'pages': self._parse_page_count(own),
+            }
+            if not any(v['url'] == full_url for v in versions_by_number.setdefault(number, [])):
+                versions_by_number[number].append(version)
 
-        chapters = sorted(by_number.values(), key=lambda c: float(c.number))
-        logger.info(f"MangaDot: {len(chapters)} chapter(s) for {series.title!r}")
+            if number not in titles_by_number:
+                titles_by_number[number] = self._clean_chapter_title(text, number)
+
+        chapters = []
+        multi = 0
+        for number, versions in versions_by_number.items():
+            best = self.select_version(versions)
+            chapter = Chapter(
+                number=number,
+                title=titles_by_number.get(number) or f"Chapter {number}",
+                url=best['url'],
+            )
+            # Carried so the download loop can record what was taken and spot
+            # a better version on a later run.
+            chapter._md_versions = versions
+            chapter._md_version = best
+            chapters.append(chapter)
+            if len(versions) > 1:
+                multi += 1
+
+        chapters.sort(key=lambda c: float(c.number))
+        logger.info(
+            f"MangaDot: {len(chapters)} chapter(s) for {series.title!r} "
+            f"({multi} with multiple versions)"
+        )
         return chapters
+
+    # -- version selection -------------------------------------------------
+
+    @staticmethod
+    def _parse_group(text: str) -> str:
+        """Scanlation group from a version row ("… upload Qi Manhwa · MD 147p")."""
+        match = re.search(r'upload\s+(.+?)\s*·', text or '')
+        return match.group(1).strip() if match else ''
+
+    @staticmethod
+    def _parse_page_count(text: str) -> int:
+        """Page count from a version row ("147p" -> 147)."""
+        match = re.search(r'\b(\d+)\s*p\b', text or '')
+        return int(match.group(1)) if match else 0
+
+    @staticmethod
+    def _clean_chapter_title(text: str, number: str) -> str:
+        """Strip the leading "Ch. N" and any trailing version/uploader noise."""
+        title = re.sub(r'^\W*Ch\.\s*[\d.]+\s*', '', text or '').strip()
+        title = re.split(r'\s+upload\b', title)[0]
+        title = re.split(r'\s*\d+\s+VERSIONS?\b', title)[0]
+        title = title.strip(' ·└○▾-—')
+        # The site repeats "Chapter N" as a placeholder when there is no title.
+        if re.fullmatch(rf'Chapter\s*{re.escape(number)}', title.strip(), re.I):
+            return f"Chapter {number}"
+        return title.strip()
+
+    def _group_rank(self, group: str) -> int:
+        """Position in the preferred-group list; unknown groups sort after."""
+        name = (group or '').strip().lower()
+        if not name or name == 'no group':
+            # Ungrouped uploads are usually raw/placeholder dumps — last resort.
+            return len(self.prefer_groups) + 1
+        for i, preferred in enumerate(self.prefer_groups):
+            if preferred.strip().lower() == name:
+                return i
+        return len(self.prefer_groups)
+
+    def version_score(self, version: dict) -> tuple:
+        """Sort key for a version — lower is better."""
+        return (self._group_rank(version.get('group', '')),
+                -int(version.get('pages') or 0))
+
+    def select_version(self, versions: List[dict]) -> dict:
+        """Pick the best version of a chapter.
+
+        Page count is only a rough quality signal — a long-strip chapter cut
+        into 6 tall images can equal one cut into 147 short ones — so it is
+        used as a floor rather than a ranking: versions far below the best
+        sibling are dropped as stubs (a 1p upload next to a 73p one), and the
+        preferred-group order decides among what remains.
+        """
+        if not versions:
+            return {}
+        if len(versions) == 1:
+            return versions[0]
+
+        best_pages = max(int(v.get('pages') or 0) for v in versions)
+        if best_pages > 0:
+            floor = best_pages * self.PAGE_FLOOR_RATIO
+            viable = [v for v in versions if int(v.get('pages') or 0) >= floor]
+        else:
+            viable = []
+        # If page counts are missing or every version looks like a stub, fall
+        # back to the full set so we still return something.
+        if not viable:
+            viable = list(versions)
+
+        return sorted(viable, key=self.version_score)[0]
+
+    # -- version manifest --------------------------------------------------
+
+    def load_version_manifest(self, series_dir: Path) -> dict:
+        """Read the per-series record of which version each chapter came from."""
+        path = series_dir / self.VERSION_MANIFEST
+        if not path.exists():
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.warning(f"MangaDot: could not read {path.name}: {e}")
+            return {}
+
+    def save_version_manifest(self, series_dir: Path, manifest: dict) -> None:
+        if not manifest:
+            return
+        try:
+            series_dir.mkdir(parents=True, exist_ok=True)
+            with open(series_dir / self.VERSION_MANIFEST, 'w', encoding='utf-8') as f:
+                json.dump(manifest, f, indent=1, sort_keys=True)
+        except Exception as e:
+            logger.warning(f"MangaDot: could not write version manifest: {e}")
+
+    def is_upgrade(self, chapter: Chapter, manifest: dict) -> bool:
+        """True when the chosen version beats the one already on disk.
+
+        A chapter with no manifest entry is left alone: it predates version
+        tracking, and re-downloading the whole back catalogue on the first
+        run after this change is exactly the stampede we want to avoid.
+        """
+        recorded = manifest.get(str(chapter.number))
+        if not recorded:
+            return False
+        chosen = getattr(chapter, '_md_version', None) or {}
+        if not chosen or chosen.get('url') == recorded.get('url'):
+            return False
+        return self.version_score(chosen) < self.version_score(recorded)
 
     # -- pages -------------------------------------------------------------
 
@@ -5332,7 +5479,8 @@ PRIMARY_SITES = {
 
 def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None,
                 max_pages: int = None, origins: List[str] = None,
-                required_tags: List[str] = None, min_chapters: int = None) -> BaseSiteScraper:
+                required_tags: List[str] = None, min_chapters: int = None,
+                prefer_groups: List[str] = None) -> BaseSiteScraper:
     """Get scraper instance by site name"""
     site_lower = site.lower()
 
@@ -5345,7 +5493,7 @@ def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: i
             if scraper_class == MangaDotScraper:
                 return scraper_class(headless=headless, limit=limit, max_pages=max_pages,
                                      origins=origins, required_tags=required_tags,
-                                     min_chapters=min_chapters)
+                                     min_chapters=min_chapters, prefer_groups=prefer_groups)
             return scraper_class(headless=headless, limit=limit, max_pages=max_pages)
     
     raise ValueError(f"Unknown site: {site}. Available: {list(SCRAPERS.keys())}")
@@ -5694,6 +5842,8 @@ Examples:
     parser.add_argument('--merge-csv', help='For MangaDot: write near-duplicate merge candidates to this CSV for review (default: <output>/mangadot_merge_candidates.csv)')
     parser.add_argument('--merge-threshold', type=int, default=88, help='For MangaDot: similarity %% (0-100) above which a near-match is flagged for review (default: 88)')
     parser.add_argument('--no-alias-merge', action='store_true', help='For MangaDot: disable alt-title ("Other Names") matching against existing series')
+    parser.add_argument('--prefer-groups', help='For MangaDot: comma-separated scanlation groups, best first, used to pick between multiple versions of a chapter')
+    parser.add_argument('--max-upgrades', type=int, default=25, help='For MangaDot: max chapters per run to re-download because a better version appeared (default: 25, 0 disables)')
     
     args = parser.parse_args()
     
@@ -5865,10 +6015,13 @@ Examples:
                       if getattr(args, 'origin', None) else None)
         md_tags = ([t.strip() for t in args.tags.split(',') if t.strip()]
                    if getattr(args, 'tags', None) else None)
+        md_groups = ([g.strip() for g in args.prefer_groups.split(',') if g.strip()]
+                     if getattr(args, 'prefer_groups', None) else None)
         scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit,
                               max_pages=getattr(args, 'pages', None),
                               origins=md_origins, required_tags=md_tags,
-                              min_chapters=args.min_chapters or None)
+                              min_chapters=args.min_chapters or None,
+                              prefer_groups=md_groups)
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
@@ -6020,10 +6173,13 @@ Examples:
                       if getattr(args, 'origin', None) else None)
         md_tags = ([t.strip() for t in args.tags.split(',') if t.strip()]
                    if getattr(args, 'tags', None) else None)
+        md_groups = ([g.strip() for g in args.prefer_groups.split(',') if g.strip()]
+                     if getattr(args, 'prefer_groups', None) else None)
         scraper = get_scraper(args.site, headless, canvas=args.canvas, limit=args.limit,
                               max_pages=getattr(args, 'pages', None),
                               origins=md_origins, required_tags=md_tags,
-                              min_chapters=args.min_chapters or None)
+                              min_chapters=args.min_chapters or None,
+                              prefer_groups=md_groups)
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
@@ -6083,6 +6239,12 @@ Examples:
             alias_index = MangaDotAliasIndex(
                 index_dirs, threshold=args.merge_threshold / 100.0
             )
+
+        # Run-wide budget for re-downloading chapters whose chosen version was
+        # beaten by a better one. Capped so a newly preferred group cannot
+        # trigger a library-wide re-download in a single run.
+        upgrade_budget = args.max_upgrades if isinstance(scraper, MangaDotScraper) else 0
+        upgrades_done = 0
 
         # Download each series
         for i, series in enumerate(series_list, 1):
@@ -6148,6 +6310,46 @@ Examples:
                 # set lookups instead of individual stat() calls on the NFS mount.
                 existing_cbzs = scraper._scan_series_dir(display_title, output_path)
 
+                # MangaDot: re-download chapters whose recorded version has been
+                # beaten by a better one.  The existing CBZ is removed and the
+                # tracker entry cleared so the normal download path picks it up.
+                version_manifest = {}
+                md_series_dir = None
+                if isinstance(scraper, MangaDotScraper):
+                    md_series_dir = output_path / scraper._sanitize_filename(display_title)
+                    version_manifest = scraper.load_version_manifest(md_series_dir)
+                    for chapter in chapters:
+                        if upgrades_done >= upgrade_budget:
+                            break
+                        if not scraper.is_upgrade(chapter, version_manifest):
+                            continue
+                        old = version_manifest.get(str(chapter.number), {})
+                        new = getattr(chapter, '_md_version', {})
+                        stem = scraper._sanitize_filename(
+                            f"{display_title} - Chapter {chapter.number}")
+                        cbz = md_series_dir / f"{stem}.cbz"
+                        if not cbz.exists():
+                            continue
+                        logger.info(
+                            f"  Upgrading Ch.{chapter.number}: "
+                            f"{old.get('group') or '?'} ({old.get('pages') or '?'}p) -> "
+                            f"{new.get('group') or '?'} ({new.get('pages') or '?'}p)"
+                        )
+                        try:
+                            cbz.unlink()
+                        except OSError as e:
+                            logger.warning(f"  Could not remove {cbz.name}: {e}")
+                            continue
+                        existing_cbzs.discard(stem)
+                        tracker.downloaded.discard(old.get('url') or '')
+                        tracker.downloaded.discard(chapter.url)
+                        upgrades_done += 1
+                    if upgrades_done >= upgrade_budget and upgrade_budget:
+                        logger.info(
+                            f"  Upgrade budget reached ({upgrade_budget}); "
+                            f"remaining upgrades will run next time"
+                        )
+
                 # ManhuaFast uses raw Chinese chapter numbers that can be 3-6×
                 # higher than the English translation numbers used by other sources.
                 # Detect the mismatch and renumber out-of-range chapters sequentially.
@@ -6178,6 +6380,23 @@ Examples:
                 # Flush tracker to disk once per series instead of once per chapter.
                 # This turns O(N) disk writes per series into O(1).
                 tracker.save()
+
+                # Record which version each chapter on disk came from, so a
+                # later run can tell whether a better one has since appeared.
+                if md_series_dir is not None and md_series_dir.exists():
+                    for chapter in chapters:
+                        chosen = getattr(chapter, '_md_version', None)
+                        if not chosen:
+                            continue
+                        stem = scraper._sanitize_filename(
+                            f"{display_title} - Chapter {chapter.number}")
+                        if (md_series_dir / f"{stem}.cbz").exists():
+                            version_manifest[str(chapter.number)] = {
+                                'url': chosen.get('url', ''),
+                                'group': chosen.get('group', ''),
+                                'pages': int(chosen.get('pages') or 0),
+                            }
+                    scraper.save_version_manifest(md_series_dir, version_manifest)
 
                 # Always log a per-series summary so silent skips are visible
                 parts = []

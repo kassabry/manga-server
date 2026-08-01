@@ -54,6 +54,14 @@
 - Origin routing is per-invocation via `--origin KR -o library/Manhwa` / `--origin CN -o library/Manhua`
 - Alt-title merging: exact match on title or any "Other Names" entry auto-merges into the existing folder; near-matches go to `mangadot_merge_candidates.csv` for review (apply via `suggest_merges.py`). Disable with `--no-alias-merge`
 
+### Multi-version chapters
+- Each version is its own anchor: `└ ○ upload {Group} · MD {N}p {date}` — group and page count parse straight out of it
+- DOM order is NOT quality order (Ch. 215 of manga/26041 lists a 4p version before a 5p one), so never just take the first anchor
+- Page count is a floor, not a ranking: a long-strip chapter cut into 6 tall images can equal one cut into 147 short ones, so `PAGE_FLOOR_RATIO` (0.5) only drops stub uploads, and `--prefer-groups` decides among what survives. A preferred group posting a stub still loses
+- `.mangadot_versions.json` per series dir records the chosen version's url/group/pages; `is_upgrade()` compares it on later runs
+- Chapters with no manifest entry are never upgraded — that's deliberate, otherwise the first run after adding version tracking re-downloads the whole back catalogue
+- `--max-upgrades` (default 25) caps re-downloads per run; upgrades delete the CBZ and clear the tracker entry so the normal path re-fetches it
+
 ## Maintenance Scripts
 - `scripts/fix_flame_chapters.py` — fixes wrong chapter numbers in already-downloaded Flame CBZs by sorting numerically and renumbering 1, 2, 3… Dry-run by default; use `--apply [--db path/to/mangashelf.db]`
 - Run after any FlameComics re-scrape where chapter numbers look wrong (e.g. Ch.14 instead of Ch.1)
