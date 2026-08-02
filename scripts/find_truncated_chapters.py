@@ -14,8 +14,12 @@ the images actually inside the CBZ.
     python scripts/find_truncated_chapters.py --library library
 
     # delete the short ones so the next scrape refetches them
-    python scripts/find_truncated_chapters.py --library library --apply \
-        --tracker manhwa_downloader_progress.json
+    python scripts/find_truncated_chapters.py --library library --apply
+
+Then just re-run the MangaDot scraper as usual — no extra flag. Deleting the
+CBZ is the whole trigger: download_chapter only honours its progress tracker
+while the file is still on disk, and otherwise clears the entry itself and
+refetches. `--tracker` merely keeps that progress file tidy.
 
 A little slack is allowed by default because the downloader legitimately drops
 a few promo images per chapter (_filter_outlier_images_by_dimension), so an
@@ -161,9 +165,9 @@ def main() -> int:
                         help='Delete short CBZs so they are refetched '
                              '(default: report only)')
     parser.add_argument('--tracker',
-                        help='Downloader progress JSON to clear refetched URLs '
-                             'from. Without it the scraper will skip the '
-                             'deleted chapters as already downloaded')
+                        help='Optional: downloader progress JSON to prune the '
+                             'refetched URLs from. Not required — the scraper '
+                             'already refetches any chapter whose CBZ is gone')
     parser.add_argument('--tolerance', type=float, default=DEFAULT_TOLERANCE,
                         help='Fraction of the advertised page count a chapter '
                              'must reach (default: %.2f)' % DEFAULT_TOLERANCE)
@@ -245,10 +249,12 @@ def main() -> int:
 
     print('\nDeleted %d incomplete chapter file(s).' % removed)
 
+    print('Re-run the MangaDot scraper to refetch them — no extra flags needed.')
+
     if not args.tracker:
-        print('No --tracker given. The scraper treats a URL in its progress')
-        print('file as already downloaded, so it will likely SKIP these rather')
-        print('than refetch them — rerun with --tracker to clear them.')
+        # Deleting the file is enough on its own: download_chapter only trusts
+        # the tracker while the CBZ is still there, and otherwise drops the
+        # entry itself and refetches.
         return 0
 
     try:
@@ -269,8 +275,7 @@ def main() -> int:
               % (dropped, before, len(downloaded)))
     except Exception as e:
         print('WARNING: could not write tracker %s (%s).' % (args.tracker, e))
-
-    print('\nRe-run the MangaDot scraper to refetch them.')
+        print('Harmless — the scraper refetches any chapter whose CBZ is gone.')
     return 0
 
 

@@ -58,7 +58,8 @@
 - The reader lazy-loads images on scroll. Walk it with a step of ~0.8 × viewport height and bound the loop by `document.body.scrollHeight` **re-read every pass** (it grows as images resolve) — never by a fixed iteration count
 - A fixed `range(40)` of `innerHeight * 1.5` jumps was silently truncating long chapters: a simulated 147-page chapter collected **34 pages**, and the resulting CBZ looks complete. Big jumps also outrun the lazy-load observer
 - The chosen version advertises its page count (`_md_version['pages']`, from "… · MD 147p"). Use it as ground truth: stop early once all pages are in, retry once if short, and log an ERROR if still short — never return a silently truncated chapter
-- `scripts/find_truncated_chapters.py` finds already-downloaded victims by comparing CBZ image count against `.mangadot_versions.json`. `--apply` deletes them, drops the manifest entry, and clears the tracker URL so a rescrape refetches. Needs `--tracker`, or the scraper treats them as already downloaded and skips
+- `scripts/find_truncated_chapters.py` finds already-downloaded victims by comparing CBZ image count against `.mangadot_versions.json`. `--apply` deletes them; the next normal scrape refetches. No scraper flag needed
+- Deleting a CBZ is enough to force a refetch: `download_chapter` only honours the tracker when the file is still on disk, and otherwise discards the tracker entry and re-downloads ("Re-downloading (file missing)"). `--tracker` on the repair script is optional tidiness, not a requirement
 - Default tolerance is 90% of the advertised count, because `_filter_outlier_images_by_dimension` legitimately removes a few promo images per chapter
 
 ### Multi-version chapters
