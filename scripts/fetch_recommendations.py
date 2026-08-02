@@ -32,11 +32,13 @@ rather than list[...], no `X | Y` unions.
 
 import argparse
 import csv
+import html as html_lib
 import json
 import os
 import re
 import sqlite3
 import sys
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -132,6 +134,43 @@ def new_id() -> str:
 # HTTP
 # ---------------------------------------------------------------------------
 
+def json_from_html(body: str) -> Optional[dict]:
+    """Pull a JSON document out of what FlareSolverr hands back.
+
+    FlareSolverr returns the *rendered* page, so a JSON endpoint comes back
+    wrapped in Chrome's viewer markup (`<html><body><pre>{...}</pre>`) rather
+    than as a bare document. Falls through progressively so a change in that
+    wrapper does not break everything.
+    """
+    if not body:
+        return None
+    text = body.strip()
+
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+
+    match = re.search(r'<pre[^>]*>(.*?)</pre>', text, re.S | re.I)
+    candidate = match.group(1) if match else re.sub(r'<[^>]+>', '', text)
+    candidate = html_lib.unescape(candidate).strip()
+
+    try:
+        return json.loads(candidate)
+    except ValueError:
+        pass
+
+    # Last resort: the outermost braces in whatever is left.
+    start, end = candidate.find('{'), candidate.rfind('}')
+    if start != -1 and end > start:
+        try:
+            return json.loads(candidate[start:end + 1])
+        except ValueError:
+            pass
+    print('    could not parse JSON from FlareSolverr response')
+    return None
+
+
 class ChallengeBlocked(Exception):
     """MangaDot is behind a Cloudflare challenge we could not clear."""
 
@@ -153,6 +192,7 @@ class MangaDotClient:
         self.fs_url = (flaresolverr_url
                        or os.environ.get('FLARESOLVERR_URL', 'http://localhost:8191'))
         self._solved = False
+        self._announced = False
 
     @staticmethod
     def _is_challenge(resp) -> bool:
@@ -168,16 +208,19 @@ class MangaDotClient:
         except Exception:
             return False
 
-    def _solve(self) -> None:
-        """Clear the challenge against the site root and keep the cookies.
+    def _solver_get(self, url: str) -> Optional[dict]:
+        """Fetch a URL *through* FlareSolverr's browser and parse the JSON.
 
-        Solved against the root rather than the API URL because FlareSolverr
-        returns a rendered HTML page — useless for JSON. All we want is
-        cf_clearance, which applies to the whole domain.
+        Cookies alone are not enough. Cloudflare binds cf_clearance to the TLS
+        fingerprint of the browser that earned it, and requests' fingerprint is
+        not Chrome's — replaying the cookies gets challenged straight back.
+        (The same constraint is noted on _flaresolverr_post in
+        manhwa_scraper.py.) So the real request goes through the browser, and
+        the cookies are kept only as a fast path worth trying first.
         """
         resp = requests.post(
             '%s/v1' % self.fs_url,
-            json={'cmd': 'request.get', 'url': MANGADOT_BASE + '/', 'maxTimeout': 60000},
+            json={'cmd': 'request.get', 'url': url, 'maxTimeout': 60000},
             timeout=120,
         )
         resp.raise_for_status()
@@ -196,22 +239,24 @@ class MangaDotClient:
             self.session.headers['User-Agent'] = solution['userAgent']
         self._solved = True
 
-    def get_json(self, url: str) -> Optional[dict]:
-        """Fetch JSON, solving a challenge once if one appears.
+        return json_from_html(solution.get('response') or '')
 
-        Raises ChallengeBlocked when the wall cannot be cleared — the caller is
-        expected to stop rather than grind through the rest of the library
+    def get_json(self, url: str) -> Optional[dict]:
+        """Fetch JSON, going through FlareSolverr if Cloudflare intervenes.
+
+        Raises ChallengeBlocked when even the browser cannot get through — the
+        caller stops rather than grinding through the rest of the library
         collecting identical failures.
         """
-        for attempt in range(2):
+        # Fast path: a plain request, which works until Cloudflare decides
+        # otherwise and costs nothing when it does work.
+        challenged = False
+        for _ in range(3):
             try:
                 resp = self.session.get(url, timeout=30)
             except Exception as e:
-                if attempt:
-                    print('    request failed (%s): %s' % (type(e).__name__, e))
-                    return None
-                time.sleep(2)
-                continue
+                print('    request failed (%s): %s' % (type(e).__name__, e))
+                return None
 
             if resp.status_code == 404:
                 return None
@@ -220,29 +265,29 @@ class MangaDotClient:
                 print('    rate limited, waiting %ss' % wait)
                 time.sleep(wait)
                 continue
-
             if self._is_challenge(resp):
-                # Retrying a challenge without solving it just multiplies load
-                # and digs the hole deeper, so solve or give up.
-                if self._solved or attempt:
-                    raise ChallengeBlocked(
-                        'Cloudflare is still challenging after a FlareSolverr solve')
-                if not self.flaresolverr_available():
-                    raise ChallengeBlocked(
-                        'Cloudflare challenge, and FlareSolverr is not reachable at %s'
-                        % self.fs_url)
-                print('    Cloudflare challenge — solving via FlareSolverr...')
-                self._solve()
-                continue
-
-            if resp.status_code != 200:
+                challenged = True
+            elif resp.status_code == 200:
+                try:
+                    return resp.json()
+                except ValueError:
+                    return None
+            else:
                 print('    HTTP %s on %s' % (resp.status_code, url[:70]))
                 return None
-            try:
-                return resp.json()
-            except ValueError:
-                return None
-        return None
+            break
+
+        if not challenged:
+            return None
+
+        if not self._announced:
+            print('    Cloudflare challenge — routing requests through FlareSolverr')
+            self._announced = True
+            if not self.flaresolverr_available():
+                raise ChallengeBlocked(
+                    'Cloudflare challenge, and FlareSolverr is not reachable at %s'
+                    % self.fs_url)
+        return self._solver_get(url)
 
 
 class AniListUnavailable(Exception):
@@ -424,6 +469,29 @@ def build_indexes(series: List[dict]) -> Tuple[Dict[int, str], Dict[str, str]]:
     return by_anilist, by_title
 
 
+def resolve_cache_path(db_path: str, override: Optional[str]) -> Tuple[str, List[str]]:
+    """Pick where the id cache lives: (write_path, paths_to_try_reading).
+
+    The database directory is the natural home but is not always writable —
+    on the Pi the library sits on a mount owned by another user. Falling back
+    keeps a long resolve run resumable instead of silently discarding it.
+    """
+    if override:
+        return override, [override]
+
+    db_dir = os.path.dirname(os.path.abspath(db_path))
+    candidates = [
+        os.path.join(db_dir, CACHE_FILENAME),
+        os.path.join(os.getcwd(), CACHE_FILENAME),
+        os.path.join(tempfile.gettempdir(), CACHE_FILENAME),
+    ]
+    for path in candidates:
+        directory = os.path.dirname(path) or '.'
+        if os.access(directory, os.W_OK):
+            return path, candidates
+    return candidates[-1], candidates
+
+
 def load_cache(path: str) -> Dict[str, Optional[int]]:
     """Remembered title -> AniList id (null for a confirmed miss).
 
@@ -439,12 +507,16 @@ def load_cache(path: str) -> Dict[str, Optional[int]]:
         return {}
 
 
-def save_cache(path: str, cache: Dict[str, Optional[int]]) -> None:
+def save_cache(path: str, cache: Dict[str, Optional[int]]) -> bool:
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(cache, f, indent=0, sort_keys=True)
+        return True
     except Exception as e:
-        print('  WARNING: could not write id cache: %s' % e)
+        print('  WARNING: could not write id cache to %s (%s)' % (path, e))
+        print('  Pass --cache-file to put it somewhere writable, or this run\'s'
+              ' lookups are lost.')
+        return False
 
 
 def write_review_csv(path: str, rows: List[dict]) -> None:
@@ -490,6 +562,11 @@ def main() -> int:
                              'work through the backlog' % DEFAULT_MAX_LOOKUPS)
     parser.add_argument('--refresh-cache', action='store_true',
                         help='Ignore %s and look everything up again' % CACHE_FILENAME)
+    parser.add_argument('--cache-file',
+                        help='Where to keep resolved ids. Defaults to %s beside '
+                             'the database, falling back to the working '
+                             'directory then the temp dir if that is not '
+                             'writable' % CACHE_FILENAME)
     parser.add_argument('--flaresolverr-url',
                         help='FlareSolverr endpoint for clearing MangaDot\'s '
                              'Cloudflare challenge (default: $FLARESOLVERR_URL '
@@ -530,10 +607,15 @@ def main() -> int:
 
     unresolved = [s for s in series if not s['anilistId']]
 
-    cache_path = os.path.join(os.path.dirname(os.path.abspath(args.db)), CACHE_FILENAME)
-    cache = {} if args.refresh_cache else load_cache(cache_path)
-    if cache:
-        print('Reusing %d cached id lookup(s) from %s' % (len(cache), CACHE_FILENAME))
+    cache_path, cache_candidates = resolve_cache_path(args.db, args.cache_file)
+    cache = {}
+    if not args.refresh_cache:
+        for candidate in cache_candidates:
+            cache = load_cache(candidate)
+            if cache:
+                print('Reusing %d cached id lookup(s) from %s'
+                      % (len(cache), candidate))
+                break
 
     # Anything the cache already knows costs nothing.
     for s in unresolved[:]:
@@ -584,15 +666,21 @@ def main() -> int:
             print('\nInterrupted — keeping what has been resolved so far.')
 
         # Written even on an abort: the lookups already made were expensive.
-        save_cache(cache_path, cache)
+        cached_ok = save_cache(cache_path, cache)
 
         if blocked:
             print('\n%s' % ('-' * 70))
             print('STOPPED: %s' % blocked)
             print('MangaDot is behind Cloudflare. Start FlareSolverr (it is in')
             print('docker-compose.yml) and set FLARESOLVERR_URL, or pass')
-            print('--flaresolverr-url. Progress so far is cached in %s,' % CACHE_FILENAME)
-            print('so re-running resumes rather than starting over.')
+            print('--flaresolverr-url.')
+            if cached_ok:
+                print('Progress so far is cached in %s, so re-running resumes.'
+                      % cache_path)
+            else:
+                print('This run\'s lookups could NOT be cached (see warning above),')
+                print('so re-running starts over until --cache-file points somewhere')
+                print('writable.')
             print('%s' % ('-' * 70))
     elif not unresolved:
         print('\nEvery series already has an id or a cached lookup.')
