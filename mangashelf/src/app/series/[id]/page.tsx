@@ -59,6 +59,55 @@ function AlternateTitles({ raw }: { raw: string | null }) {
   );
 }
 
+/**
+ * "Readers Also Liked" — precomputed AniList pairings, filtered down to series
+ * already in the library, so every card here is something you can open.
+ * Renders nothing until scripts/fetch_recommendations.py has been run.
+ */
+function Recommendations({ entries }: { entries?: RecommendationEntry[] }) {
+  if (!entries || entries.length === 0) return null;
+
+  return (
+    <section>
+      <h2 className="mb-3 text-lg font-semibold">Readers Also Liked</h2>
+      <div className="grid grid-cols-3 gap-4 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8">
+        {entries.map(({ rating, target }) => (
+          <Link key={target.id} href={`/series/${target.id}`} className="group block">
+            <div className="relative aspect-[2/3] overflow-hidden rounded-lg bg-bg-card">
+              {target.coverPath ? (
+                <img
+                  src={target.coverPath}
+                  alt={target.title}
+                  className="h-full w-full object-cover transition-transform group-hover:scale-105"
+                  loading="lazy"
+                />
+              ) : (
+                <div className="flex h-full items-center justify-center text-text-secondary">
+                  <svg className="h-10 w-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                  </svg>
+                </div>
+              )}
+              <span className="absolute left-1 top-1 rounded bg-bg-secondary/90 px-1.5 py-0.5 text-[10px] font-medium">
+                {target.type}
+              </span>
+              <span
+                className="absolute bottom-1 right-1 rounded bg-bg-secondary/90 px-1.5 py-0.5 text-[10px]"
+                title={`${rating} AniList votes for this pairing`}
+              >
+                ♥ {rating}
+              </span>
+            </div>
+            <h3 className="mt-2 line-clamp-2 text-sm font-medium leading-tight group-hover:text-accent">
+              {target.title}
+            </h3>
+          </Link>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 interface AvailableCover {
   source: string;
   url: string;
@@ -81,6 +130,17 @@ interface Chapter {
   sourceUrl: string | null;
 }
 
+interface RecommendationEntry {
+  rating: number;
+  target: {
+    id: string;
+    title: string;
+    slug: string;
+    type: string;
+    coverPath: string | null;
+  };
+}
+
 interface SeriesDetail {
   id: string;
   title: string;
@@ -100,6 +160,7 @@ interface SeriesDetail {
   chapterCount: number;
   chapters: Chapter[];
   availableCovers: AvailableCover[];
+  recommendations?: RecommendationEntry[];
 }
 
 interface ProgressMap {
@@ -635,7 +696,9 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
           </div>
         )}
 
-        <div className="space-y-1">
+        {/* Capped so a 400-chapter series does not push Recommendations off
+            the bottom of the page. max-h only bites when the list is long. */}
+        <div className="max-h-[32rem] space-y-1 overflow-y-auto pr-1">
           {isGrouped
             ? groupedChapters.map((group) => {
                 const anyCompleted = group.sources.some((ch) => progress[ch.id]?.completed);
@@ -742,6 +805,8 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
               })}
         </div>
       </section>
+
+      <Recommendations entries={series.recommendations} />
     </div>
   );
 }

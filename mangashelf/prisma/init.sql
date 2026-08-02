@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS "Series" (
     "slug" TEXT NOT NULL,
     "description" TEXT,
     "altTitles" TEXT,
+    "anilistId" INTEGER,
     "author" TEXT,
     "artist" TEXT,
     "status" TEXT,
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS "Series" (
 -- no ADD COLUMN IF NOT EXISTS; on an already-migrated DB this errors with
 -- "duplicate column name" and is discarded by start.sh's 2>/dev/null.
 ALTER TABLE "Series" ADD COLUMN "altTitles" TEXT;
+ALTER TABLE "Series" ADD COLUMN "anilistId" INTEGER;
 
 CREATE UNIQUE INDEX IF NOT EXISTS "Series_slug_key" ON "Series"("slug");
 CREATE UNIQUE INDEX IF NOT EXISTS "Series_libraryPath_key" ON "Series"("libraryPath");
@@ -135,3 +137,18 @@ CREATE TABLE IF NOT EXISTS "ReadProgress" (
     CONSTRAINT "ReadProgress_chapterId_fkey" FOREIGN KEY ("chapterId") REFERENCES "Chapter" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 CREATE UNIQUE INDEX IF NOT EXISTS "ReadProgress_userId_chapterId_key" ON "ReadProgress"("userId", "chapterId");
+
+-- Precomputed "readers also liked" edges between two series in the library.
+-- Written by scripts/fetch_recommendations.py, never populated at page load.
+CREATE TABLE IF NOT EXISTS "Recommendation" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "seriesId" TEXT NOT NULL,
+    "targetSeriesId" TEXT NOT NULL,
+    "rating" INTEGER NOT NULL DEFAULT 0,
+    "source" TEXT NOT NULL DEFAULT 'anilist',
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "Recommendation_seriesId_fkey" FOREIGN KEY ("seriesId") REFERENCES "Series" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "Recommendation_targetSeriesId_fkey" FOREIGN KEY ("targetSeriesId") REFERENCES "Series" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "Recommendation_seriesId_targetSeriesId_key" ON "Recommendation"("seriesId", "targetSeriesId");
+CREATE INDEX IF NOT EXISTS "Recommendation_seriesId_rating_idx" ON "Recommendation"("seriesId", "rating");

@@ -31,6 +31,24 @@ export async function GET(
           source: true,
         },
       },
+      // Precomputed by scripts/fetch_recommendations.py. Every target is a
+      // series already in the library, so each one is a link you can follow.
+      recommendations: {
+        orderBy: { rating: "desc" },
+        take: 12,
+        select: {
+          rating: true,
+          target: {
+            select: {
+              id: true,
+              title: true,
+              slug: true,
+              type: true,
+              coverPath: true,
+            },
+          },
+        },
+      },
     },
   });
 

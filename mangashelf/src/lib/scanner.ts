@@ -7,24 +7,29 @@ import { extractEpubMetadata, getEpubPageCount, extractEpubCover } from "./epub"
 import { extractCover, extractCoverFromBuffer } from "./covers";
 
 /**
- * Read alternate titles ("Other Names") for a series.
+ * Read the scraper's per-series sidecar: alternate titles ("Other Names") and
+ * the AniList media id used to pull recommendations.
  *
- * Prefers the scraper's sidecar over the ComicInfo tag: metadata is read from
- * the first book only, so relying on AlternateSeries alone would leave every
+ * Prefers the sidecar over the ComicInfo tag: metadata is read from the first
+ * book only, so relying on AlternateSeries alone would leave every
  * already-downloaded series without alt titles until one of its chapters
- * happened to be re-fetched. Returns a JSON array string, or null.
+ * happened to be re-fetched. altTitles comes back as a JSON array string.
  */
-async function readAltTitles(
+async function readSeriesSidecar(
   seriesDirPath: string,
   alternateSeries?: string | null,
-): Promise<string | null> {
+): Promise<{ altTitles: string | null; anilistId: number | null }> {
   let titles: string[] = [];
+  let anilistId: number | null = null;
 
   try {
     const raw = await readFile(join(seriesDirPath, ".mangadot_meta.json"), "utf-8");
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed?.altTitles)) {
       titles = parsed.altTitles.filter((t: unknown): t is string => typeof t === "string");
+    }
+    if (Number.isInteger(parsed?.anilistId) && parsed.anilistId > 0) {
+      anilistId = parsed.anilistId;
     }
   } catch {
     // No sidecar, or unreadable — fall back to the ComicInfo tag.
@@ -42,7 +47,10 @@ async function readAltTitles(
     return true;
   });
 
-  return unique.length > 0 ? JSON.stringify(unique) : null;
+  return {
+    altTitles: unique.length > 0 ? JSON.stringify(unique) : null,
+    anilistId,
+  };
 }
 
 /** Count distinct chapter numbers for a series (ignores duplicate chapters across sources). */
@@ -626,8 +634,11 @@ async function scanSeries(
   const cleanAuthor = sanitizePersonName(comicInfo?.Writer);
   const cleanArtist = sanitizePersonName(comicInfo?.Penciller);
 
-  // Alternate titles from the scraper sidecar, falling back to ComicInfo
-  const altTitles = await readAltTitles(seriesDirPath, comicInfo?.AlternateSeries);
+  // Alternate titles + AniList id from the scraper sidecar, falling back to ComicInfo
+  const { altTitles, anilistId } = await readSeriesSidecar(
+    seriesDirPath,
+    comicInfo?.AlternateSeries,
+  );
 
   // Normalize the publisher/source tag
   const normalizedPublisher = sourceTag
@@ -645,6 +656,7 @@ async function scanSeries(
         slug: seriesSlug,
         description: comicInfo?.Summary || null,
         altTitles,
+        anilistId,
         author: cleanAuthor,
         artist: cleanArtist,
         status: parseStatus(comicInfo?.Notes),
@@ -682,6 +694,13 @@ async function scanSeries(
     // on every scrape, including runs where no new chapter was downloaded.
     if (altTitles && altTitles !== series.altTitles) {
       corrections.altTitles = altTitles;
+    }
+
+    // Only sync a sidecar id that actually exists. Non-MangaDot series get
+    // their anilistId resolved by title in fetch_recommendations.py and have
+    // no sidecar at all, so writing null here would wipe it on every scan.
+    if (anilistId && anilistId !== series.anilistId) {
+      corrections.anilistId = anilistId;
     }
 
     // Fix garbage author/artist (e.g. "s:", single chars) — replace with clean value or null

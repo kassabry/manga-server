@@ -4983,6 +4983,10 @@ class MangaDotScraper(BaseSiteScraper):
 
     API_SEARCH = "/api/search"
 
+    # Per-series detail endpoint.  The search listing carries no external ids,
+    # so anilist_id costs one extra (small, unauthenticated) GET per series.
+    API_MANGA = "/api/manga"
+
     # Chapter page images live under this path prefix.
     _PAGE_PREFIX = "/chapters/manga_"
 
@@ -5539,8 +5543,27 @@ class MangaDotScraper(BaseSiteScraper):
 
         return kept
 
+    def fetch_anilist_id(self, md_id) -> Optional[int]:
+        """AniList media id for a MangaDot series, or None.
+
+        Lives on the detail endpoint only — the search listing carries no
+        external ids at all.  Used to pull recommendations later; a failure
+        here is never worth interrupting a download for.
+        """
+        if not md_id:
+            return None
+        try:
+            resp = self.session.get(
+                f"{self.BASE_URL}{self.API_MANGA}/{md_id}", timeout=30)
+            resp.raise_for_status()
+            value = (resp.json().get('manga') or {}).get('anilist_id')
+            return int(value) if value else None
+        except Exception as e:
+            logger.debug(f"MangaDot: no anilist_id for {md_id}: {e}")
+            return None
+
     def save_series_meta(self, series_dir: Path, series: Series) -> List[str]:
-        """Write the alt-title sidecar and return the titles kept.
+        """Write the metadata sidecar and return the alt titles kept.
 
         A sidecar rather than only ComicInfo: the scanner reads metadata from
         the first CBZ in a series, so relying on the tag alone would leave
@@ -5549,15 +5572,28 @@ class MangaDotScraper(BaseSiteScraper):
         """
         alt = self.english_alt_titles(
             getattr(series, '_md_alt_titles', []), series.title)
-        if not alt:
+        anilist_id = self.fetch_anilist_id(getattr(series, '_md_id', None))
+
+        # A transient detail-endpoint failure must not erase an id recorded on
+        # an earlier run — the sidecar is rewritten in full every time.
+        if anilist_id is None:
+            try:
+                with open(series_dir / self.META_SIDECAR, encoding='utf-8') as f:
+                    anilist_id = json.load(f).get('anilistId')
+            except Exception:
+                pass
+
+        if not alt and not anilist_id:
             return []
         try:
             series_dir.mkdir(parents=True, exist_ok=True)
             payload = {'title': series.title, 'altTitles': alt, 'source': self.SITE_NAME}
+            if anilist_id:
+                payload['anilistId'] = anilist_id
             with open(series_dir / self.META_SIDECAR, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, indent=1, ensure_ascii=False)
         except Exception as e:
-            logger.warning(f"MangaDot: could not write alt-title sidecar: {e}")
+            logger.warning(f"MangaDot: could not write metadata sidecar: {e}")
         return alt
 
     # -- pages -------------------------------------------------------------

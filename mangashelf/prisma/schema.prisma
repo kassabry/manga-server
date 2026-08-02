@@ -59,6 +59,9 @@ model Series {
   description    String?
   // JSON array of alternate titles ("Other Names"), English-looking only
   altTitles      String?
+  // AniList media id, used to pull recommendations. Sourced from the MangaDot
+  // sidecar, or resolved by title in scripts/fetch_recommendations.py.
+  anilistId      Int?
   author         String?
   artist         String?
   status         String?
@@ -79,6 +82,26 @@ model Series {
   listEntries       ListEntry[]
   libraryPaths      SeriesPath[]
   customListEntries CustomListEntry[]
+  recommendations   Recommendation[] @relation("RecommendationSource")
+  recommendedBy     Recommendation[] @relation("RecommendationTarget")
+}
+
+/// A precomputed "readers also liked" edge between two series already in the
+/// library. Populated by scripts/fetch_recommendations.py — never fetched at
+/// page load, so a slow or rate-limited AniList never blocks a series page.
+model Recommendation {
+  id             String   @id @default(cuid())
+  seriesId       String
+  targetSeriesId String
+  /// AniList's community vote count for this pairing; higher is stronger.
+  rating         Int      @default(0)
+  source         String   @default("anilist")
+  createdAt      DateTime @default(now())
+  series         Series   @relation("RecommendationSource", fields: [seriesId], references: [id], onDelete: Cascade)
+  target         Series   @relation("RecommendationTarget", fields: [targetSeriesId], references: [id], onDelete: Cascade)
+
+  @@unique([seriesId, targetSeriesId])
+  @@index([seriesId, rating])
 }
 
 model SeriesPath {

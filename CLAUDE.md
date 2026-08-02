@@ -66,6 +66,18 @@
 - `--report-groups -o groups.csv` surveys which groups win contested chapters (win rate, stub rate, avg pages) and prints a suggested `--prefer-groups` line. Bound the survey with `--pages`/`--limit`; it needs a Selenium chapter-list load per series
 - Real signal from a 4-series survey: on the same 339 contested chapters Asura Scans won 94% with 0% stubs, Drake Scans 16% with 46% stubs — worth surveying before assuming page count alone is enough
 
+## Recommendations (`scripts/fetch_recommendations.py`)
+- Precomputed into the `Recommendation` table; the series page only ever reads rows, so AniList is never on the page-load path
+- Only links series **already in the library** — a recommendation you cannot open is noise. Expect most AniList targets to be dropped
+- A small library legitimately yields zero rows: 11 niche manhwa produced 85 targets, none of them local. That is correct behaviour, not a bug
+- MangaDex has no recommendations API (`/manga/{id}/recommendations` 404s) — do not retry it. AniList GraphQL (`https://graphql.anilist.co`) is the source
+- MangaDot is the title→AniList bridge: `GET /api/search?search={title}`. The param is **`search=`** — `q=`, `query=`, `title=` are silently ignored and return the unfiltered catalogue
+- `anilist_id` is NOT in the search listing. It is on the detail endpoint `GET /api/manga/{id}` under `manga.anilist_id` (unauthenticated, ~3KB). Sampled 12/12 coverage
+- This bridge beats searching AniList by title because MangaDot indexes the same scanlation sources the library came from (items carry `source_url` like `asurascans.com/...`), so titles agree exactly — 14/14 on the real library
+- Exact `_md_norm` match on title or alt title auto-links; ≥0.88 near-matches go to `anilist_link_candidates.csv` for review, matching `MangaDotAliasIndex` policy
+- `--apply` deletes and rewrites edges only for the series it fetched, so `--only` never wipes the rest of the library
+- SQLite enforces the `ON DELETE CASCADE` only when `PRAGMA foreign_keys = ON`. Prisma sets it; a raw Python connection does not, so scripts deleting series directly will orphan rows
+
 ## Maintenance Scripts
 - `scripts/fix_flame_chapters.py` — fixes wrong chapter numbers in already-downloaded Flame CBZs by sorting numerically and renumbering 1, 2, 3… Dry-run by default; use `--apply [--db path/to/mangashelf.db]`
 - Run after any FlameComics re-scrape where chapter numbers look wrong (e.g. Ch.14 instead of Ch.1)
