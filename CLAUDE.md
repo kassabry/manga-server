@@ -54,6 +54,13 @@
 - Origin routing is per-invocation via `--origin KR -o library/Manhwa` / `--origin CN -o library/Manhua`
 - Alt-title merging: exact match on title or any "Other Names" entry auto-merges into the existing folder; near-matches go to `mangadot_merge_candidates.csv` for review (apply via `suggest_merges.py`). Disable with `--no-alias-merge`
 
+### Page collection (`get_pages`)
+- The reader lazy-loads images on scroll. Walk it with a step of ~0.8 × viewport height and bound the loop by `document.body.scrollHeight` **re-read every pass** (it grows as images resolve) — never by a fixed iteration count
+- A fixed `range(40)` of `innerHeight * 1.5` jumps was silently truncating long chapters: a simulated 147-page chapter collected **34 pages**, and the resulting CBZ looks complete. Big jumps also outrun the lazy-load observer
+- The chosen version advertises its page count (`_md_version['pages']`, from "… · MD 147p"). Use it as ground truth: stop early once all pages are in, retry once if short, and log an ERROR if still short — never return a silently truncated chapter
+- `scripts/find_truncated_chapters.py` finds already-downloaded victims by comparing CBZ image count against `.mangadot_versions.json`. `--apply` deletes them, drops the manifest entry, and clears the tracker URL so a rescrape refetches. Needs `--tracker`, or the scraper treats them as already downloaded and skips
+- Default tolerance is 90% of the advertised count, because `_filter_outlier_images_by_dimension` legitimately removes a few promo images per chapter
+
 ### Multi-version chapters
 - Each version is its own anchor: `└ ○ upload {Group} · MD {N}p {date}` — group and page count parse straight out of it
 - DOM order is NOT quality order (Ch. 215 of manga/26041 lists a 4p version before a 5p one), so never just take the first anchor

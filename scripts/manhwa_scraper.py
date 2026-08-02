@@ -5598,57 +5598,146 @@ class MangaDotScraper(BaseSiteScraper):
 
     # -- pages -------------------------------------------------------------
 
+    # Fallback scroll step, used only when the viewport height cannot be read.
+    # The real step is a fraction of the viewport (see _scroll_for_pages): it
+    # has to overlap so no strip is skipped past without loading, but scaling
+    # with the window keeps a 500-page chapter from taking thousands of passes.
+    _SCROLL_STEP = 400
+    _SCROLL_OVERLAP = 0.8
+
+    # Backstop against a reader that grows forever (infinite scroll into the
+    # next chapter, ad iframes).  The normal exit is reaching the document
+    # bottom or the advertised page count; this only catches pathology.
+    _MAX_SCROLL_PASSES = 2000
+
+    def _collect_page_images(self, driver, pages: List[str]) -> int:
+        """Append any newly-loaded page images. Returns how many were added."""
+        try:
+            found = driver.execute_script("""
+                return Array.from(document.images)
+                    .map(i => i.currentSrc || i.src)
+                    .filter(Boolean);
+            """) or []
+        except Exception:
+            return 0
+
+        added = 0
+        seen = set(pages)
+        for src in found:
+            if self._PAGE_PREFIX in src and src not in seen:
+                pages.append(src)
+                seen.add(src)
+                added += 1
+        return added
+
+    def _scroll_for_pages(self, driver, expected: int) -> List[str]:
+        """Walk the reader top to bottom, collecting page images as they load.
+
+        Bounded by the document's actual height (re-read every pass, since it
+        grows as images resolve) rather than by a fixed number of iterations —
+        a fixed count silently truncates any chapter taller than it happened
+        to reach.
+        """
+        pages: List[str] = []
+        position = 0
+
+        try:
+            viewport = int(driver.execute_script("return window.innerHeight") or 0)
+        except Exception:
+            viewport = 0
+        step = max(int(viewport * self._SCROLL_OVERLAP), self._SCROLL_STEP)
+
+        exhausted = True
+        for _ in range(self._MAX_SCROLL_PASSES):
+            self._collect_page_images(driver, pages)
+
+            # The chapter advertises its own length, so stop as soon as it is
+            # all here rather than scrolling to the bottom for its own sake.
+            if expected and len(pages) >= expected:
+                exhausted = False
+                break
+
+            try:
+                height = driver.execute_script("return document.body.scrollHeight") or 0
+            except Exception:
+                exhausted = False
+                break
+            if position >= height:
+                exhausted = False
+                break
+
+            try:
+                driver.execute_script(f"window.scrollTo(0, {position})")
+            except Exception:
+                exhausted = False
+                break
+            position += step
+            time.sleep(0.15)
+
+        if exhausted:
+            logger.warning(
+                f"  Scroll cap ({self._MAX_SCROLL_PASSES} passes) hit with "
+                f"{len(pages)} page(s) collected — chapter may be incomplete"
+            )
+
+        # The last screenful is still decoding when the loop ends.
+        time.sleep(2)
+        self._collect_page_images(driver, pages)
+        return pages
+
     def get_pages(self, chapter: Chapter) -> List[str]:
         """Collect page images from the reader.
 
-        Images are injected by the reader after hydration and lazy-load on
-        scroll, so the page is scrolled to the bottom before reading them.
+        Images are injected after hydration and lazy-load on scroll, so the
+        reader has to be walked from top to bottom.  The chosen version
+        advertises its page count ("… · MD 147p"), which is used as ground
+        truth: a short result is retried once and then reported, because
+        silently returning a truncated chapter produces a CBZ that looks
+        complete and is not.
         """
+        expected = int((getattr(chapter, '_md_version', None) or {}).get('pages') or 0)
+
         self._init_driver()
         driver = self.driver
 
-        try:
-            driver.get(chapter.url)
-        except Exception as e:
-            logger.warning(f"MangaDot: could not load {chapter.url}: {e}")
-            return []
-
-        time.sleep(4)
-
-        pages: List[str] = []
-        stagnant = 0
-        for _ in range(40):
+        best: List[str] = []
+        for attempt in (1, 2):
             try:
-                found = driver.execute_script("""
-                    return Array.from(document.images)
-                        .map(i => i.currentSrc || i.src)
-                        .filter(Boolean);
-                """) or []
-            except Exception:
+                driver.get(chapter.url)
+            except Exception as e:
+                logger.warning(f"MangaDot: could not load {chapter.url}: {e}")
+                return []
+
+            time.sleep(4)
+            pages = self._scroll_for_pages(driver, expected)
+            if len(pages) > len(best):
+                best = pages
+
+            if not expected or len(best) >= expected:
                 break
+            if attempt == 1:
+                logger.warning(
+                    f"  Ch.{chapter.number}: got {len(pages)} of {expected} "
+                    f"advertised page(s), retrying"
+                )
 
-            before = len(pages)
-            for src in found:
-                if self._PAGE_PREFIX in src and src not in pages:
-                    pages.append(src)
+        if expected and len(best) < expected:
+            # Loud, because the alternative is a CBZ that is quietly missing
+            # its ending.  Delete the file and re-run to try again.
+            logger.error(
+                f"  Ch.{chapter.number}: INCOMPLETE — {len(best)} of {expected} "
+                f"page(s) after retry ({chapter.url})"
+            )
 
-            stagnant = stagnant + 1 if len(pages) == before else 0
-            if stagnant >= 4:
-                break
-
-            try:
-                driver.execute_script("window.scrollBy(0, window.innerHeight * 1.5);")
-            except Exception:
-                break
-            time.sleep(0.8)
-
-        # Reader order follows the numeric filename (…/001.webp).
+        # Reader order follows the numeric filename (…/001.webp). Anything that
+        # does not match sorts last rather than colliding at 0 and scrambling
+        # the front of the chapter.
         def page_key(url: str):
             match = re.search(r'/(\d+)\.\w+(?:\?|$)', url)
-            return int(match.group(1)) if match else 0
+            return (0, int(match.group(1))) if match else (1, 0)
 
-        pages.sort(key=page_key)
-        return pages
+        best.sort(key=page_key)
+        return best
 
 
 def report_mangadot_groups(scraper: 'MangaDotScraper', series_list: List[Series],
