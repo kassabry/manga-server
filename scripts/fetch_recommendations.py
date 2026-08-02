@@ -39,12 +39,11 @@ import sqlite3
 import sys
 import time
 import unicodedata
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple
+
+import requests
 
 ANILIST_API = 'https://graphql.anilist.co'
 MANGADOT_BASE = 'https://mangadot.net'
@@ -53,6 +52,14 @@ USER_AGENT = 'Mozilla/5.0 (MangaShelf recommendations)'
 # AniList allows ~90 requests/minute. Stay well under it.
 ANILIST_DELAY = 0.8
 MANGADOT_DELAY = 0.4
+
+# Resolution is the expensive half of this script and it hits a third-party
+# site, so a run is bounded by default. Ids are cached, so successive runs
+# chew through the backlog instead of re-asking for what is already known.
+DEFAULT_MAX_LOOKUPS = 250
+
+# Where resolved ids are remembered between runs, next to the database.
+CACHE_FILENAME = '.anilist_id_cache.json'
 
 # Series per AniList query. The API caps perPage at 50; 25 keeps each query's
 # complexity modest while still cutting request count by more than an order of
@@ -125,44 +132,168 @@ def new_id() -> str:
 # HTTP
 # ---------------------------------------------------------------------------
 
-def http_json(url: str, data: Optional[bytes] = None,
-              headers: Optional[Dict[str, str]] = None,
-              timeout: int = 30, retries: int = 3) -> Optional[dict]:
-    """GET/POST returning parsed JSON, or None. Honours 429 Retry-After."""
-    hdrs = {'User-Agent': USER_AGENT}
-    if headers:
-        hdrs.update(headers)
+class ChallengeBlocked(Exception):
+    """MangaDot is behind a Cloudflare challenge we could not clear."""
 
-    for attempt in range(retries):
+
+class MangaDotClient:
+    """MangaDot API access that can clear a Cloudflare challenge.
+
+    MangaDot sits behind Cloudflare. It often serves plain requests fine, then
+    starts challenging once a run makes a few hundred of them. FlareSolverr
+    (already part of this project's docker stack for ManhuaTo) solves the
+    challenge in a headless browser; we take its cookies and User-Agent and go
+    back to ordinary requests. cf_clearance is bound to the User-Agent, so
+    adopting FlareSolverr's is not optional.
+    """
+
+    def __init__(self, flaresolverr_url: Optional[str] = None):
+        self.session = requests.Session()
+        self.session.headers['User-Agent'] = USER_AGENT
+        self.fs_url = (flaresolverr_url
+                       or os.environ.get('FLARESOLVERR_URL', 'http://localhost:8191'))
+        self._solved = False
+
+    @staticmethod
+    def _is_challenge(resp) -> bool:
+        if resp.status_code not in (403, 503):
+            return False
+        return ('cf-mitigated' in resp.headers
+                or 'server' in resp.headers and 'cloudflare' in resp.headers['server'].lower()
+                or 'Just a moment' in resp.text[:1000])
+
+    def flaresolverr_available(self) -> bool:
         try:
-            req = urllib.request.Request(url, data=data, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = int(e.headers.get('Retry-After') or 60)
-                print("    rate limited, waiting %ss" % wait)
+            return requests.get(self.fs_url, timeout=5).status_code == 200
+        except Exception:
+            return False
+
+    def _solve(self) -> None:
+        """Clear the challenge against the site root and keep the cookies.
+
+        Solved against the root rather than the API URL because FlareSolverr
+        returns a rendered HTML page — useless for JSON. All we want is
+        cf_clearance, which applies to the whole domain.
+        """
+        resp = requests.post(
+            '%s/v1' % self.fs_url,
+            json={'cmd': 'request.get', 'url': MANGADOT_BASE + '/', 'maxTimeout': 60000},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get('status') != 'ok':
+            raise ChallengeBlocked('FlareSolverr: %s' % data.get('message', 'unknown'))
+
+        solution = data.get('solution') or {}
+        for cookie in solution.get('cookies') or []:
+            domain = (cookie.get('domain') or '').strip()
+            if not domain:
+                continue
+            self.session.cookies.set(cookie['name'], cookie['value'],
+                                     domain=domain, path=cookie.get('path', '/'))
+        if solution.get('userAgent'):
+            self.session.headers['User-Agent'] = solution['userAgent']
+        self._solved = True
+
+    def get_json(self, url: str) -> Optional[dict]:
+        """Fetch JSON, solving a challenge once if one appears.
+
+        Raises ChallengeBlocked when the wall cannot be cleared — the caller is
+        expected to stop rather than grind through the rest of the library
+        collecting identical failures.
+        """
+        for attempt in range(2):
+            try:
+                resp = self.session.get(url, timeout=30)
+            except Exception as e:
+                if attempt:
+                    print('    request failed (%s): %s' % (type(e).__name__, e))
+                    return None
+                time.sleep(2)
+                continue
+
+            if resp.status_code == 404:
+                return None
+            if resp.status_code == 429:
+                wait = int(resp.headers.get('Retry-After') or 60)
+                print('    rate limited, waiting %ss' % wait)
                 time.sleep(wait)
                 continue
-            # A 404 is a real answer, not a transient failure.
-            if e.code == 404:
+
+            if self._is_challenge(resp):
+                # Retrying a challenge without solving it just multiplies load
+                # and digs the hole deeper, so solve or give up.
+                if self._solved or attempt:
+                    raise ChallengeBlocked(
+                        'Cloudflare is still challenging after a FlareSolverr solve')
+                if not self.flaresolverr_available():
+                    raise ChallengeBlocked(
+                        'Cloudflare challenge, and FlareSolverr is not reachable at %s'
+                        % self.fs_url)
+                print('    Cloudflare challenge — solving via FlareSolverr...')
+                self._solve()
+                continue
+
+            if resp.status_code != 200:
+                print('    HTTP %s on %s' % (resp.status_code, url[:70]))
                 return None
-            print("    HTTP %s on %s" % (e.code, url[:70]))
+            try:
+                return resp.json()
+            except ValueError:
+                return None
+        return None
+
+
+class AniListUnavailable(Exception):
+    """AniList refused the request outright — retrying will not help."""
+
+
+def anilist_post(payload: dict, retries: int = 3) -> Optional[dict]:
+    """POST a GraphQL query to AniList. Honours 429 Retry-After.
+
+    A 403 here is not a transient failure: AniList returns one when the API is
+    switched off wholesale (it has been disabled before "due to severe
+    stability issues"). Retrying that just multiplies noise, so it aborts with
+    whatever reason the API gave.
+    """
+    for attempt in range(retries):
+        try:
+            resp = requests.post(
+                ANILIST_API, json=payload, timeout=30,
+                headers={'User-Agent': USER_AGENT, 'Accept': 'application/json'},
+            )
+            if resp.status_code == 429:
+                wait = int(resp.headers.get('Retry-After') or 60)
+                print('    AniList rate limited, waiting %ss' % wait)
+                time.sleep(wait)
+                continue
+            if resp.status_code == 403:
+                reason = 'HTTP 403'
+                try:
+                    errors = resp.json().get('errors') or []
+                    if errors and errors[0].get('message'):
+                        reason = errors[0]['message']
+                except ValueError:
+                    pass
+                raise AniListUnavailable(reason)
+            resp.raise_for_status()
+            return resp.json()
+        except AniListUnavailable:
+            raise
         except Exception as e:
-            print("    request failed (%s): %s" % (type(e).__name__, e))
-        if attempt < retries - 1:
-            time.sleep(2 * (attempt + 1))
+            print('    AniList request failed (%s): %s' % (type(e).__name__, e))
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))
     return None
 
 
 def anilist_recommendations(ids: List[int], per_series: int) -> Dict[int, List[dict]]:
     """Map AniList media id -> list of {rating, id, title} recommendations."""
-    payload = json.dumps({
+    body = anilist_post({
         'query': RECS_QUERY,
         'variables': {'ids': ids, 'perPage': per_series},
-    }).encode('utf-8')
-    body = http_json(ANILIST_API, data=payload,
-                     headers={'Content-Type': 'application/json'})
+    })
     out = {}  # type: Dict[int, List[dict]]
     if not body:
         return out
@@ -185,7 +316,8 @@ def anilist_recommendations(ids: List[int], per_series: int) -> Dict[int, List[d
     return out
 
 
-def mangadot_lookup(title: str) -> Tuple[Optional[int], str, Optional[dict], float]:
+def mangadot_lookup(client: MangaDotClient,
+                    title: str) -> Tuple[Optional[int], str, Optional[dict], float]:
     """Resolve a title to an AniList id via MangaDot.
 
     Returns (anilist_id, matched_via, best_fuzzy_item, best_fuzzy_score).
@@ -195,9 +327,11 @@ def mangadot_lookup(title: str) -> Tuple[Optional[int], str, Optional[dict], flo
     if not key:
         return None, '', None, 0.0
 
+    # The search parameter is `search=`. `q=`, `query=` and `title=` are
+    # silently ignored and hand back the unfiltered catalogue.
     url = '%s/api/search?page=1&search=%s' % (
-        MANGADOT_BASE, urllib.parse.quote(bare_title(title)))
-    body = http_json(url)
+        MANGADOT_BASE, requests.utils.quote(bare_title(title)))
+    body = client.get_json(url)
     items = (body or {}).get('manga_list') or []
 
     hit = None
@@ -215,7 +349,9 @@ def mangadot_lookup(title: str) -> Tuple[Optional[int], str, Optional[dict], flo
 
     if hit:
         time.sleep(MANGADOT_DELAY)
-        detail = http_json('%s/api/manga/%s' % (MANGADOT_BASE, hit.get('id')))
+        # anilist_id is only on the detail endpoint — the search listing
+        # carries no external ids at all.
+        detail = client.get_json('%s/api/manga/%s' % (MANGADOT_BASE, hit.get('id')))
         value = ((detail or {}).get('manga') or {}).get('anilist_id')
         if value:
             return int(value), via, None, 1.0
@@ -288,6 +424,29 @@ def build_indexes(series: List[dict]) -> Tuple[Dict[int, str], Dict[str, str]]:
     return by_anilist, by_title
 
 
+def load_cache(path: str) -> Dict[str, Optional[int]]:
+    """Remembered title -> AniList id (null for a confirmed miss).
+
+    Resolution is slow and hits a third party, so a dry run is worth as much
+    as a real one: both populate this, and neither re-asks what it already
+    knows. Without it, a 1900-series dry run throws away 40 minutes of work.
+    """
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_cache(path: str, cache: Dict[str, Optional[int]]) -> None:
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=0, sort_keys=True)
+    except Exception as e:
+        print('  WARNING: could not write id cache: %s' % e)
+
+
 def write_review_csv(path: str, rows: List[dict]) -> None:
     fields = ['local_title', 'mangadot_title', 'mangadot_id',
               'similarity', 'anilist_id', 'action']
@@ -325,6 +484,16 @@ def main() -> int:
                                        'contains this substring')
     parser.add_argument('--no-resolve', action='store_true',
                         help='Skip AniList id lookup; only use ids already known')
+    parser.add_argument('--max-lookups', type=int, default=DEFAULT_MAX_LOOKUPS,
+                        help='Cap MangaDot lookups per run (default: %d, 0 for '
+                             'no cap). Results are cached, so successive runs '
+                             'work through the backlog' % DEFAULT_MAX_LOOKUPS)
+    parser.add_argument('--refresh-cache', action='store_true',
+                        help='Ignore %s and look everything up again' % CACHE_FILENAME)
+    parser.add_argument('--flaresolverr-url',
+                        help='FlareSolverr endpoint for clearing MangaDot\'s '
+                             'Cloudflare challenge (default: $FLARESOLVERR_URL '
+                             'or http://localhost:8191)')
     args = parser.parse_args()
 
     if not os.path.exists(args.db):
@@ -361,30 +530,72 @@ def main() -> int:
 
     unresolved = [s for s in series if not s['anilistId']]
 
+    cache_path = os.path.join(os.path.dirname(os.path.abspath(args.db)), CACHE_FILENAME)
+    cache = {} if args.refresh_cache else load_cache(cache_path)
+    if cache:
+        print('Reusing %d cached id lookup(s) from %s' % (len(cache), CACHE_FILENAME))
+
+    # Anything the cache already knows costs nothing.
+    for s in unresolved[:]:
+        key = norm(bare_title(s['title']))
+        if key in cache:
+            if cache[key]:
+                s['anilistId'] = cache[key]
+                resolved_now.append((s['id'], cache[key]))
+            unresolved.remove(s)
+
     if unresolved and not args.no_resolve:
-        print('\nResolving %d series to AniList via MangaDot...' % len(unresolved))
-        for s in unresolved:
-            aid, via, fuzzy, score = mangadot_lookup(s['title'])
-            if aid:
-                s['anilistId'] = aid
-                resolved_now.append((s['id'], aid))
-                print('  LINK   %-44s -> %s (via %s)'
-                      % (bare_title(s['title'])[:44], aid, via))
-            elif fuzzy is not None:
-                review_rows.append({
-                    'local_title': s['title'],
-                    'mangadot_title': fuzzy.get('title', ''),
-                    'mangadot_id': fuzzy.get('id', ''),
-                    'similarity': round(score, 4),
-                    'anilist_id': '',
-                    'action': '',
-                })
-                print('  REVIEW %-44s ~ %s (%.2f)'
-                      % (bare_title(s['title'])[:44],
-                         (fuzzy.get('title') or '')[:30], score))
-            else:
-                print('  MISS   %s' % bare_title(s['title'])[:44])
-            time.sleep(MANGADOT_DELAY)
+        budget = args.max_lookups if args.max_lookups > 0 else len(unresolved)
+        todo = unresolved[:budget]
+        print('\nResolving %d of %d unresolved series via MangaDot%s...'
+              % (len(todo), len(unresolved),
+                 '' if len(todo) == len(unresolved) else ' (--max-lookups)'))
+
+        client = MangaDotClient(args.flaresolverr_url)
+        blocked = None
+        try:
+            for s in todo:
+                key = norm(bare_title(s['title']))
+                aid, via, fuzzy, score = mangadot_lookup(client, s['title'])
+                cache[key] = aid
+                if aid:
+                    s['anilistId'] = aid
+                    resolved_now.append((s['id'], aid))
+                    print('  LINK   %-44s -> %s (via %s)'
+                          % (bare_title(s['title'])[:44], aid, via))
+                elif fuzzy is not None:
+                    review_rows.append({
+                        'local_title': s['title'],
+                        'mangadot_title': fuzzy.get('title', ''),
+                        'mangadot_id': fuzzy.get('id', ''),
+                        'similarity': round(score, 4),
+                        'anilist_id': '',
+                        'action': '',
+                    })
+                    print('  REVIEW %-44s ~ %s (%.2f)'
+                          % (bare_title(s['title'])[:44],
+                             (fuzzy.get('title') or '')[:30], score))
+                else:
+                    print('  MISS   %s' % bare_title(s['title'])[:44])
+                time.sleep(MANGADOT_DELAY)
+        except ChallengeBlocked as e:
+            blocked = e
+        except KeyboardInterrupt:
+            print('\nInterrupted — keeping what has been resolved so far.')
+
+        # Written even on an abort: the lookups already made were expensive.
+        save_cache(cache_path, cache)
+
+        if blocked:
+            print('\n%s' % ('-' * 70))
+            print('STOPPED: %s' % blocked)
+            print('MangaDot is behind Cloudflare. Start FlareSolverr (it is in')
+            print('docker-compose.yml) and set FLARESOLVERR_URL, or pass')
+            print('--flaresolverr-url. Progress so far is cached in %s,' % CACHE_FILENAME)
+            print('so re-running resumes rather than starting over.')
+            print('%s' % ('-' * 70))
+    elif not unresolved:
+        print('\nEvery series already has an id or a cached lookup.')
 
     if review_rows:
         write_review_csv(args.review_csv, review_rows)
@@ -405,11 +616,21 @@ def main() -> int:
     print('\nFetching recommendations (%d series, %d per batch)...'
           % (len(ids), ANILIST_BATCH))
     all_recs = {}  # type: Dict[int, List[dict]]
-    for i in range(0, len(ids), ANILIST_BATCH):
-        batch = ids[i:i + ANILIST_BATCH]
-        all_recs.update(anilist_recommendations(batch, args.per_series))
-        print('  %d/%d' % (min(i + ANILIST_BATCH, len(ids)), len(ids)))
-        time.sleep(ANILIST_DELAY)
+    try:
+        for i in range(0, len(ids), ANILIST_BATCH):
+            batch = ids[i:i + ANILIST_BATCH]
+            all_recs.update(anilist_recommendations(batch, args.per_series))
+            print('  %d/%d' % (min(i + ANILIST_BATCH, len(ids)), len(ids)))
+            time.sleep(ANILIST_DELAY)
+    except AniListUnavailable as e:
+        print('\n%s' % ('-' * 70))
+        print('STOPPED: AniList refused the request.')
+        print('  %s' % e)
+        print('Nothing is wrong with your library or the resolved ids — those')
+        print('are cached. Re-run once AniList is serving again.')
+        print('%s' % ('-' * 70))
+        con.close()
+        return 1
 
     # -- 3. map targets back to local series --------------------------------
 

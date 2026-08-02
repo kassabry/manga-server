@@ -77,6 +77,10 @@
 - Exact `_md_norm` match on title or alt title auto-links; ≥0.88 near-matches go to `anilist_link_candidates.csv` for review, matching `MangaDotAliasIndex` policy
 - `--apply` deletes and rewrites edges only for the series it fetched, so `--only` never wipes the rest of the library
 - SQLite enforces the `ON DELETE CASCADE` only when `PRAGMA foreign_keys = ON`. Prisma sets it; a raw Python connection does not, so scripts deleting series directly will orphan rows
+- **MangaDot is behind Cloudflare.** It serves plain requests fine for a while, then challenges once a run makes a few hundred (`cf-mitigated: challenge`, "Just a moment..."). Route through FlareSolverr — same stack already used for ManhuaTo, `FLARESOLVERR_URL` or `--flaresolverr-url`. cf_clearance is bound to the User-Agent, so adopt FlareSolverr's UA along with its cookies
+- **Never retry a 403.** Neither site's 403 is transient, and retrying triples the request volume — that is what tripped MangaDot's challenge in the first place. Abort and surface the reason
+- **AniList returns a 403 with a human-readable `errors[0].message` when their API is switched off wholesale** (seen 2026-08-02: "temporarily disabled due to severe stability issues"). Not a rate limit, not fixable from here — read the message rather than retrying
+- Resolution is cached in `.anilist_id_cache.json` beside the DB, written even when a run aborts, so a 1900-series run resumes instead of restarting. `--max-lookups` (default 250) bounds each run
 
 ## Maintenance Scripts
 - `scripts/fix_flame_chapters.py` — fixes wrong chapter numbers in already-downloaded Flame CBZs by sorting numerically and renumbering 1, 2, 3… Dry-run by default; use `--apply [--db path/to/mangashelf.db]`
