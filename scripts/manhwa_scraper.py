@@ -1587,6 +1587,40 @@ class BaseSiteScraper:
             'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
         }
 
+    # Magic bytes for the formats these CDNs actually serve.  JPEG/PNG/GIF/BMP
+    # are identified from byte 0; WebP and the ISO-BMFF family (AVIF, HEIC)
+    # carry their marker after a 4-byte length or "RIFF" prefix.
+    _IMAGE_SIGNATURES = (
+        b'\xff\xd8\xff',            # JPEG
+        b'\x89PNG\r\n\x1a\n',       # PNG
+        b'GIF87a',
+        b'GIF89a',
+        b'BM',                      # BMP
+    )
+
+    @classmethod
+    def _image_body_error(cls, body: bytes, content_type: str) -> Optional[str]:
+        """Why a 200 response body is not a usable image, or None if it is.
+
+        Judging by size does not work on long-strip content: slicing a webtoon
+        into fixed-height strips regularly lands one on a near-blank band of the
+        page, and 1280x211 of almost-flat colour is a perfectly valid 772-byte
+        webp.  Those are real pages, and dropping them punches holes in the
+        middle of a chapter that nothing downstream can detect.  So check what
+        the bytes *are* rather than how many there are.
+        """
+        if len(body) < 32:
+            # Too short to carry any image header at all.
+            return f"{len(body)} byte body (truncated?)"
+        if body.startswith(cls._IMAGE_SIGNATURES):
+            return None
+        if body[:4] == b'RIFF' and body[8:12] == b'WEBP':
+            return None
+        if body[4:8] == b'ftyp':    # AVIF / HEIC / other ISO-BMFF
+            return None
+        kind = (content_type or '').split(';')[0].strip() or 'unknown type'
+        return f"{len(body)} byte {kind} body, not an image (error page?)"
+
     def _download_image(self, url: str, path: Path, referer: str) -> bool:
         """Download an image file, retrying transient failures.
 
@@ -1607,8 +1641,13 @@ class BaseSiteScraper:
             else:
                 status = response.status_code
                 if status == 200:
-                    if len(response.content) < 1000:  # Likely an error page
-                        reason = f"{len(response.content)} byte body (error page?)"
+                    problem = self._image_body_error(
+                        response.content, response.headers.get('Content-Type', ''))
+                    if problem:
+                        # Not transient — the same bytes come back every time —
+                        # so leave it to the post-cooldown pass rather than
+                        # hammering it here.
+                        reason = problem
                         break
                     path.write_bytes(response.content)
                     return True
