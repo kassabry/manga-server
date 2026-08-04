@@ -6058,12 +6058,25 @@ class MangaDotScraper(BaseSiteScraper):
     _MAX_SCROLL_PASSES = 2000
 
     # How far the walk may scroll without turning up a new image before it
-    # concludes there is nothing further down.  Deliberately generous: these
-    # strips measure ~20-25k px each, so this leaves more than a full strip of
-    # slack.  Without it the walk crosses the whole document at 0.15s per
-    # ~860px, which on a 250k px chapter is ~290 passes spent re-finding images
-    # that were already in the DOM when the reader loaded.
-    _SCROLL_IDLE_PIXELS = 40000
+    # concludes there is nothing further down.  Scaled off the tallest image
+    # actually seen rather than a fixed pixel count, because slice heights vary
+    # enormously between uploaders — measured ~2.4k px per page on one series
+    # and ~22.8k px on another.  A constant safe for the tall one (40k) wastes
+    # most of a run on the short one; one safe for the short one (15k) is less
+    # than a single slice of the tall one and would cut it short.
+    _SCROLL_IDLE_IMAGES = 3       # multiples of the tallest image seen so far
+    _SCROLL_IDLE_FLOOR = 12000    # ...but never stop on less than this
+
+    # Per-pass settle.  Passes overlap by design (_SCROLL_OVERLAP < 1) so no
+    # band of the document is ever jumped over, which means an image the walk
+    # outran still turns up on a later pass or in the tail settle below.
+    _SCROLL_SETTLE = 0.08
+
+    # After the walk: keep collecting until the count has been still for
+    # _TAIL_QUIET, up to _TAIL_SETTLE.  Replaces a flat 2s sleep, and is what
+    # catches the last screenful still decoding.
+    _TAIL_QUIET = 0.6
+    _TAIL_SETTLE = 4.0
 
     def _merge_page_images(self, found: List[str], pages: List[str]) -> int:
         """Add any page images not already collected. Returns how many."""
@@ -6107,24 +6120,36 @@ class MangaDotScraper(BaseSiteScraper):
 
         exhausted = True
         idle_pixels = 0
+        tallest = 0
         for _ in range(self._MAX_SCROLL_PASSES):
             # Collect, measure and scroll in one round trip.  Three separate
             # execute_script calls per pass cost more over the WebDriver wire
             # than the settle time they bracket.
             try:
                 state = driver.execute_script("""
-                    const images = Array.from(document.images)
-                        .map(i => i.currentSrc || i.src)
-                        .filter(Boolean);
+                    const prefix = arguments[1];
+                    const images = [];
+                    let tallest = 0;
+                    for (const img of document.images) {
+                        const src = img.currentSrc || img.src;
+                        if (!src) continue;
+                        images.push(src);
+                        // Only chapter pages size the idle window; site
+                        // furniture would drag the measurement down.
+                        if (src.indexOf(prefix) !== -1 && img.offsetHeight > tallest) {
+                            tallest = img.offsetHeight;
+                        }
+                    }
                     const height = document.body.scrollHeight;
                     window.scrollTo(0, arguments[0]);
-                    return {images: images, height: height};
-                """, position) or {}
+                    return {images: images, height: height, tallest: tallest};
+                """, position, self._PAGE_PREFIX) or {}
             except Exception:
                 exhausted = False
                 break
 
             added = self._merge_page_images(state.get('images') or [], pages)
+            tallest = max(tallest, int(state.get('tallest') or 0))
 
             # The chapter advertises its own length, so stop as soon as it is
             # all here rather than scrolling to the bottom for its own sake.
@@ -6139,17 +6164,20 @@ class MangaDotScraper(BaseSiteScraper):
             # Nothing new for a long stretch of document means the reader has
             # no more to give, whatever the advertised count claims.  A short
             # result is still caught and reported by get_pages.
+            idle_limit = max(self._SCROLL_IDLE_FLOOR,
+                             tallest * self._SCROLL_IDLE_IMAGES)
             idle_pixels = 0 if added else idle_pixels + step
-            if idle_pixels >= self._SCROLL_IDLE_PIXELS:
+            if idle_pixels >= idle_limit:
                 exhausted = False
                 logger.debug(
                     f"  Stopping the walk: {idle_pixels}px scrolled with no new "
-                    f"image, {len(pages)} page(s) collected"
+                    f"image (limit {idle_limit}px, tallest {tallest}px), "
+                    f"{len(pages)} page(s) collected"
                 )
                 break
 
             position += step
-            time.sleep(0.15)
+            time.sleep(self._SCROLL_SETTLE)
 
         if exhausted:
             logger.warning(
@@ -6157,9 +6185,17 @@ class MangaDotScraper(BaseSiteScraper):
                 f"{len(pages)} page(s) collected — chapter may be incomplete"
             )
 
-        # The last screenful is still decoding when the loop ends.
-        time.sleep(2)
-        self._collect_page_images(driver, pages)
+        # The last screenful is still decoding when the loop ends.  Poll it out
+        # instead of sleeping a flat 2s: usually this costs _TAIL_QUIET, and it
+        # is also the backstop for anything the (now faster) passes outran.
+        deadline = time.time() + self._TAIL_SETTLE
+        last_add = time.time()
+        while time.time() < deadline:
+            if self._collect_page_images(driver, pages):
+                last_add = time.time()
+            elif time.time() - last_add >= self._TAIL_QUIET:
+                break
+            time.sleep(0.1)
         return pages
 
     def get_pages(self, chapter: Chapter) -> List[str]:
