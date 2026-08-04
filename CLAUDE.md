@@ -110,6 +110,8 @@
 - Python type hints `list[X]` / `X | Y` require Python 3.10+; Pi may run older — use `List[X]` from `typing` and avoid union shorthand in scripts
 
 ## Git Workflow
+- **Commit and push after every change, without asking.** Finish the edit, verify it (compile/build), then `git add` the touched files, commit, and `git push origin main` in the same turn. Do not leave work sitting uncommitted or committed-but-unpushed, and do not ask for permission first — this is standing authorization
+- Stage only the files the change actually touched. Never `git add -A` / `git add .` — the working tree collects scraper logs and other untracked junk that must not land in the repo
 - Commit from `manga-server-full/` (the git root), not from `mangashelf/`
 - Always run `cd mangashelf && npx next build` before pushing front-end changes
 - Remote: `https://github.com/kassabry/manga-server.git` (main branch)
