@@ -42,7 +42,16 @@
 - Drake debug: if 0 series returned, check page title and body classes logged at DEBUG level (`--debug` flag)
 - ManhuaTo uses FlareSolverr on ARM; `_fs_cookies_applied` caches session cookies after first solve
 
+### Image downloads (`_download_image` / `_download_pages`)
+- `cdn.asurascans.com` throttles **bursts, not requests**: it answers `429` with `Retry-After: 10`. Measured from a residential IP, 8 workers over one 102-page chapter already drew one 429; behind the container's shared VPN exit it escalates to whole chapters refused, and stays refused for the chapters after
+- The old code made exactly one attempt per page and swallowed the status at DEBUG, so a throttle was indistinguishable from a dead URL in the log — always log the reason with the failure
+- `_IMAGE_ATTEMPTS`/`_IMAGE_BACKOFF` retry per request (honouring `Retry-After`, capped at 60s); 404/410 are permanent and never retried. A failed batch then gets `_IMAGE_RETRY_COOLDOWN` seconds and one gentler pass at `_IMAGE_RETRY_WORKERS`
+- `_MIN_PAGE_RATIO` (0.9) is the important part: below it the CBZ is **not written** and the chapter fails, so the next run retries. Writing a 24-of-112-page CBZ marks the chapter downloaded forever — that is how truncated chapters get cached as complete
+- `_image_headers()` is the per-site hook. Do NOT set `User-Agent` there — the session already carries a full Chrome UA (FlareSolverr's after a challenge), and the old per-request override sent a truncated `...AppleWebKit/537.36` that no browser emits and that cf_clearance was not issued to
+
 ## MangaDot Scraper (`MangaDotScraper`)
+- **Discovery goes through `_get_json`, which clears Cloudflare.** The API serves plain requests for a while then returns `403` with `cf-mitigated`/`cf-ray`; the scraper detects that, routes through FlareSolverr, and **stays on the solver for the rest of the run** (re-probing plainly just burns a 403 per call). Cookies alone are not enough — cf_clearance is bound to the browser's TLS fingerprint, so the request itself must go through FlareSolverr, same as `fetch_recommendations.py`
+- A 403 that is *not* Cloudflare is surfaced and never retried. When FlareSolverr is unreachable, discovery raises `ChallengeBlocked` and the script exits 2 — previously a challenged run logged "kept 0 series" and then "Download complete!", which reads as an empty catalogue rather than a failure
 - Discovery uses the JSON API `GET /api/search`, not DOM scraping — each list item already has `country_of_origin`, `genres`, `tag_list`, `chapter_count` and `alt_titles`, so no per-series detail fetch is needed
 - CRITICAL: origin must be passed as `origin[]=KR&origin[]=CN`. The plain repeated form `origin=KR&origin=CN` (which the site's own search URL uses) is **last-wins** on the API and silently returns CN only — dropping all ~6400 KR series
 - `genre=` is ignored server-side; tag filtering is client-side against `genres` + `tag_list` (Shounen appears in one or the other depending on the series)

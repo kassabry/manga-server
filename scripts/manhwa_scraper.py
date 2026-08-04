@@ -42,6 +42,7 @@ import random
 import zipfile
 import logging
 import unicodedata
+import html as html_lib
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Dict, Optional, Set
@@ -203,6 +204,21 @@ class BaseSiteScraper:
     # that rate-limit or 504 under parallel load (e.g. ManhuaFast/Drake sites).
     _DOWNLOAD_WORKERS = 8
 
+    # Image download policy.  These CDNs throttle bursts rather than individual
+    # requests: a run pulls a chapter or two cleanly, then every image comes
+    # back blocked until the burst window passes.  With one attempt per page
+    # that becomes a CBZ silently missing most of its pages, so a failed batch
+    # gets a cooldown and a second, gentler pass before the chapter is given up.
+    _IMAGE_ATTEMPTS = 3          # per-request attempts for transient failures
+    _IMAGE_BACKOFF = 2.0         # seconds before the first retry, doubled after
+    _IMAGE_RETRY_COOLDOWN = 30   # seconds to wait out a CDN burst block
+    _IMAGE_RETRY_WORKERS = 2     # concurrency for the post-cooldown pass
+
+    # Fraction of a chapter's pages that must arrive before a CBZ is written.
+    # Below it the chapter is failed instead, so the next run retries it —
+    # a truncated CBZ would otherwise be cached as complete forever.
+    _MIN_PAGE_RATIO = 0.9
+
     def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None):
         self.headless = headless
         self.driver = None
@@ -213,6 +229,8 @@ class BaseSiteScraper:
         # Track cover URLs that have already failed so we don't spam a 403
         # warning on every chapter of a series when the cover is unavailable.
         self._failed_cover_urls: set = set()
+        # Reason the most recent image download gave up, for batch reporting.
+        self._last_image_error: str = ''
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -1477,28 +1495,51 @@ class BaseSiteScraper:
             temp_dir.mkdir(exist_ok=True)
             
             # Download images concurrently (CDN images, no rate limiting needed)
-            success_count = 0
             download_tasks = []
             for i, page_url in enumerate(pages, 1):
                 ext = self._get_extension(page_url)
                 img_path = temp_dir / f"{i:03d}{ext}"
                 download_tasks.append((i, page_url, img_path))
 
-            with ThreadPoolExecutor(max_workers=self._DOWNLOAD_WORKERS) as pool:
-                futures = {
-                    pool.submit(self._download_image, url, path, chapter.url): page_num
-                    for page_num, url, path in download_tasks
-                }
-                for future in as_completed(futures):
-                    page_num = futures[future]
-                    if future.result():
-                        success_count += 1
-                    else:
-                        logger.warning(f"Failed to download page {page_num}")
-            
+            self._last_image_error = ''
+            failed = self._download_pages(
+                download_tasks, chapter.url, self._DOWNLOAD_WORKERS)
+
+            if failed:
+                # A page or two failing is a bad URL; a batch failing is the CDN
+                # throttling the burst, and the only cure for that is to wait.
+                logger.warning(
+                    f"{len(failed)}/{len(download_tasks)} page(s) failed "
+                    f"(last error: {self._last_image_error or 'unknown'}) — "
+                    f"cooling down {self._IMAGE_RETRY_COOLDOWN}s and retrying"
+                )
+                time.sleep(self._IMAGE_RETRY_COOLDOWN)
+                self._last_image_error = ''
+                failed = self._download_pages(
+                    sorted(failed), chapter.url, self._IMAGE_RETRY_WORKERS)
+                for page_num, _, _ in sorted(failed):
+                    logger.warning(f"Failed to download page {page_num}")
+
+            success_count = len(download_tasks) - len(failed)
+
             if success_count == 0:
-                logger.error(f"No images downloaded for chapter {chapter.number}")
-                return False
+                logger.error(
+                    f"No images downloaded for chapter {chapter.number} "
+                    f"(last error: {self._last_image_error or 'unknown'})"
+                )
+                self._clear_temp_dir(temp_dir)
+                return 'fail'
+
+            if success_count < len(download_tasks) * self._MIN_PAGE_RATIO:
+                # Writing this would cache a truncated chapter as complete.
+                logger.error(
+                    f"Only {success_count}/{len(download_tasks)} pages downloaded for "
+                    f"chapter {chapter.number} (last error: "
+                    f"{self._last_image_error or 'unknown'}) — not writing a "
+                    f"truncated CBZ; it will be retried on the next run"
+                )
+                self._clear_temp_dir(temp_dir)
+                return 'fail'
 
             # Post-download: remove outlier images by dimension
             # Promotional covers have different aspect ratios than chapter pages
@@ -1508,10 +1549,8 @@ class BaseSiteScraper:
             self._create_cbz(temp_dir, cbz_path, series, chapter)
             
             # Cleanup
-            for f in temp_dir.iterdir():
-                f.unlink()
-            temp_dir.rmdir()
-            
+            self._clear_temp_dir(temp_dir)
+
             # Mark as downloaded and update the in-memory set so the rest of
             # this run's chapter loop doesn't re-check a file we just wrote.
             tracker.mark_downloaded(chapter.url)
@@ -1525,25 +1564,89 @@ class BaseSiteScraper:
             logger.error(f"Error downloading chapter: {e}")
             return 'fail'
     
-    def _download_image(self, url: str, path: Path, referer: str) -> bool:
-        """Download an image file"""
+    @staticmethod
+    def _clear_temp_dir(temp_dir: Path):
+        """Delete a chapter's scratch directory, ignoring what isn't there."""
         try:
-            headers = {
-                'Referer': referer,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            response = self.session.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            
-            if len(response.content) < 1000:  # Likely an error page
-                return False
-            
-            path.write_bytes(response.content)
-            return True
-        except Exception as e:
-            logger.debug(f"Failed to download {url}: {e}")
-            return False
-    
+            for f in temp_dir.iterdir():
+                f.unlink()
+            temp_dir.rmdir()
+        except OSError as e:
+            logger.debug(f"Could not clean up {temp_dir}: {e}")
+
+    def _image_headers(self, referer: str) -> dict:
+        """Headers for a CDN image request.
+
+        No User-Agent: the session already carries a full Chrome UA, replaced
+        by FlareSolverr's after a challenge.  Overriding it per-request sent a
+        truncated UA that no real browser emits and that does not match the one
+        cf_clearance was issued to, which is exactly what these CDNs check.
+        """
+        return {
+            'Referer': referer,
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        }
+
+    def _download_image(self, url: str, path: Path, referer: str) -> bool:
+        """Download an image file, retrying transient failures.
+
+        Records the last failure reason on self._last_image_error so the
+        chapter loop can report *why* a batch of pages failed rather than just
+        that it did — a bare "Failed to download page N" makes a CDN throttle
+        indistinguishable from a dead URL.
+        """
+        headers = self._image_headers(referer)
+        delay = self._IMAGE_BACKOFF
+        reason = 'unknown'
+
+        for attempt in range(1, self._IMAGE_ATTEMPTS + 1):
+            try:
+                response = self.session.get(url, headers=headers, timeout=30)
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+            else:
+                status = response.status_code
+                if status == 200:
+                    if len(response.content) < 1000:  # Likely an error page
+                        reason = f"{len(response.content)} byte body (error page?)"
+                        break
+                    path.write_bytes(response.content)
+                    return True
+
+                reason = f"HTTP {status}"
+                # 404/410 are permanent — the page genuinely is not there.
+                if status in (404, 410):
+                    break
+                # A throttled CDN sends Retry-After; honour it, but cap it so a
+                # hostile value can't stall the whole run.
+                if status == 429:
+                    try:
+                        delay = max(delay, min(float(response.headers.get('Retry-After', 0)), 60))
+                    except (TypeError, ValueError):
+                        pass
+
+            if attempt < self._IMAGE_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+
+        logger.debug(f"Failed to download {url}: {reason}")
+        self._last_image_error = reason
+        return False
+
+    def _download_pages(self, tasks: list, referer: str, workers: int) -> list:
+        """Download a batch of (page_num, url, path) tasks; return the failures."""
+        failed = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {}
+            for page_num, url, path in tasks:
+                future = pool.submit(self._download_image, url, path, referer)
+                futures[future] = (page_num, url, path)
+            for future in as_completed(futures):
+                if not future.result():
+                    failed.append(futures[future])
+        return failed
+
+
     def _create_cbz(self, source_dir: Path, output_path: Path, series: Series = None, chapter: Chapter = None):
         """Create CBZ archive from images with optional ComicInfo.xml metadata.
 
@@ -1616,7 +1719,13 @@ class AsuraFullScraper(BaseSiteScraper):
     BASE_URL = "https://asurascans.com"
     SITE_NAME = "asura"
     CLOUDFLARE_SITE = True
-    
+
+    # cdn.asurascans.com throttles on sustained volume, not per request: a run
+    # pulls one or two chapters at 8 workers, then starts refusing every image
+    # partway through the next one and keeps refusing for whole chapters after.
+    # Fewer workers keeps the burst under whatever the CDN's threshold is.
+    _DOWNLOAD_WORKERS = 4
+
     def get_series_details(self, series: Series) -> Series:
         """Fetch full details from Asura's series page.
 
@@ -3395,27 +3504,17 @@ class ManhuaToScraper(BaseSiteScraper):
             logger.debug(traceback.format_exc())
             return []
 
-    def _download_image(self, url: str, path: Path, referer: str) -> bool:
-        """Download image using the FlareSolverr session cookies and matching UA.
+    def _image_headers(self, referer: str) -> dict:
+        """Send no User-Agent so the session's own is used.
 
-        The base class hardcodes a generic User-Agent which cdn.manhuato.com
-        rejects when it doesn't match the UA used during the Cloudflare challenge.
-        We send only the Referer here and let the session supply the correct UA.
+        The base class sets a generic User-Agent which cdn.manhuato.com rejects
+        when it doesn't match the UA used during the Cloudflare challenge —
+        FlareSolverr's UA is already on the session, so leave it alone.
         """
-        try:
-            headers = {
-                'Referer': referer,
-                'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-            }
-            response = self.session.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            if len(response.content) < 1000:
-                return False
-            path.write_bytes(response.content)
-            return True
-        except Exception as e:
-            logger.debug(f"Failed to download {url}: {e}")
-            return False
+        return {
+            'Referer': referer,
+            'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        }
 
 
 class DrakeFullScraper(BaseSiteScraper):
@@ -4840,6 +4939,47 @@ def _md_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def _json_from_html(body: str) -> Optional[dict]:
+    """Pull a JSON document out of what FlareSolverr hands back.
+
+    FlareSolverr returns the *rendered* page, so a JSON endpoint arrives
+    wrapped in Chrome's viewer markup (`<html><body><pre>{...}</pre>`) rather
+    than as a bare document.  Falls through progressively so a change in that
+    wrapper does not break everything.  (Same logic as fetch_recommendations.py,
+    which hit this first.)
+    """
+    if not body:
+        return None
+    text = body.strip()
+
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+
+    match = re.search(r'<pre[^>]*>(.*?)</pre>', text, re.S | re.I)
+    candidate = match.group(1) if match else re.sub(r'<[^>]+>', '', text)
+    candidate = html_lib.unescape(candidate).strip()
+
+    try:
+        return json.loads(candidate)
+    except ValueError:
+        pass
+
+    start, end = candidate.find('{'), candidate.rfind('}')
+    if start != -1 and end > start:
+        try:
+            return json.loads(candidate[start:end + 1])
+        except ValueError:
+            pass
+    logger.warning("MangaDot: could not parse JSON out of the FlareSolverr response")
+    return None
+
+
+class ChallengeBlocked(Exception):
+    """A Cloudflare challenge we could not clear — retrying will not help."""
+
+
 class MangaDotAliasIndex:
     """Maps normalized titles (and alt titles) to existing library folders.
 
@@ -4972,6 +5112,7 @@ class MangaDotScraper(BaseSiteScraper):
 
     BASE_URL = "https://mangadot.net"
     SITE_NAME = "mangadot"
+    CLOUDFLARE_SITE = True
 
     # country_of_origin -> library subfolder
     ORIGIN_FOLDER = {'KR': 'Manhwa', 'CN': 'Manhua'}
@@ -5025,6 +5166,79 @@ class MangaDotScraper(BaseSiteScraper):
         self.required_tags = frozenset(t.lower() for t in self.required_tags_raw)
         self.min_chapters = (self.DEFAULT_MIN_CHAPTERS
                              if min_chapters is None else min_chapters)
+        # Once Cloudflare starts challenging it does not stop, so the solver
+        # stays on for the rest of the run rather than eating a 403 per call.
+        self._md_via_solver = False
+        self._md_solver_announced = False
+
+    # -- HTTP --------------------------------------------------------------
+
+    @staticmethod
+    def _is_cf_challenge(resp) -> bool:
+        """True when a response is Cloudflare blocking us, not the API saying no."""
+        if resp.status_code not in (403, 503):
+            return False
+        server = resp.headers.get('server', '').lower()
+        return ('cf-mitigated' in resp.headers
+                or 'cf-ray' in resp.headers
+                or 'cloudflare' in server
+                or 'Just a moment' in resp.text[:1000])
+
+    def _get_json(self, url: str) -> Optional[dict]:
+        """Fetch a MangaDot JSON endpoint, clearing Cloudflare if it intervenes.
+
+        The API serves plain requests fine for a while, then challenges once a
+        run has made a few hundred.  Replaying FlareSolverr's cookies is not
+        enough on its own — cf_clearance is bound to the TLS fingerprint of the
+        browser that earned it — so once challenged, every subsequent request
+        goes through FlareSolverr's browser for the rest of the run.
+
+        Raises ChallengeBlocked when the challenge cannot be cleared at all, so
+        discovery stops with a reason instead of quietly reporting 0 series.
+        """
+        if self._md_via_solver:
+            return self._solver_get_json(url)
+
+        try:
+            resp = self.session.get(url, timeout=30)
+        except Exception as e:
+            logger.warning(f"MangaDot request failed ({type(e).__name__}): {e}")
+            return None
+
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError:
+                logger.warning(f"MangaDot returned non-JSON for {url}")
+                return None
+        if resp.status_code == 404:
+            return None
+        if not self._is_cf_challenge(resp):
+            # Never retry: neither a 403 nor any other status here is transient,
+            # and retrying only adds to the volume that triggers a challenge.
+            logger.warning(f"MangaDot: HTTP {resp.status_code} for {url}")
+            return None
+
+        if not self._md_solver_announced:
+            self._md_solver_announced = True
+            logger.info("MangaDot: Cloudflare challenge — routing through FlareSolverr")
+            if not self._flaresolverr_available():
+                raise ChallengeBlocked(
+                    f"MangaDot is behind a Cloudflare challenge and FlareSolverr is "
+                    f"not reachable at {self._flaresolverr_url()}. Start it (it is in "
+                    f"docker-compose.yml) or set FLARESOLVERR_URL."
+                )
+        self._md_via_solver = True
+        return self._solver_get_json(url)
+
+    def _solver_get_json(self, url: str) -> Optional[dict]:
+        """Fetch through FlareSolverr's browser and unwrap the JSON."""
+        try:
+            html, cookies, user_agent = self._flaresolverr_get(url)
+        except Exception as e:
+            raise ChallengeBlocked(f"FlareSolverr could not fetch {url}: {e}")
+        self._apply_flaresolverr_cookies(cookies, user_agent)
+        return _json_from_html(html)
 
     # -- discovery ---------------------------------------------------------
 
@@ -5096,13 +5310,11 @@ class MangaDotScraper(BaseSiteScraper):
         url = f"{self.BASE_URL}{self.API_SEARCH}?page={page}&{self._origin_qs}"
         if extra:
             url += f"&{extra}"
-        try:
-            resp = self.session.get(url, timeout=30)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.warning(f"MangaDot search failed ({extra or 'no filter'}, page {page}): {e}")
-            return None
+        payload = self._get_json(url)
+        if payload is None:
+            logger.warning(
+                f"MangaDot search returned nothing ({extra or 'no filter'}, page {page})")
+        return payload
 
     def _resolve_tag_queries(self) -> List[str]:
         """Work out which query parameter actually filters each required tag.
@@ -5243,6 +5455,13 @@ class MangaDotScraper(BaseSiteScraper):
                 page += 1
                 self._delay()
 
+        if not pages_fetched:
+            # Zero pages is never a legitimate result — the catalogue always has
+            # some.  Say so, otherwise the run ends on "Download complete!".
+            logger.error(
+                "MangaDot: the search API returned nothing at all — discovery "
+                "failed rather than finding no matches"
+            )
         logger.info(
             f"MangaDot: kept {kept} series from {pages_fetched} page(s) "
             f"(skipped {skipped_tags} on tags, {skipped_chapters} on chapter count, "
@@ -5553,10 +5772,8 @@ class MangaDotScraper(BaseSiteScraper):
         if not md_id:
             return None
         try:
-            resp = self.session.get(
-                f"{self.BASE_URL}{self.API_MANGA}/{md_id}", timeout=30)
-            resp.raise_for_status()
-            value = (resp.json().get('manga') or {}).get('anilist_id')
+            payload = self._get_json(f"{self.BASE_URL}{self.API_MANGA}/{md_id}")
+            value = ((payload or {}).get('manga') or {}).get('anilist_id')
             return int(value) if value else None
         except Exception as e:
             logger.debug(f"MangaDot: no anilist_id for {md_id}: {e}")
@@ -6903,4 +7120,10 @@ Examples:
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except ChallengeBlocked as e:
+        # Not transient and not fixable by retrying — say so and exit non-zero
+        # rather than logging "Download complete!" over an empty run.
+        logger.error(str(e))
+        sys.exit(2)
