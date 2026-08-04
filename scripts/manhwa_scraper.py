@@ -5469,6 +5469,201 @@ class MangaDotScraper(BaseSiteScraper):
         )
         return all_series
 
+    # -- Selenium + Cloudflare ---------------------------------------------
+
+    # Wording Cloudflare puts on its interstitial, matched against title+body.
+    _CF_PAGE_MARKERS = (
+        'just a moment',
+        'checking your browser',
+        'enable javascript and cookies',
+        'verifying you are human',
+        'attention required',
+    )
+
+    # undetected-chromedriver often walks through the interstitial on its own,
+    # so wait this many seconds before spending a FlareSolverr round-trip.
+    _CF_SELF_SOLVE_WAIT = 12
+
+    def _driver_challenged(self) -> bool:
+        """True when the browser is sitting on a Cloudflare interstitial."""
+        try:
+            probe = self.driver.execute_script("""
+                const body = document.body ? (document.body.innerText || '') : '';
+                return {
+                    title: document.title || '',
+                    text: body.slice(0, 600),
+                    challenge: !!document.querySelector(
+                        '#challenge-form, #cf-challenge-running, #challenge-running,'
+                        + ' form[action*="__cf_chl"],'
+                        + ' iframe[src*="challenges.cloudflare.com"]')
+                };
+            """) or {}
+        except Exception:
+            return False
+        if probe.get('challenge'):
+            return True
+        haystack = f"{probe.get('title', '')} {probe.get('text', '')}".lower()
+        return any(marker in haystack for marker in self._CF_PAGE_MARKERS)
+
+    def _driver_clear_challenge(self, url: str) -> bool:
+        """Get the browser past Cloudflare, waiting first, then borrowing
+        FlareSolverr's clearance.
+
+        The discovery path solves this by making every request through
+        FlareSolverr, but chapter lists and reader pages are client-rendered and
+        need a real browser we drive ourselves, so the clearance has to be moved
+        into that browser instead.  cf_clearance does transfer between two real
+        Chromes leaving the same IP — but only if this one also sends the
+        User-Agent the cookie was issued to.
+        """
+        for _ in range(self._CF_SELF_SOLVE_WAIT):
+            time.sleep(1)
+            if not self._driver_challenged():
+                logger.info("MangaDot: browser cleared the challenge on its own")
+                return True
+
+        if not self._flaresolverr_available():
+            logger.error(
+                f"MangaDot: Cloudflare is challenging the browser and FlareSolverr "
+                f"is not reachable at {self._flaresolverr_url()}. Start it (it is in "
+                f"docker-compose.yml) or set FLARESOLVERR_URL."
+            )
+            return False
+
+        try:
+            _, cookies, user_agent = self._flaresolverr_get(url)
+        except Exception as e:
+            logger.error(f"MangaDot: FlareSolverr could not clear {url}: {e}")
+            return False
+
+        # Keep the requests session in step too, so the API side of the run
+        # benefits from the same freshly solved clearance.
+        self._apply_flaresolverr_cookies(cookies, user_agent)
+        return self._driver_adopt_session(cookies, user_agent, url)
+
+    def _driver_adopt_session(self, cookies: list, user_agent: str, url: str) -> bool:
+        """Hand FlareSolverr's cookies and User-Agent to the Selenium browser."""
+        driver = self.driver
+
+        if user_agent:
+            try:
+                driver.execute_cdp_cmd('Network.setUserAgentOverride',
+                                       {'userAgent': user_agent})
+            except Exception as e:
+                # cf_clearance is bound to the UA it was issued to, so without
+                # this the cookies below are rejected on sight.
+                logger.warning(f"MangaDot: could not adopt the solver's UA: {e}")
+
+        applied = 0
+        for c in cookies:
+            domain = (c.get('domain') or '').strip()
+            if not domain or 'mangadot' not in domain:
+                continue
+            try:
+                driver.add_cookie({
+                    'name': c['name'],
+                    'value': c['value'],
+                    'domain': domain,
+                    'path': c.get('path') or '/',
+                })
+                applied += 1
+            except Exception as e:
+                logger.debug(f"MangaDot: cookie {c.get('name')!r} rejected: {e}")
+
+        if not applied:
+            logger.error("MangaDot: FlareSolverr returned no usable mangadot cookies")
+            return False
+
+        try:
+            driver.get(url)
+        except Exception as e:
+            logger.error(f"MangaDot: reload after adopting the session failed: {e}")
+            return False
+        time.sleep(3)
+
+        if self._driver_challenged():
+            logger.error(
+                "MangaDot: still challenged after adopting FlareSolverr's session — "
+                "the solver and the browser are probably not sharing an exit IP"
+            )
+            return False
+
+        logger.info(f"MangaDot: adopted FlareSolverr's session ({applied} cookie(s))")
+        return True
+
+    def _report_unrendered(self, url: str) -> None:
+        """Say what the browser is actually looking at when a page stays empty.
+
+        Without this an interstitial, a redirect and a genuinely empty series
+        all produce the same "0 chapters" line, which reads as the site having
+        nothing rather than as the run being broken.
+        """
+        try:
+            info = self.driver.execute_script("""
+                return {
+                    title: document.title || '',
+                    href: location.href,
+                    anchors: document.querySelectorAll('a').length,
+                    text: (document.body ? document.body.innerText : '')
+                        .replace(/\\s+/g, ' ').trim().slice(0, 200)
+                };
+            """) or {}
+        except Exception as e:
+            logger.warning(f"MangaDot: {url} never rendered, and the page could "
+                           f"not be inspected: {e}")
+            return
+        logger.warning(
+            f"MangaDot: {url} never rendered — now on {info.get('href')!r} "
+            f"(title {info.get('title')!r}, {info.get('anchors')} link(s)): "
+            f"{info.get('text')!r}"
+        )
+
+    def _load_rendered(self, url: str, ready_js: str, timeout: int = 30) -> bool:
+        """Load a client-rendered page and wait for React to fill it in.
+
+        Returns False only after reporting why, because every selector this
+        class uses comes back empty on an interstitial exactly as it would on a
+        series with nothing posted.
+        """
+        driver = self.driver
+
+        for attempt in (1, 2):
+            try:
+                driver.get(url)
+            except Exception as e:
+                logger.warning(f"MangaDot: could not load {url}: {e}")
+                return False
+
+            time.sleep(4)
+            challenged = False
+            for _ in range(timeout):
+                try:
+                    if driver.execute_script(ready_js):
+                        return True
+                except Exception:
+                    pass
+                # Bail out of the wait immediately on a challenge: the rows
+                # being waited for are never coming.
+                if self._driver_challenged():
+                    challenged = True
+                    break
+                time.sleep(1)
+
+            if not challenged:
+                self._report_unrendered(url)
+                return False
+
+            logger.warning(f"MangaDot: Cloudflare interstitial on {url}")
+            if attempt == 2 or not self._driver_clear_challenge(url):
+                logger.error(
+                    "MangaDot: could not get the browser past Cloudflare — chapter "
+                    "lists and reader pages are client-rendered, so nothing can be "
+                    "read until this clears"
+                )
+                return False
+
+        return False
+
     # -- chapters ----------------------------------------------------------
 
     def get_chapters(self, series: Series) -> List[Chapter]:
@@ -5481,28 +5676,16 @@ class MangaDotScraper(BaseSiteScraper):
         self._init_driver()
         driver = self.driver
 
-        try:
-            driver.get(series.url)
-        except Exception as e:
-            logger.warning(f"MangaDot: could not load {series.url}: {e}")
-            return []
-
         # Wait for hydration before touching the expander.  The server-rendered
         # page already contains one chapter anchor ("Start Reading") and an
         # inert copy of the button, so their mere presence is not a readiness
         # signal — clicking then does nothing and the list stays collapsed.
         # Wait for the several chapter rows that only React renders.
-        time.sleep(4)
-        for _ in range(30):
-            try:
-                ready = driver.execute_script("""
-                    return document.querySelectorAll('a[href*="/chapter/"]').length > 3;
-                """)
-            except Exception:
-                ready = False
-            if ready:
-                break
-            time.sleep(1)
+        if not self._load_rendered(
+            series.url,
+            'return document.querySelectorAll(\'a[href*="/chapter/"]\').length > 3;',
+        ):
+            return []
 
         # Click through the expander until no more rows are hidden.  Note that
         # chapters with several scanlation groups render as "N VERSIONS"
@@ -5919,13 +6102,16 @@ class MangaDotScraper(BaseSiteScraper):
 
         best: List[str] = []
         for attempt in (1, 2):
-            try:
-                driver.get(chapter.url)
-            except Exception as e:
-                logger.warning(f"MangaDot: could not load {chapter.url}: {e}")
-                return []
+            # Mirror _collect_page_images: the reader sets srcset, so an image
+            # can be on screen with an empty src attribute.
+            if not self._load_rendered(
+                chapter.url,
+                f'return Array.from(document.images)'
+                f'.some(i => (i.currentSrc || i.src || "")'
+                f'.includes({json.dumps(self._PAGE_PREFIX)}));',
+            ):
+                return best
 
-            time.sleep(4)
             pages = self._scroll_for_pages(driver, expected)
             if len(pages) > len(best):
                 best = pages
