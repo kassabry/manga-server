@@ -1564,7 +1564,13 @@ class BaseSiteScraper:
         self._cover_media_ids = set()
 
         try:
+            # Timed per phase.  "Slower than the other scrapers" is not
+            # actionable without knowing whether the time goes into reading the
+            # reader or into pulling the images, and the two have completely
+            # different fixes.
+            started = time.time()
             pages = self.get_pages(chapter)
+            pages_secs = time.time() - started
             if not pages:
                 # Drake paywalled chapters return 0 pages silently (logged at DEBUG
                 # in get_pages); other sites treat this as a real error.
@@ -1584,6 +1590,7 @@ class BaseSiteScraper:
                 download_tasks.append((i, page_url, img_path))
 
             self._last_image_error = ''
+            started = time.time()
             failed = self._download_pages(
                 download_tasks, chapter.url, self._DOWNLOAD_WORKERS)
 
@@ -1602,6 +1609,7 @@ class BaseSiteScraper:
                 for page_num, _, _ in sorted(failed):
                     logger.warning(f"Failed to download page {page_num}")
 
+            download_secs = time.time() - started
             success_count = len(download_tasks) - len(failed)
 
             if success_count == 0:
@@ -1639,7 +1647,10 @@ class BaseSiteScraper:
             if existing_cbzs is not None:
                 existing_cbzs.add(cbz_name)
 
-            logger.info(f"Created: {cbz_name} ({success_count} pages)")
+            logger.info(
+                f"Created: {cbz_name} ({success_count} pages, "
+                f"read {pages_secs:.1f}s + fetch {download_secs:.1f}s)"
+            )
             return 'new'
 
         except Exception as e:
