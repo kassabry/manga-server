@@ -37,11 +37,16 @@ python3 scripts/manhwa_scraper.py --site drake --download-all --filter "action,f
 
 # MangaDot filters by origin/tag/chapter-count during discovery, so it takes no
 # --filter. Run once per origin: KR lands in Manhwa, CN in Manhua.
+# --tag-mode all means a series must carry EVERY tag in --tags, not any one of
+# them (the default). Without it, "Action,Adventure,Shounen" keeps anything
+# tagged Action, which is most of the catalogue.
 echo "=== MangaDot (Manhwa / KR) ==="
-python3 scripts/manhwa_scraper.py --site mangadot --download-all --origin KR --source-prefix -o ./library/Manhwa
+python3 scripts/manhwa_scraper.py --site mangadot --download-all --origin KR \
+  --tags "Action,Adventure" --tag-mode all --source-prefix -o ./library/Manhwa
 
 echo "=== MangaDot (Manhua / CN) ==="
-python3 scripts/manhwa_scraper.py --site mangadot --download-all --origin CN --source-prefix -o ./library/Manhua
+python3 scripts/manhwa_scraper.py --site mangadot --download-all --origin CN \
+  --tags "Action,Adventure" --tag-mode all --source-prefix -o ./library/Manhua
 
 echo "=== LightNovelPub ==="
 python3 scripts/lightnovel_scraper.py --site lightnovelpub --download-all --popular --pages 10 --source-prefix -o ./library/LightNovels

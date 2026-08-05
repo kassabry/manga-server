@@ -91,6 +91,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Consecutive per-chapter failures that mean the series (or the browser) is the
+# problem rather than the chapter.  Kept well above the handful of paywalled
+# chapters a healthy run hits, but low enough that a hung browser costs minutes
+# instead of the six hours a 180-chapter series takes at one timeout each.
+MAX_CONSECUTIVE_CHAPTER_FAILS = 15
+
 
 @dataclass
 class Chapter:
@@ -548,7 +554,83 @@ class BaseSiteScraper:
         if self.driver:
             self.driver.quit()
             self.driver = None
-    
+
+    # Substrings that mean the browser is gone, not that the page misbehaved.
+    # A hung chromedriver surfaces as a urllib3 read timeout against its own
+    # localhost port, which is indistinguishable from a slow page until you
+    # notice that every subsequent command times out identically.
+    _DRIVER_DEAD_MARKERS = (
+        'read timed out',
+        'connection refused',
+        'connection aborted',
+        'connection reset',
+        'max retries exceeded',
+        'invalid session id',
+        'session deleted',
+        'no such session',
+        'chrome not reachable',
+        'disconnected: not connected to devtools',
+        'target crashed',
+        'unable to connect',
+    )
+
+    @classmethod
+    def _driver_is_dead(cls, exc: Exception) -> bool:
+        """True when an exception means the browser has to be rebuilt."""
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return any(marker in text for marker in cls._DRIVER_DEAD_MARKERS)
+
+    def _kill_driver(self):
+        """Drop a hung browser without waiting on it.
+
+        driver.quit() is itself a WebDriver command, so on a browser that has
+        stopped answering it blocks for another full command timeout (120s by
+        default) before failing.  Kill the processes directly instead and let
+        the next _init_driver() build a fresh one.
+        """
+        driver, self.driver = self.driver, None
+        if driver is None:
+            return
+
+        import signal
+        sig = getattr(signal, 'SIGKILL', signal.SIGTERM)
+
+        # undetected-chromedriver exposes the browser it spawned; regular
+        # selenium only owns the chromedriver process, which takes Chrome
+        # down with it.
+        pid = getattr(driver, 'browser_pid', None)
+        if pid:
+            try:
+                os.kill(pid, sig)
+            except (OSError, ProcessLookupError):
+                pass
+
+        process = getattr(getattr(driver, 'service', None), 'process', None)
+        if process is not None:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+
+    def _restart_driver(self) -> bool:
+        """Rebuild a browser that stopped responding.  True when it came back.
+
+        Without this a single hung chromedriver poisons the rest of the run:
+        every following page load waits out the full command timeout and
+        fails identically, so a series of 180 chapters costs six hours and
+        downloads nothing.
+        """
+        logger.warning("Browser stopped responding — restarting it")
+        self._kill_driver()
+        try:
+            self._init_driver()
+        except Exception as e:
+            logger.error(f"Could not restart the browser: {e}")
+            return False
+        return True
+
+
     @staticmethod
     def _is_browser_error_page(soup) -> bool:
         """Detect browser/OS network error pages (Chrome ERR_*, Firefox, etc.)
@@ -5664,6 +5746,7 @@ class MangaDotScraper(BaseSiteScraper):
         class uses comes back empty on an interstitial exactly as it would on a
         series with nothing posted.
         """
+        self._init_driver()
         driver = self.driver
 
         for attempt in (1, 2):
@@ -5671,6 +5754,12 @@ class MangaDotScraper(BaseSiteScraper):
                 driver.get(url)
             except Exception as e:
                 logger.warning(f"MangaDot: could not load {url}: {e}")
+                # A dead browser fails every later chapter the same way, so
+                # rebuild it here rather than letting the whole series (and
+                # the ones after it) time out one command at a time.
+                if attempt == 1 and self._driver_is_dead(e) and self._restart_driver():
+                    driver = self.driver
+                    continue
                 return False
 
             # Poll from the start rather than sleeping a flat few seconds
@@ -6198,34 +6287,51 @@ class MangaDotScraper(BaseSiteScraper):
             time.sleep(0.1)
         return pages
 
-    def get_pages(self, chapter: Chapter) -> List[str]:
-        """Collect page images from the reader.
+    # How many *other* versions of a chapter to fall back to when the chosen
+    # one will not give up all its pages.  Each attempt costs a page load and
+    # a full scroll, so this is deliberately small.
+    _MAX_VERSION_FALLBACKS = 2
 
-        Images are injected after hydration and lazy-load on scroll, so the
-        reader has to be walked from top to bottom.  The chosen version
-        advertises its page count ("… · MD 147p"), which is used as ground
-        truth: a short result is retried once and then reported, because
-        silently returning a truncated chapter produces a CBZ that looks
-        complete and is not.
+    def _fallback_versions(self, chapter: Chapter) -> List[dict]:
+        """The chosen version first, then the other non-stub ones, best first.
+
+        Multi-version chapters are the normal case here (166 of "The Heaven's
+        List"'s 283 chapters have several).  When one uploader's reader will
+        not surrender all its pages, another group has usually posted the same
+        chapter intact — trying it is far cheaper than shipping a CBZ that is
+        missing two thirds of its pages.
         """
-        expected = int((getattr(chapter, '_md_version', None) or {}).get('pages') or 0)
+        chosen = getattr(chapter, '_md_version', None) or {}
+        versions = getattr(chapter, '_md_versions', None) or []
+        ordered = [chosen] if chosen.get('url') else []
+        if len(versions) <= 1:
+            return ordered or [{'url': chapter.url, 'group': '', 'pages': 0}]
 
-        self._init_driver()
-        driver = self.driver
+        # Same floor select_version() uses: a 1p entry beside a 73p one is a
+        # placeholder, and falling back to it would make things worse.
+        best_pages = max(int(v.get('pages') or 0) for v in versions)
+        floor = best_pages * self.PAGE_FLOOR_RATIO if best_pages else 0
+        others = [v for v in versions
+                  if v.get('url') != chosen.get('url')
+                  and int(v.get('pages') or 0) >= floor]
+        others.sort(key=self.version_score)
+        return ordered + others
 
+    def _pages_from_version(self, url: str, expected: int, number: str) -> List[str]:
+        """Walk one version's reader, retrying once if it comes up short."""
         best: List[str] = []
         for attempt in (1, 2):
             # Mirror _collect_page_images: the reader sets srcset, so an image
             # can be on screen with an empty src attribute.
             if not self._load_rendered(
-                chapter.url,
+                url,
                 f'return Array.from(document.images)'
                 f'.some(i => (i.currentSrc || i.src || "")'
                 f'.includes({json.dumps(self._PAGE_PREFIX)}));',
             ):
                 return best
 
-            pages = self._scroll_for_pages(driver, expected)
+            pages = self._scroll_for_pages(self.driver, expected)
             if len(pages) > len(best):
                 best = pages
 
@@ -6233,17 +6339,68 @@ class MangaDotScraper(BaseSiteScraper):
                 break
             if attempt == 1:
                 logger.warning(
-                    f"  Ch.{chapter.number}: got {len(pages)} of {expected} "
+                    f"  Ch.{number}: got {len(pages)} of {expected} "
                     f"advertised page(s), retrying"
                 )
+        return best
 
-        if expected and len(best) < expected:
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        """Collect page images from the reader.
+
+        Images are injected after hydration and lazy-load on scroll, so the
+        reader has to be walked from top to bottom.  Each version advertises
+        its page count ("… · MD 147p"), which is used as ground truth: a short
+        result is retried, then the chapter's *other* versions are tried,
+        because silently returning a truncated chapter produces a CBZ that
+        looks complete and is not.
+        """
+        self._init_driver()
+
+        candidates = self._fallback_versions(chapter)[:self._MAX_VERSION_FALLBACKS + 1]
+        best: List[str] = []
+        best_version = candidates[0]
+
+        for index, version in enumerate(candidates):
+            url = version.get('url') or chapter.url
+            expected = int(version.get('pages') or 0)
+
+            if index:
+                logger.info(
+                    f"  Ch.{chapter.number}: trying another version — "
+                    f"{version.get('group') or 'no group'} "
+                    f"({expected or '?'}p)"
+                )
+
+            pages = self._pages_from_version(url, expected, chapter.number)
+            if len(pages) > len(best):
+                best, best_version = pages, version
+
+            if expected and len(pages) >= expected:
+                break
+            if index + 1 < len(candidates):
+                logger.warning(
+                    f"  Ch.{chapter.number}: {version.get('group') or 'no group'} "
+                    f"gave {len(pages)} of {expected} page(s) — falling back to "
+                    f"another version"
+                )
+
+        expected_best = int(best_version.get('pages') or 0)
+        if expected_best and len(best) < expected_best:
             # Loud, because the alternative is a CBZ that is quietly missing
             # its ending.  Delete the file and re-run to try again.
             logger.error(
-                f"  Ch.{chapter.number}: INCOMPLETE — {len(best)} of {expected} "
-                f"page(s) after retry ({chapter.url})"
+                f"  Ch.{chapter.number}: INCOMPLETE — {len(best)} of "
+                f"{expected_best} page(s) after retry "
+                f"({best_version.get('url') or chapter.url})"
             )
+
+        # Record what actually produced the pages, not what was picked before
+        # the download started: the tracker keys off chapter.url and the
+        # version manifest reads _md_version, and both would otherwise claim
+        # a version whose images are not the ones in the CBZ.
+        if best_version.get('url'):
+            chapter._md_version = best_version
+            chapter.url = best_version['url']
 
         # Reader order follows the numeric filename (…/001.webp). Anything that
         # does not match sorts last rather than colliding at 0 and scrambling
@@ -7311,9 +7468,22 @@ Examples:
                             scraper._failed_cover_urls.add(series_for_meta.cover_url)
 
                 counts = {'new': 0, 'exists': 0, 'skip': 0, 'fail': 0}
+                consecutive_fails = 0
                 for chapter in chapters:
                     status = scraper.download_chapter(chapter, display_title, series_output_path, tracker, series_for_meta, existing_cbzs=existing_cbzs)
                     counts[status if status in counts else 'fail'] += 1
+
+                    # Once every chapter in a row is failing, the cause is the
+                    # series or the browser, not the chapter — and each attempt
+                    # can cost a full command timeout.  Give up on this series
+                    # rather than spending hours proving it.
+                    consecutive_fails = consecutive_fails + 1 if status == 'fail' else 0
+                    if consecutive_fails >= MAX_CONSECUTIVE_CHAPTER_FAILS:
+                        logger.error(
+                            f"  {consecutive_fails} chapters failed in a row — "
+                            f"abandoning {display_title!r} and moving on"
+                        )
+                        break
 
                 # Flush tracker to disk once per series instead of once per chapter.
                 # This turns O(N) disk writes per series into O(1).
