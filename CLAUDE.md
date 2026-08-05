@@ -82,6 +82,11 @@
 - Deleting a CBZ is enough to force a refetch: `download_chapter` only honours the tracker when the file is still on disk, and otherwise discards the tracker entry and re-downloads ("Re-downloading (file missing)"). `--tracker` on the repair script is optional tidiness, not a requirement
 - Default tolerance is 90% of the advertised count, because `_filter_outlier_images_by_dimension` legitimately removes a few promo images per chapter
 
+### Version fallback vs. speed — they interact
+- `get_pages` tries the chosen version, retries it once, then up to `_MAX_VERSION_FALLBACKS` other versions: **up to 6 page loads and 6 full scroll walks per chapter**. Whatever the per-walk cost is, this multiplies it
+- The accept/fall-back decision goes through `_enough_pages()`, tied to `_MIN_PAGE_RATIO` — the same threshold `download_chapter` refuses to write a CBZ below. Do NOT change it back to exact equality with the advertised count: the count routinely runs a page or two over what the reader yields (that is why the ratio exists), so equality made the fallback fire on healthy chapters and quietly multiplied every run
+- `Created:` lines carry `read Xs + fetch Ys`. If a run feels slow, read that split before touching anything — and if the suffix is missing, the container is running old code (`scripts/` is bind-mounted, but a run already in flight keeps the code it started with, and the Pi needs a `git pull` first)
+
 ### Multi-version chapters
 - Each version is its own anchor: `└ ○ upload {Group} · MD {N}p {date}` — group and page count parse straight out of it
 - DOM order is NOT quality order (Ch. 215 of manga/26041 lists a 4p version before a 5p one), so never just take the first anchor

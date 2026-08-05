@@ -6328,6 +6328,22 @@ class MangaDotScraper(BaseSiteScraper):
         others.sort(key=self.version_score)
         return ordered + others
 
+    def _enough_pages(self, count: int, expected: int) -> bool:
+        """Whether a version's result is worth accepting rather than retrying.
+
+        Tied to _MIN_PAGE_RATIO deliberately: that is the threshold at which
+        download_chapter refuses to write the CBZ, so anything above it is a
+        chapter that gets kept either way and there is nothing to win by
+        walking another reader.
+
+        Testing exact equality with the advertised count instead made the
+        retry-and-fall-back path fire on healthy chapters — the count runs a
+        page or two over what the reader yields often enough that
+        _MIN_PAGE_RATIO exists for that very reason — and each miss costs a
+        page load and a full scroll, up to six of each per chapter.
+        """
+        return not expected or count >= expected * self._MIN_PAGE_RATIO
+
     def _pages_from_version(self, url: str, expected: int, number: str) -> List[str]:
         """Walk one version's reader, retrying once if it comes up short."""
         best: List[str] = []
@@ -6346,7 +6362,7 @@ class MangaDotScraper(BaseSiteScraper):
             if len(pages) > len(best):
                 best = pages
 
-            if not expected or len(best) >= expected:
+            if self._enough_pages(len(best), expected):
                 break
             if attempt == 1:
                 logger.warning(
@@ -6386,7 +6402,7 @@ class MangaDotScraper(BaseSiteScraper):
             if len(pages) > len(best):
                 best, best_version = pages, version
 
-            if expected and len(pages) >= expected:
+            if self._enough_pages(len(pages), expected):
                 break
             if index + 1 < len(candidates):
                 logger.warning(
@@ -6396,13 +6412,20 @@ class MangaDotScraper(BaseSiteScraper):
                 )
 
         expected_best = int(best_version.get('pages') or 0)
-        if expected_best and len(best) < expected_best:
+        if not self._enough_pages(len(best), expected_best):
             # Loud, because the alternative is a CBZ that is quietly missing
             # its ending.  Delete the file and re-run to try again.
             logger.error(
                 f"  Ch.{chapter.number}: INCOMPLETE — {len(best)} of "
                 f"{expected_best} page(s) after retry "
                 f"({best_version.get('url') or chapter.url})"
+            )
+        elif expected_best and len(best) < expected_best:
+            # Short of the advertised count but comfortably above the ratio the
+            # CBZ is judged by — the usual case, not worth a line at INFO.
+            logger.debug(
+                f"  Ch.{chapter.number}: {len(best)} of {expected_best} "
+                f"advertised page(s), accepted"
             )
 
         # Record what actually produced the pages, not what was picked before
