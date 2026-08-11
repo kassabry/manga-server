@@ -1,5 +1,5 @@
 import JSZip from "jszip";
-import { readFile } from "fs/promises";
+import { readFile, stat } from "fs/promises";
 import { XMLParser } from "fast-xml-parser";
 import type { ComicInfo } from "./types";
 
@@ -8,13 +8,29 @@ const xmlParser = new XMLParser({
   trimValues: true,
 });
 
+// Identity of the bytes currently at a path, not just the path.  The scraper
+// rewrites a CBZ in place when a chapter is re-downloaded, and a cache keyed on
+// the path alone then serves entry names that no longer exist in the file.
+// That is not a stale-but-usable read: every zip.file(name) returns null, so
+// EVERY page 404s, and because these caches live for the life of the process a
+// reload never clears it. Seen after a MangaDot re-fetch replaced ManhuaTo's
+// .jpg pages with .webp ones under the same filename.
+async function fileStamp(cbzPath: string): Promise<string> {
+  const info = await stat(cbzPath);
+  return `${info.mtimeMs}:${info.size}`;
+}
+
 // LRU cache for loaded ZIP objects — avoids re-reading CBZ from disk on every page
 const ZIP_CACHE_MAX = 10;
-const zipCache = new Map<string, { zip: JSZip; lastAccess: number }>();
+const zipCache = new Map<
+  string,
+  { zip: JSZip; stamp: string; lastAccess: number }
+>();
 
-async function getZip(cbzPath: string): Promise<JSZip> {
+async function getZip(cbzPath: string, knownStamp?: string): Promise<JSZip> {
+  const stamp = knownStamp ?? (await fileStamp(cbzPath));
   const cached = zipCache.get(cbzPath);
-  if (cached) {
+  if (cached && cached.stamp === stamp) {
     cached.lastAccess = Date.now();
     return cached.zip;
   }
@@ -35,12 +51,12 @@ async function getZip(cbzPath: string): Promise<JSZip> {
     if (oldestKey) zipCache.delete(oldestKey);
   }
 
-  zipCache.set(cbzPath, { zip, lastAccess: Date.now() });
+  zipCache.set(cbzPath, { zip, stamp, lastAccess: Date.now() });
   return zip;
 }
 
 // Cache page lists separately (lightweight, can keep more)
-const pageListCache = new Map<string, string[]>();
+const pageListCache = new Map<string, { stamp: string; pages: string[] }>();
 
 export async function extractComicInfo(
   cbzPath: string
@@ -212,10 +228,11 @@ async function filterOutlierImages(
 }
 
 export async function getPageList(cbzPath: string): Promise<string[]> {
+  const stamp = await fileStamp(cbzPath);
   const cached = pageListCache.get(cbzPath);
-  if (cached) return cached;
+  if (cached && cached.stamp === stamp) return cached.pages;
 
-  const zip = await getZip(cbzPath);
+  const zip = await getZip(cbzPath, stamp);
 
   const imageExtensions = [".jpg", ".jpeg", ".png", ".webp", ".gif"];
   const pages: string[] = [];
@@ -237,7 +254,7 @@ export async function getPageList(cbzPath: string): Promise<string[]> {
   // Filter outlier images by dimension (removes promo covers from other series)
   const filtered = await filterOutlierImages(zip, pages);
 
-  pageListCache.set(cbzPath, filtered);
+  pageListCache.set(cbzPath, { stamp, pages: filtered });
   return filtered;
 }
 

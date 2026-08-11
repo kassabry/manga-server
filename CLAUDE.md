@@ -31,7 +31,9 @@
 - Files with "cover" in the name are excluded from the page list in `getPageList`
 - `filterOutlierImages` reads both width+height from raw headers (no external deps)
 - Webtoon detection: if a non-dominant group has avg aspect ratio ≥ 5:1 and the dominant group is ≤ 3:1, prefer the tall-strip group — promo covers from other series tend to be portrait images that outnumber the actual webtoon strips
-- Page list is LRU-cached per file path; invalidated on server restart
+- **Both caches are keyed on path + `mtimeMs:size`, not path alone.** The scraper rewrites a CBZ in place when a chapter is re-downloaded, and a path-only key then serves entry names that are not in the new file — `zip.file(name)` returns null for every one, so *every* page 404s, not just the extra ones. `zipCache` is capped at 10 and evicts, `pageListCache` was unbounded and never expired, so the stale list outlived the zip it came from and a reload never fixed it
+- Real case: a MangaDot re-fetch replaced ManhuaTo's `.jpg` pages with `.webp` under the same filename, and the reader listed 32 pages for a 9-page file with all of them broken
+- Any new cache in this file must carry the stamp too — a CBZ at a stable path is not immutable content
 
 ## Scraper Patterns (`scripts/manhwa_scraper.py`)
 - `--pages N` caps browse pages per category for Asura, ManhuaTo, Drake; caps scroll rounds for Flame
