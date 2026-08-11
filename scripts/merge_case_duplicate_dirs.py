@@ -43,6 +43,14 @@ import shutil
 import sys
 from typing import Dict, List, Optional, Tuple
 
+# Files this project writes alongside the chapters.  A directory holding only
+# these and no CBZ is a shell left behind by a title-casing change.
+ARTIFACTS = frozenset((
+    '.mangadot_versions.json', '.mangadot_meta.json',
+    'cover.webp', 'cover.jpg', 'cover.jpeg', 'cover.png',
+    'ComicInfo.xml', '.DS_Store', 'Thumbs.db',
+))
+
 CHAPTER_RE = re.compile(r'^(?P<title>.*) - Chapter (?P<num>[0-9]+(?:\.[0-9]+)?)\.cbz$',
                         re.IGNORECASE)
 
@@ -144,8 +152,7 @@ def merge_group(parent, names, apply_changes, prefer_larger, drop_conflicts):
             moved += 1
 
         # Sidecars: only carry across what the survivor does not already have.
-        for extra in ('.mangadot_versions.json', '.mangadot_meta.json',
-                      'cover.webp', 'cover.jpg', 'cover.png'):
+        for extra in ARTIFACTS:
             src = os.path.join(src_dir, extra)
             dst = os.path.join(keep_path, extra)
             if os.path.exists(src) and not os.path.exists(dst) and apply_changes:
@@ -153,6 +160,24 @@ def merge_group(parent, names, apply_changes, prefer_larger, drop_conflicts):
                     shutil.move(src, dst)
                 except OSError:
                     pass
+
+        # A directory left holding no chapters at all is a shell: the casing
+        # changed between runs and this spelling never received one.  Its cover
+        # and sidecars are not worth keeping on their own, so clear them out —
+        # but only ever the artifacts we know we wrote.
+        remaining = sorted(os.listdir(src_dir)) if os.path.isdir(src_dir) else []
+        if remaining and not cbz_files(src_dir):
+            leftovers = [n for n in remaining if n not in ARTIFACTS]
+            if leftovers:
+                print('     .  %s holds %d unrecognised file(s), left in place: %s'
+                      % (name, len(leftovers), ', '.join(leftovers[:3])))
+            elif apply_changes:
+                for n in remaining:
+                    try:
+                        os.remove(os.path.join(src_dir, n))
+                    except OSError:
+                        pass
+                remaining = sorted(os.listdir(src_dir))
 
         if apply_changes:
             remaining = os.listdir(src_dir) if os.path.isdir(src_dir) else []
@@ -182,6 +207,9 @@ def main():
     parser.add_argument('--prefer-larger', action='store_true',
                         help='On a filename clash keep whichever file is bigger '
                              '(default: keep the surviving directory\'s copy)')
+    parser.add_argument('--series',
+                        help='Only groups whose directory name contains this '
+                             'substring (case-insensitive)')
     parser.add_argument('--drop-conflicts', action='store_true',
                         help='Delete the losing copy on a clash instead of leaving '
                              'it in place. Only meaningful with --apply')
@@ -198,6 +226,9 @@ def main():
     print('%s\n' % ('=' * 70))
 
     groups = find_groups(args.library)
+    if args.series:
+        needle = args.series.lower()
+        groups = [(p, n) for p, n in groups if any(needle in x.lower() for x in n)]
     if not groups:
         print('No case-duplicate directories found.')
         return 0
