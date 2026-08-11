@@ -134,6 +134,7 @@
 - Resolution is cached in `.anilist_id_cache.json` beside the DB, written even when a run aborts, so a 1900-series run resumes instead of restarting. `--max-lookups` (default 250) bounds each run
 
 ## Maintenance Scripts
+- `scripts/merge_case_duplicate_dirs.py` — merges sibling series directories that differ only by letter case (the ext4 split described under Scraper Patterns). Keeps the directory with the most chapters, renames incoming files onto its spelling, reports clashes rather than overwriting. Dry-run by default; `--apply`, plus `--prefer-larger` / `--drop-conflicts`. Only groups within the same parent — a series appearing under both `Manhua/` and `Manhwa/` is a *different* problem and is deliberately left alone
 - `scripts/fix_flame_chapters.py` — fixes wrong chapter numbers in already-downloaded Flame CBZs by sorting numerically and renumbering 1, 2, 3… Dry-run by default; use `--apply [--db path/to/mangashelf.db]`
 - Run after any FlameComics re-scrape where chapter numbers look wrong (e.g. Ch.14 instead of Ch.1)
 
