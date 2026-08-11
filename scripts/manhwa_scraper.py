@@ -5267,6 +5267,11 @@ class MangaDotScraper(BaseSiteScraper):
     # is treated as a stub upload (e.g. a 1p or 6p entry beside a 73p one).
     PAGE_FLOOR_RATIO = 0.5
 
+    # Hard placeholder floor for --version-pick first, as a fraction of the
+    # best sibling.  Uploaders differ in how finely they slice a chapter — up
+    # to about 6x — so nothing real lands this far below the best.
+    _STUB_ABSOLUTE_RATIO = 0.1
+
     # Preferred scanlation groups, best first.  Unlisted groups sort after
     # these; "No Group" sorts last.  Override with --prefer-groups.
     DEFAULT_PREFER_GROUPS: List[str] = []
@@ -5620,6 +5625,11 @@ class MangaDotScraper(BaseSiteScraper):
     # so wait this many seconds before spending a FlareSolverr round-trip.
     _CF_SELF_SOLVE_WAIT = 12
 
+    # Ceiling for an injected script.  The default (30s) is tight for the
+    # chapter-list read on a 500-chapter series running on a Pi, and the
+    # failure mode is a script timeout that reads as "0 chapters".
+    _SCRIPT_TIMEOUT = 90
+
     def _driver_challenged(self) -> bool:
         """True when the browser is sitting on a Cloudflare interstitial."""
         try:
@@ -5820,12 +5830,35 @@ class MangaDotScraper(BaseSiteScraper):
     def get_chapters(self, series: Series) -> List[Chapter]:
         """Expand the lazy chapter list and collect every chapter link.
 
+        Retries once on a fresh browser, because a chromedriver that stops
+        answering produces an empty list that is indistinguishable from a
+        series with nothing posted — the run then reports "Found 0 chapters"
+        and "nothing to do" and moves on, skipping the series entirely.
+        """
+        for attempt in (1, 2):
+            chapters, browser_failed = self._chapters_once(series)
+            if not browser_failed:
+                return chapters
+            if attempt == 1 and self._restart_driver():
+                logger.warning(
+                    f"MangaDot: retrying {series.title!r} on a fresh browser")
+                continue
+            logger.error(
+                f"MangaDot: could not read the chapter list for {series.title!r} "
+                f"— skipping this run. This is a browser failure, not an empty "
+                f"series; the chapters are still there"
+            )
+            return []
+        return []
+
+    def _chapters_once(self, series: Series) -> tuple:
+        """One attempt at the chapter list. Returns (chapters, browser_failed).
+
         The list renders ~9 rows and hides the rest behind a
         "SHOW N MORE CHAPTERS" button, so it must be clicked before the
         links exist in the DOM.
         """
         self._init_driver()
-        driver = self.driver
 
         # Wait for hydration before touching the expander.  The server-rendered
         # page already contains one chapter anchor ("Start Reading") and an
@@ -5836,7 +5869,19 @@ class MangaDotScraper(BaseSiteScraper):
             series.url,
             'return document.querySelectorAll(\'a[href*="/chapter/"]\').length > 3;',
         ):
-            return []
+            # _load_rendered has already said why, and a rebuilt browser will
+            # not clear a Cloudflare interstitial, so this is not a retry case.
+            return [], False
+
+        # Re-read the driver: _load_rendered rebuilds it when the browser hangs,
+        # and a reference captured before that call points at the dead session.
+        # That is what turned a successful restart into a run of "connection
+        # refused" on the old port and a silent "Found 0 chapters".
+        driver = self.driver
+        try:
+            driver.set_script_timeout(self._SCRIPT_TIMEOUT)
+        except Exception:
+            pass
 
         # Click through the expander until no more rows are hidden.  Note that
         # chapters with several scanlation groups render as "N VERSIONS"
@@ -5863,39 +5908,49 @@ class MangaDotScraper(BaseSiteScraper):
         # carry "Ch. N" in their own text, so walk up a few levels to find it.
         try:
             raw = driver.execute_script("""
+                // Walk up only until "Ch. N" is found, and stop.  Reading
+                // innerText from all four ancestors of every anchor forces a
+                // layout pass each time, and the outer two ARE the whole
+                // chapter list — on a long series that is hundreds of full
+                // reflows over a huge subtree, which is what times the script
+                // out. Most anchors match at level 0 or 1 and never touch it.
+                const CH = /Ch\\.\\s*[\\d.]+/;
                 return Array.from(document.querySelectorAll('a[href*="/chapter/"]'))
                     .map(a => {
-                        const texts = [];
-                        let el = a;
-                        for (let i = 0; i < 4 && el; i++) {
-                            texts.push((el.innerText || '').replace(/\\s+/g, ' ').trim());
+                        const own = (a.innerText || '').replace(/\\s+/g, ' ').trim();
+                        let matched = CH.test(own) ? own : '';
+                        let el = a.parentElement;
+                        for (let i = 0; i < 3 && el && !matched; i++) {
+                            const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                            if (CH.test(t)) matched = t;
                             el = el.parentElement;
                         }
-                        return [a.getAttribute('href'), texts];
+                        return [a.getAttribute('href'), own, matched];
                     });
             """) or []
         except Exception as e:
             logger.warning(f"MangaDot: could not read chapter list: {e}")
-            return []
+            # A script timeout leaves the browser alive but useless for this
+            # series, and a hung one is worse; either way the caller should
+            # rebuild and try again rather than record an empty series.
+            return [], True
 
         # A chapter posted by several groups contributes one anchor per
         # version, so collect them all and choose afterwards rather than
         # taking whichever happens to come first in the DOM.
         versions_by_number: Dict[str, List[dict]] = {}
         titles_by_number: Dict[str, str] = {}
-        for href, texts in raw:
+        for href, own, matched in raw:
             if not href or '/chapter/' not in href:
                 continue
             # "Start Reading" is a duplicate link to the first chapter.
-            if texts and texts[0].strip().lower() == 'start reading':
+            if own.strip().lower() == 'start reading':
                 continue
-            match = None
-            text = texts[0] if texts else ''
-            for candidate in texts:
-                match = re.search(r'Ch\.\s*([\d.]+)', candidate)
-                if match:
-                    text = candidate
-                    break
+            # `matched` is whichever element carried "Ch. N" — the anchor
+            # itself for a single-version chapter, an ancestor row for a
+            # multi-version group.
+            text = matched or own
+            match = re.search(r'Ch\.\s*([\d.]+)', text)
             if not match:
                 continue
             number = match.group(1).rstrip('.')
@@ -5908,8 +5963,7 @@ class MangaDotScraper(BaseSiteScraper):
 
             full_url = href if href.startswith('http') else self.BASE_URL + href
             # The anchor's own text describes this specific version; the
-            # ancestor text (used for the number) covers the whole group.
-            own = texts[0] if texts else ''
+            # matched text (used for the number) may cover the whole group.
             version = {
                 'url': full_url,
                 'group': self._parse_group(own),
@@ -5948,7 +6002,10 @@ class MangaDotScraper(BaseSiteScraper):
             f"MangaDot: {len(chapters)} chapter(s) for {series.title!r} "
             f"({multi} with multiple versions)"
         )
-        return chapters
+        # An expanded list that yields nothing parseable means the page was
+        # there but unreadable — worth one attempt on a fresh browser rather
+        # than recording the series as empty.
+        return chapters, (not chapters and bool(raw))
 
     # -- version selection -------------------------------------------------
 
@@ -6082,11 +6139,21 @@ class MangaDotScraper(BaseSiteScraper):
 
         counts = sorted(int(v.get('pages') or 0) for v in versions)
         if self.version_pick == 'first':
-            reference = counts[len(counts) // 2]      # median
+            # Lower middle, not counts[len//2]: on an even-length list the
+            # upper middle of two versions IS the maximum, which put the floor
+            # right back on the outlier for every two-version chapter — the
+            # most common shape there is.
+            reference = counts[(len(counts) - 1) // 2]
+            # A median floor alone cannot catch a placeholder in a two-version
+            # chapter: the median of [1, 80] is 1.  Nothing legitimate sits
+            # near a tenth of its best sibling — the finest slicing seen is
+            # about 6x, not 80x — so this only ever removes placeholders.
+            floor = max(reference * self.PAGE_FLOOR_RATIO,
+                        counts[-1] * self._STUB_ABSOLUTE_RATIO)
         else:
             reference = counts[-1]                    # max
-        if reference > 0:
             floor = reference * self.PAGE_FLOOR_RATIO
+        if counts[-1] > 0:
             viable = [v for v in versions if int(v.get('pages') or 0) >= floor]
         else:
             viable = []
