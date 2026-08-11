@@ -36,6 +36,8 @@
 - Any new cache in this file must carry the stamp too — a CBZ at a stable path is not immutable content
 
 ## Scraper Patterns (`scripts/manhwa_scraper.py`)
+- **Every series directory must go through `_series_dir_for()`, never `output_dir / safe_title`.** The library is on ext4 (case-sensitive) but every title match here is case-insensitive, so a merge that takes its display title from one source's spelling writes to a *second* folder differing only in case. Real case: `[Manhuato] Evolution Begins with a Big Tree` (502 cbz) and `[Manhuato] Evolution Begins With a Big Tree` (427 cbz) side by side. The scanner merges them back by slug, so every chapter shows twice in the reader, and the new folder re-downloads the whole back catalogue because `_scan_series_dir` looked at the empty one
+- Note this cannot be reproduced on a Windows dev box — NTFS is case-insensitive, so `target.exists()` short-circuits and the bug is invisible. Test the fallback branch directly
 - `--pages N` caps browse pages per category for Asura, ManhuaTo, Drake; caps scroll rounds for Flame
 - `BaseSiteScraper.__init__` params: `headless`, `limit` (series count cap), `max_pages` (page cap)
 - `get_scraper(site, headless, canvas, limit, max_pages)` — always pass all relevant params

@@ -1473,6 +1473,34 @@ class BaseSiteScraper:
         if removed:
             logger.info(f"Removed {removed} outlier image(s) by dimension")
 
+    @staticmethod
+    def _series_dir_for(output_dir: Path, safe_title: str) -> Path:
+        """The directory for a series, matched case-insensitively if it exists.
+
+        The library lives on ext4, which is case-sensitive, but every title
+        match in this codebase is not.  A merge takes its display title from
+        whichever spelling one source used, so "Evolution Begins with a Big
+        Tree" and "Evolution Begins With a Big Tree" resolve to the same series
+        and then write to two different directories.  The scanner merges those
+        back into one series by slug, so every chapter appears twice in the
+        reader and the second folder re-downloads the whole back catalogue
+        because it scanned the wrong one.
+
+        Returns the existing directory when one matches ignoring case, and the
+        literal path when nothing is there yet.
+        """
+        target = output_dir / safe_title
+        if target.exists():
+            return target
+        lowered = safe_title.lower()
+        try:
+            for entry in output_dir.iterdir():
+                if entry.is_dir() and entry.name.lower() == lowered:
+                    return entry
+        except (FileNotFoundError, PermissionError):
+            pass
+        return target
+
     def _scan_series_dir(self, series_title: str, output_dir: Path) -> set:
         """Return the set of CBZ filenames already present in the series directory.
 
@@ -1482,7 +1510,7 @@ class BaseSiteScraper:
         take hundreds of milliseconds.
         """
         safe_title = self._sanitize_filename(series_title)
-        series_dir = output_dir / safe_title
+        series_dir = self._series_dir_for(output_dir, safe_title)
         try:
             return {f.name for f in series_dir.iterdir() if f.suffix == '.cbz'}
         except (FileNotFoundError, PermissionError):
@@ -1502,7 +1530,10 @@ class BaseSiteScraper:
         safe_title = self._sanitize_filename(series_title)
         safe_chapter = self._sanitize_filename(chapter.number)
 
-        series_dir = output_dir / safe_title
+        # Write into the directory that is already there, whatever its casing —
+        # see _series_dir_for.  Must agree with _scan_series_dir, or the
+        # existence check reads one folder and the download writes another.
+        series_dir = self._series_dir_for(output_dir, safe_title)
         # Guard against path traversal: series_dir must stay inside output_dir
         try:
             series_dir.resolve().relative_to(output_dir.resolve())
@@ -7656,7 +7687,8 @@ Examples:
                         alias_index.register(
                             series.title,
                             getattr(series, '_md_alt_titles', []),
-                            output_path / scraper._sanitize_filename(display_title),
+                            scraper._series_dir_for(
+                                output_path, scraper._sanitize_filename(display_title)),
                         )
 
                 # Scan the series directory once so per-chapter checks are O(1)
@@ -7669,7 +7701,8 @@ Examples:
                 version_manifest = {}
                 md_series_dir = None
                 if isinstance(scraper, MangaDotScraper):
-                    md_series_dir = series_output_path / scraper._sanitize_filename(display_title)
+                    md_series_dir = scraper._series_dir_for(
+                        series_output_path, scraper._sanitize_filename(display_title))
                     version_manifest = scraper.load_version_manifest(md_series_dir)
                     for chapter in chapters:
                         if upgrades_done >= upgrade_budget:
