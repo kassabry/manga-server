@@ -87,6 +87,14 @@
 - The accept/fall-back decision goes through `_enough_pages()`, tied to `_MIN_PAGE_RATIO` — the same threshold `download_chapter` refuses to write a CBZ below. Do NOT change it back to exact equality with the advertised count: the count routinely runs a page or two over what the reader yields (that is why the ratio exists), so equality made the fallback fire on healthy chapters and quietly multiplied every run
 - `Created:` lines carry `read Xs + fetch Ys`. If a run feels slow, read that split before touching anything — and if the suffix is missing, the container is running old code (`scripts/` is bind-mounted, but a run already in flight keeps the code it started with, and the Pi needs a `git pull` first)
 
+### Version choice (`--version-pick`, default `first`)
+- **`first` is the default**: pick the earliest upload, ignoring group order and page count. Page count ranks badly here — on manga 20828 ("The Divine Ring Descends") WebToon posts 136-171p against five siblings in the 6-31p range, so a max-based floor leaves WebToon as the only survivor on nearly every chapter and page count decides everything by default
+- Versions carry `uploaded` (age in days, larger = older, via `_parse_upload_age`) and `order` (DOM position, the tiebreak for same-day uploads — the site shows no clock time once an upload is a day old). Undated versions sort after every dated one so they cannot win by accident
+- The site mixes date formats in one list: relative (`3d`, `8h`, `2mo`, `1y`) for recent uploads, absolute with **no year** (`Jun 11`, `Mar 24`) for older ones. A bare month/day is read as its most recent past occurrence
+- The stub floor still applies in `first` mode, but off the **median** page count, not the max — it must exclude 1p placeholders without letting one finely-sliced outlier eliminate everyone else. `quality` mode keeps the max-based floor
+- `is_upgrade()` always returns False in `first` mode: the earliest upload of a chapter cannot change, so there is nothing to upgrade to and re-picking would only churn
+- **Deleting a truncated CBZ and re-running does nothing on its own.** Selection is deterministic — same versions in, same version out, same broken result. Repairing a bad chapter needs the *selection* to change (switch `--version-pick`, or pass `--prefer-groups`), not just the file to be removed
+
 ### Multi-version chapters
 - Each version is its own anchor: `└ ○ upload {Group} · MD {N}p {date}` — group and page count parse straight out of it
 - DOM order is NOT quality order (Ch. 215 of manga/26041 lists a 4p version before a 5p one), so never just take the first anchor

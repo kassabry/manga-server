@@ -5284,8 +5284,12 @@ class MangaDotScraper(BaseSiteScraper):
     def __init__(self, headless: bool = True, limit: int = None, max_pages: int = None,
                  origins: List[str] = None, required_tags: List[str] = None,
                  min_chapters: int = None, prefer_groups: List[str] = None,
-                 tag_mode: str = 'any'):
+                 tag_mode: str = 'any', version_pick: str = 'first'):
         super().__init__(headless=headless, limit=limit, max_pages=max_pages)
+        self.version_pick = (version_pick or 'first').strip().lower()
+        if self.version_pick not in ('first', 'quality'):
+            raise ValueError(
+                f"version_pick must be 'first' or 'quality', got {version_pick!r}")
         self.prefer_groups = list(prefer_groups if prefer_groups is not None
                                   else self.DEFAULT_PREFER_GROUPS)
         self.origins = [o.upper() for o in (origins or list(self.ORIGIN_FOLDER))]
@@ -5910,6 +5914,11 @@ class MangaDotScraper(BaseSiteScraper):
                 'url': full_url,
                 'group': self._parse_group(own),
                 'pages': self._parse_page_count(own),
+                # Upload date, and the DOM position as a stable tiebreak for
+                # versions posted on the same day (the site shows no clock
+                # time once an upload is more than a day or so old).
+                'uploaded': self._parse_upload_age(own),
+                'order': len(versions_by_number.get(number, [])),
             }
             if not any(v['url'] == full_url for v in versions_by_number.setdefault(number, [])):
                 versions_by_number[number].append(version)
@@ -5955,6 +5964,56 @@ class MangaDotScraper(BaseSiteScraper):
         match = re.search(r'\b(\d+)\s*p\b', text or '')
         return int(match.group(1)) if match else 0
 
+    # Relative-age suffixes the site uses, in days.  "mo" must be tested before
+    # "m" or "3mo" parses as 3 minutes.
+    _AGE_UNITS = (('mo', 30.0), ('y', 365.0), ('w', 7.0),
+                  ('d', 1.0), ('h', 1 / 24.0), ('m', 1 / 1440.0), ('s', 0.0))
+
+    _MONTHS = {m: i for i, m in enumerate(
+        ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+         'jul', 'aug', 'sep', 'oct', 'nov', 'dec'], start=1)}
+
+    @classmethod
+    def _parse_upload_age(cls, text: str) -> Optional[float]:
+        """Age of an upload in days, larger being older. None if unreadable.
+
+        The site mixes two formats in the same list: recent uploads are
+        relative ("3d", "8h") and older ones are absolute with no year
+        ("Jun 11", "Mar 24").  A bare month/day is read as its most recent
+        occurrence, since a chapter cannot have been posted in the future.
+        """
+        tail = (text or '').strip()
+
+        match = re.search(r'(\d+)\s*(mo|[ywdhms])\s*$', tail, re.I)
+        if match:
+            amount = int(match.group(1))
+            unit = match.group(2).lower()
+            for suffix, days in cls._AGE_UNITS:
+                if unit == suffix:
+                    return amount * days
+
+        match = re.search(r'([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:,\s*(\d{4}))?\s*$', tail)
+        if match:
+            month = cls._MONTHS.get(match.group(1).lower())
+            if not month:
+                return None
+            day = int(match.group(2))
+            today = datetime.now().date()
+            year = int(match.group(3)) if match.group(3) else today.year
+            try:
+                posted = datetime(year, month, day).date()
+            except ValueError:
+                return None
+            if not match.group(3) and posted > today:
+                # No year given and it lands in the future — it was last year.
+                try:
+                    posted = datetime(year - 1, month, day).date()
+                except ValueError:
+                    return None
+            return float((today - posted).days)
+
+        return None
+
     @staticmethod
     def _clean_chapter_title(text: str, number: str) -> str:
         """Strip the leading "Ch. N" and any trailing version/uploader noise."""
@@ -5980,27 +6039,54 @@ class MangaDotScraper(BaseSiteScraper):
         return len(self.prefer_groups)
 
     def version_score(self, version: dict) -> tuple:
-        """Sort key for a version — lower is better."""
+        """Sort key for a version — lower is better.
+
+        In 'first' mode the only thing that matters is which upload came
+        first, so page count and group ranking are left out entirely: they are
+        the heuristics that mode exists to bypass.  Oldest sorts first, and a
+        version whose date could not be read sorts after every dated one
+        rather than winning by accident.
+        """
+        if self.version_pick == 'first':
+            age = version.get('uploaded')
+            if age is None:
+                return (1, 0.0, version.get('order', 0))
+            return (0, -float(age), version.get('order', 0))
         return (self._group_rank(version.get('group', '')),
                 -int(version.get('pages') or 0))
 
     def select_version(self, versions: List[dict]) -> dict:
         """Pick the best version of a chapter.
 
-        Page count is only a rough quality signal — a long-strip chapter cut
-        into 6 tall images can equal one cut into 147 short ones — so it is
-        used as a floor rather than a ranking: versions far below the best
-        sibling are dropped as stubs (a 1p upload next to a 73p one), and the
-        preferred-group order decides among what remains.
+        In 'quality' mode, page count is only a rough signal — a long-strip
+        chapter cut into 6 tall images can equal one cut into 147 short ones —
+        so it is used as a floor rather than a ranking: versions far below the
+        best sibling are dropped as stubs (a 1p upload next to a 73p one), and
+        the preferred-group order decides among what remains.
+
+        In 'first' mode the ranking is purely chronological — no group order,
+        no preferring more pages.  A stub floor still applies, because it
+        excludes rather than ranks: without it a 1p placeholder posted before
+        the real upload would win outright and produce a one-page CBZ.  But it
+        is taken off the *median* page count, not the maximum.  One uploader
+        slicing a chapter far finer than everyone else (136p against five
+        siblings in the 6-23p range, seen on manga 20828) drags a max-based
+        floor above every other version and leaves that outlier as the only
+        survivor — which is the ranking-by-page-count behaviour this mode
+        exists to avoid.
         """
         if not versions:
             return {}
         if len(versions) == 1:
             return versions[0]
 
-        best_pages = max(int(v.get('pages') or 0) for v in versions)
-        if best_pages > 0:
-            floor = best_pages * self.PAGE_FLOOR_RATIO
+        counts = sorted(int(v.get('pages') or 0) for v in versions)
+        if self.version_pick == 'first':
+            reference = counts[len(counts) // 2]      # median
+        else:
+            reference = counts[-1]                    # max
+        if reference > 0:
+            floor = reference * self.PAGE_FLOOR_RATIO
             viable = [v for v in versions if int(v.get('pages') or 0) >= floor]
         else:
             viable = []
@@ -6043,6 +6129,10 @@ class MangaDotScraper(BaseSiteScraper):
         tracking, and re-downloading the whole back catalogue on the first
         run after this change is exactly the stampede we want to avoid.
         """
+        if self.version_pick == 'first':
+            # The first upload of a chapter cannot change, so there is never a
+            # better one to move to.  Re-picking here would only churn.
+            return False
         recorded = manifest.get(str(chapter.number))
         if not recorded:
             return False
@@ -6576,7 +6666,8 @@ PRIMARY_SITES = {
 def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: int = None,
                 max_pages: int = None, origins: List[str] = None,
                 required_tags: List[str] = None, min_chapters: int = None,
-                prefer_groups: List[str] = None, tag_mode: str = 'any') -> BaseSiteScraper:
+                prefer_groups: List[str] = None, tag_mode: str = 'any',
+                version_pick: str = 'first') -> BaseSiteScraper:
     """Get scraper instance by site name"""
     site_lower = site.lower()
 
@@ -6590,7 +6681,7 @@ def get_scraper(site: str, headless: bool = True, canvas: bool = False, limit: i
                 return scraper_class(headless=headless, limit=limit, max_pages=max_pages,
                                      origins=origins, required_tags=required_tags,
                                      min_chapters=min_chapters, prefer_groups=prefer_groups,
-                                     tag_mode=tag_mode)
+                                     tag_mode=tag_mode, version_pick=version_pick)
             return scraper_class(headless=headless, limit=limit, max_pages=max_pages)
     
     raise ValueError(f"Unknown site: {site}. Available: {list(SCRAPERS.keys())}")
@@ -6939,7 +7030,12 @@ Examples:
     parser.add_argument('--merge-csv', help='For MangaDot: write near-duplicate merge candidates to this CSV for review (default: <output>/mangadot_merge_candidates.csv)')
     parser.add_argument('--merge-threshold', type=int, default=88, help='For MangaDot: similarity %% (0-100) above which a near-match is flagged for review (default: 88)')
     parser.add_argument('--no-alias-merge', action='store_true', help='For MangaDot: disable alt-title ("Other Names") matching against existing series')
-    parser.add_argument('--prefer-groups', help='For MangaDot: comma-separated scanlation groups, best first, used to pick between multiple versions of a chapter (optional — omit to just drop stubs and prefer more pages)')
+    parser.add_argument('--version-pick', choices=['first', 'quality'], default='first',
+                        help="For MangaDot: how to choose between multiple versions of a chapter. "
+                             "'first' (default) takes the earliest upload and ignores page counts "
+                             "and --prefer-groups entirely; 'quality' drops stubs below "
+                             "PAGE_FLOOR_RATIO and then ranks by --prefer-groups and page count")
+    parser.add_argument('--prefer-groups', help='For MangaDot: comma-separated scanlation groups, best first, used to pick between multiple versions of a chapter (only used by --version-pick quality)')
     parser.add_argument('--tag-mode', choices=['any', 'all'], default='any', help='For MangaDot: keep a series if it has ANY of --tags (default) or requires ALL of them')
     parser.add_argument('--report-groups', action='store_true', help='For MangaDot: survey which scanlation groups post the best versions and write a CSV to --output, to build a --prefer-groups list')
     parser.add_argument('--max-upgrades', type=int, default=25, help='For MangaDot: max chapters per run to re-download because a better version appeared (default: 25, 0 disables)')
@@ -7137,7 +7233,8 @@ Examples:
                               origins=md_origins, required_tags=md_tags,
                               min_chapters=args.min_chapters or None,
                               prefer_groups=md_groups,
-                              tag_mode=getattr(args, 'tag_mode', 'any'))
+                              tag_mode=getattr(args, 'tag_mode', 'any'),
+                              version_pick=getattr(args, 'version_pick', 'first'))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
@@ -7296,7 +7393,8 @@ Examples:
                               origins=md_origins, required_tags=md_tags,
                               min_chapters=args.min_chapters or None,
                               prefer_groups=md_groups,
-                              tag_mode=getattr(args, 'tag_mode', 'any'))
+                              tag_mode=getattr(args, 'tag_mode', 'any'),
+                              version_pick=getattr(args, 'version_pick', 'first'))
         filter_terms = [t.strip() for t in args.filter.split(',')] if args.filter else None
         sort_order = getattr(args, 'sort', None)
         genre_filter = getattr(args, 'genre', None)
