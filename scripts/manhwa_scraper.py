@@ -5267,10 +5267,16 @@ class MangaDotScraper(BaseSiteScraper):
     # is treated as a stub upload (e.g. a 1p or 6p entry beside a 73p one).
     PAGE_FLOOR_RATIO = 0.5
 
-    # Hard placeholder floor for --version-pick first, as a fraction of the
-    # best sibling.  Uploaders differ in how finely they slice a chapter — up
-    # to about 6x — so nothing real lands this far below the best.
-    _STUB_ABSOLUTE_RATIO = 0.1
+    # A version advertising fewer pages than this, next to siblings that have
+    # at least this many, is a placeholder rather than a thinner slicing.
+    # This is an absolute count on purpose: any floor expressed as a fraction
+    # of the best sibling breaks on this site, because one group routinely
+    # posts a chapter cut into 100+ slices next to another group's 9.  A 10%
+    # floor threw out Thunderscans' legitimate 10-page chapter (8.8% of Tapas'
+    # 102) and, since the maximum moves chapter to chapter, it kept switching
+    # which group survived — which is what stitched a series together out of
+    # several groups' incompatible numbering.
+    _PLACEHOLDER_PAGES = 3
 
     # Preferred scanlation groups, best first.  Unlisted groups sort after
     # these; "No Group" sorts last.  Override with --prefer-groups.
@@ -5311,6 +5317,8 @@ class MangaDotScraper(BaseSiteScraper):
         # stays on for the rest of the run rather than eating a 403 per call.
         self._md_via_solver = False
         self._md_solver_announced = False
+        # Set per series by get_chapters; empty means "no series-wide group".
+        self._series_group = ''
 
     # -- HTTP --------------------------------------------------------------
 
@@ -5980,6 +5988,21 @@ class MangaDotScraper(BaseSiteScraper):
             if number not in titles_by_number:
                 titles_by_number[number] = self._clean_chapter_title(text, number)
 
+        # Decided once per series, before any chapter is picked, so the whole
+        # run stays on one group's numbering.
+        self._series_group = ''
+        if self.version_pick == 'first':
+            self._series_group = self._dominant_group(versions_by_number)
+            if self._series_group:
+                covered = sum(1 for versions in versions_by_number.values()
+                              if any(v.get('group', '').strip() == self._series_group
+                                     for v in versions))
+                logger.info(
+                    f"MangaDot: using {self._series_group!r} for "
+                    f"{covered}/{len(versions_by_number)} chapter(s) of "
+                    f"{series.title!r}"
+                )
+
         chapters = []
         multi = 0
         for number, versions in versions_by_number.items():
@@ -6095,6 +6118,38 @@ class MangaDotScraper(BaseSiteScraper):
                 return i
         return len(self.prefer_groups)
 
+    def _dominant_group(self, versions_by_number: Dict[str, List[dict]]) -> str:
+        """The group that covers the most chapters of this series.
+
+        Picking a version per chapter in isolation quietly assembles a series
+        out of several groups, and groups do not share a numbering scheme —
+        one counts a prologue as chapter 0, another splits a chapter in two,
+        and from there their numbering is offset from each other's for good.
+        Switching group mid-series at such a seam writes the same content
+        under two chapter numbers and drops the one in between.
+
+        So the group is chosen once for the whole series and used wherever it
+        has a chapter.  Widest coverage wins; ties go to whoever started
+        posting first, which matches what --version-pick first asks for.
+        """
+        coverage: Dict[str, set] = {}
+        oldest: Dict[str, float] = {}
+        for number, versions in versions_by_number.items():
+            for version in versions:
+                group = (version.get('group') or '').strip()
+                if not group or re.fullmatch(r'\(?no[\s_-]?group\)?', group.lower()):
+                    continue
+                coverage.setdefault(group, set()).add(number)
+                age = version.get('uploaded')
+                if age is not None:
+                    oldest[group] = max(oldest.get(group, 0.0), float(age))
+        if not coverage:
+            return ''
+        return sorted(
+            coverage,
+            key=lambda g: (-len(coverage[g]), -oldest.get(g, 0.0), g),
+        )[0]
+
     def version_score(self, version: dict) -> tuple:
         """Sort key for a version — lower is better.
 
@@ -6102,13 +6157,17 @@ class MangaDotScraper(BaseSiteScraper):
         first, so page count and group ranking are left out entirely: they are
         the heuristics that mode exists to bypass.  Oldest sorts first, and a
         version whose date could not be read sorts after every dated one
-        rather than winning by accident.
+        rather than winning by accident.  The one thing that outranks age is
+        the series' own group — see _dominant_group.
         """
         if self.version_pick == 'first':
+            series_group = getattr(self, '_series_group', '')
+            same_group = 0 if (series_group and
+                               version.get('group', '').strip() == series_group) else 1
             age = version.get('uploaded')
             if age is None:
-                return (1, 0.0, version.get('order', 0))
-            return (0, -float(age), version.get('order', 0))
+                return (same_group, 1, 0.0, version.get('order', 0))
+            return (same_group, 0, -float(age), version.get('order', 0))
         return (self._group_rank(version.get('group', '')),
                 -int(version.get('pages') or 0))
 
@@ -6145,11 +6204,11 @@ class MangaDotScraper(BaseSiteScraper):
             # most common shape there is.
             reference = counts[(len(counts) - 1) // 2]
             # A median floor alone cannot catch a placeholder in a two-version
-            # chapter: the median of [1, 80] is 1.  Nothing legitimate sits
-            # near a tenth of its best sibling — the finest slicing seen is
-            # about 6x, not 80x — so this only ever removes placeholders.
-            floor = max(reference * self.PAGE_FLOOR_RATIO,
-                        counts[-1] * self._STUB_ABSOLUTE_RATIO)
+            # chapter: the median of [1, 80] is 1.  Hence the absolute cutoff,
+            # which does not move with the maximum.
+            floor = reference * self.PAGE_FLOOR_RATIO
+            if counts[-1] >= self._PLACEHOLDER_PAGES:
+                floor = max(floor, float(self._PLACEHOLDER_PAGES))
         else:
             reference = counts[-1]                    # max
             floor = reference * self.PAGE_FLOOR_RATIO
