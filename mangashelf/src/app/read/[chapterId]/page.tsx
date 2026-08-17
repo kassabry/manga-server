@@ -97,6 +97,13 @@ function getFilteredChapters(
     }, []);
 }
 
+// Long-strip "pull up to go back" tuning. Reaching the top of a chapter no longer
+// navigates on its own — the reader has to keep pulling up once already pinned at
+// the top, which keeps a lingering scroll (or a resumed session that left off at
+// the very top) from silently jumping to the previous chapter.
+const PREV_PULL_THRESHOLD = 320; // px of upward intent accumulated while pinned at top
+const PREV_PULL_IDLE_MS = 700; // pause that discards accumulated intent
+
 function getEffectivePrev(
   chapter: ChapterData,
   selectedSource: string | null
@@ -161,6 +168,9 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
   // Longstrip initial-scroll guard: only scroll to initialPage once per chapter load
   const scrolledToInitialRef = useRef(false);
+
+  // Long-strip pull-up-to-go-back progress (0..1), drives the top sentinel's fill bar
+  const [prevPullProgress, setPrevPullProgress] = useState(0);
 
   // EPUB / longstrip bottom sentinel ref — fires chapter completion when scrolled into view
   const bottomCompleteRef = useRef<HTMLDivElement>(null);
@@ -508,29 +518,16 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     return () => observer.disconnect();
   }, [chapter, settings.layout]);
 
-  // Longstrip scroll-based chapter traversal (with nav guard)
+  // Longstrip scroll-based forward traversal (with nav guard).
+  // Backward traversal is deliberately NOT here — see the pull-up effect below.
   useEffect(() => {
     if (!chapter || settings.layout !== "longstrip" || !containerRef.current) return;
 
-    const topSentinel = containerRef.current.querySelector("[data-sentinel='prev']");
     const bottomSentinel = containerRef.current.querySelector("[data-sentinel='next']");
 
     const observers: IntersectionObserver[] = [];
 
-    const effPrev = getEffectivePrev(chapter, selectedSource);
     const effNext = getEffectiveNext(chapter, selectedSource);
-
-    if (topSentinel && effPrev) {
-      const prevId = effPrev.id;
-      const obs = new IntersectionObserver(([entry]) => {
-        if (entry.isIntersecting && readyForNavRef.current) {
-          readyForNavRef.current = false;
-          router.push(`/read/${prevId}`);
-        }
-      }, { threshold: 0.5 });
-      obs.observe(topSentinel);
-      observers.push(obs);
-    }
 
     if (bottomSentinel) {
       const obs = new IntersectionObserver(([entry]) => {
@@ -546,6 +543,88 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
     return () => observers.forEach(obs => obs.disconnect());
   }, [chapter, settings.layout, router, saveProgress, selectedSource]);
+
+  // Long-strip backward traversal: pull up at the top of the chapter.
+  //
+  // The old behaviour navigated the moment the top sentinel scrolled into view, which
+  // made two common situations hostile: scrolling up to re-read the start of a chapter
+  // dumped you into the previous one, and reopening a chapter that was left off at the
+  // top did the same on the first stray scroll. Instead, once the container is pinned
+  // at scrollTop 0 the reader has to keep scrolling/dragging upward past a threshold.
+  // Any downward movement, any pause, or the tab going away discards the progress.
+  useEffect(() => {
+    setPrevPullProgress(0);
+    if (!chapter || settings.layout !== "longstrip") return;
+    const container = containerRef.current;
+    if (!container) return;
+    const effPrev = getEffectivePrev(chapter, selectedSource);
+    if (!effPrev) return;
+    const prevId = effPrev.id;
+
+    let pull = 0;
+    let navigated = false;
+    let lastTouchY = 0;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const reset = () => {
+      if (pull === 0) return;
+      pull = 0;
+      setPrevPullProgress(0);
+    };
+
+    const addPull = (amount: number) => {
+      if (navigated) return;
+      // Only counts while already at the very top; otherwise this is ordinary reading.
+      if (container.scrollTop > 1) {
+        reset();
+        return;
+      }
+      pull += amount;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(reset, PREV_PULL_IDLE_MS);
+      setPrevPullProgress(Math.min(1, pull / PREV_PULL_THRESHOLD));
+      if (pull >= PREV_PULL_THRESHOLD) {
+        navigated = true;
+        clearTimeout(idleTimer);
+        router.push(`/read/${prevId}`);
+      }
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) addPull(-e.deltaY);
+      else if (e.deltaY > 0) reset();
+    };
+    const onTouchStart = (e: TouchEvent) => {
+      lastTouchY = e.touches[0].clientY;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      const y = e.touches[0].clientY;
+      const dy = y - lastTouchY; // finger moving down = content pulled down = going back
+      lastTouchY = y;
+      if (dy > 0) addPull(dy);
+      else if (dy < 0) reset();
+    };
+    const onScroll = () => {
+      if (container.scrollTop > 1) reset();
+    };
+    // Locking the device / switching apps must not leave stale intent behind.
+    const onVisibility = () => reset();
+
+    container.addEventListener("wheel", onWheel, { passive: true });
+    container.addEventListener("touchstart", onTouchStart, { passive: true });
+    container.addEventListener("touchmove", onTouchMove, { passive: true });
+    container.addEventListener("scroll", onScroll, { passive: true });
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      clearTimeout(idleTimer);
+      container.removeEventListener("wheel", onWheel);
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+      container.removeEventListener("scroll", onScroll);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [chapter, settings.layout, selectedSource, router]);
 
   // Longstrip scroll-to-bottom completion: fires once the user scrolls within 100px
   // of the container bottom. Uses scroll events rather than IntersectionObserver so
@@ -1235,12 +1314,33 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
           <div className="mx-auto max-w-3xl">
             {effectivePrev && (
               <div data-sentinel="prev" className="flex items-center justify-center py-8 text-white/40">
-                <div className="flex flex-col items-center gap-2">
-                  <svg className="h-6 w-6 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    router.push(`/read/${effectivePrev.id}`);
+                  }}
+                  className="flex flex-col items-center gap-2 hover:text-white/70"
+                >
+                  <svg
+                    className="h-6 w-6 transition-transform"
+                    style={{ transform: `translateY(${-6 * prevPullProgress}px)` }}
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                  >
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
                   </svg>
                   <span className="text-sm">Previous Chapter ({effectivePrev.number})</span>
-                </div>
+                  <span className="h-1 w-32 overflow-hidden rounded-full bg-white/10">
+                    <span
+                      className="block h-full rounded-full bg-white/60 transition-[width] duration-75"
+                      style={{ width: `${prevPullProgress * 100}%` }}
+                    />
+                  </span>
+                  <span className="text-xs text-white/30">
+                    {prevPullProgress > 0 ? "Keep pulling up…" : "Pull up or tap to go back"}
+                  </span>
+                </button>
               </div>
             )}
 
