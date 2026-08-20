@@ -5056,6 +5056,311 @@ class ResetScansScraper(DrakeFullScraper):
         return super().get_chapters(series)
 
 
+class ManhuaPlusScraper(BaseSiteScraper):
+    """Series-scoped scraper for manhuaplus.org (Liliana theme).
+
+    Added to close the chapter gap MangaDot leaves on "The Jobless Guy Who Has
+    Come to Slay": MangaDot's copy starts at chapter 163, while ManhuaPlus
+    carries the complete run (chapter 0 through 209, including the 0.1/7.1/7.2
+    split chapters).
+
+    Deliberately scoped to ALLOWED_SERIES rather than the whole catalog.  It is
+    registered in SCRAPERS so `--site manhuaplus` works, but kept out of
+    PRIMARY_SITES so `--site all` never crawls the site at large.
+
+    Unlike most sites here, ManhuaPlus needs neither Cloudflare clearance nor a
+    browser.  The series page ships the whole chapter list server-side, and each
+    chapter page carries a CHAPTER_ID that feeds a plain JSON endpoint:
+
+        /ajax/image/list/chap/{id}  ->  {"status": true, "html": "<div ...>"}
+
+    whose html holds one div.separator per page, ordered by data-index.  The
+    chapter page itself only ever contains loading.gif placeholders, so parsing
+    the chapter HTML for images finds nothing — the AJAX call is mandatory.
+    """
+
+    BASE_URL = "https://manhuaplus.org"
+    SITE_NAME = "manhuaplus"
+    CLOUDFLARE_SITE = False
+
+    # Slug -> title to file the series under in the library.  ManhuaPlus calls
+    # this series "I Am God Killer", but the library (and the MangaDot chapters
+    # already sitting in that folder) use the canonical title, so the mapping
+    # keeps both sources landing in one directory instead of forking it in two.
+    ALLOWED_SERIES = {
+        'the-jobless-guy-who-has-come-to-slay': 'The Jobless Guy Who Has Come to Slay',
+    }
+
+    AJAX_IMAGES = "https://manhuaplus.org/ajax/image/list/chap/{chap_id}"
+
+    _CHAPTER_ID_RE = re.compile(r'CHAPTER_ID\s*=\s*(\d+)')
+    _SLUG_RE = re.compile(r'/manga/([^/?#]+)')
+
+    # ManhuaPlus drops pooled keep-alive connections fairly often, surfacing as
+    # RemoteDisconnected/ConnectionError partway through a long run.  It is
+    # always transient, so retry rather than losing the chapter.
+    _REQUEST_ATTEMPTS = 3
+    _REQUEST_BACKOFF = 3.0
+
+    def _retry(self, what: str, call):
+        """Run `call`, retrying transient connection failures with back-off."""
+        last_error = None
+        for attempt in range(self._REQUEST_ATTEMPTS):
+            try:
+                return call()
+            except Exception as e:
+                last_error = e
+                if attempt < self._REQUEST_ATTEMPTS - 1:
+                    wait = self._REQUEST_BACKOFF * (attempt + 1)
+                    logger.warning(
+                        f"ManhuaPlus: {what} failed "
+                        f"(attempt {attempt + 1}/{self._REQUEST_ATTEMPTS}, "
+                        f"{type(e).__name__}) — retrying in {wait:.0f}s"
+                    )
+                    time.sleep(wait)
+        raise last_error
+
+    def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
+        """ManhuaPlus serves complete HTML — never spin up a browser for it.
+
+        Callers such as get_series_details() pass use_selenium=True by default;
+        honouring that here would launch Chrome (or hit FlareSolverr) for no
+        gain, so the flag is dropped.
+        """
+        return self._retry(
+            f"GET {url}",
+            lambda: super(ManhuaPlusScraper, self)._get_soup(url, use_selenium=False),
+        )
+
+    @classmethod
+    def _slug(cls, url: str) -> str:
+        match = cls._SLUG_RE.search(url or '')
+        return match.group(1).lower() if match else ''
+
+    def get_all_series(self) -> List[Series]:
+        """Return only the allow-listed series — this site is not crawled."""
+        series_list = []
+        for slug, title in self.ALLOWED_SERIES.items():
+            series_list.append(Series(
+                title=title,
+                url=f"{self.BASE_URL}/manga/{slug}",
+                source=self.SITE_NAME,
+            ))
+        logger.info(
+            f"ManhuaPlus: {len(series_list)} allow-listed series "
+            f"(site-wide discovery is intentionally disabled)"
+        )
+        return series_list
+
+    def get_series_details(self, series: Series) -> Series:
+        pinned = self.ALLOWED_SERIES.get(self._slug(series.url))
+        series = super().get_series_details(series)
+        # Restore the library title: the base implementation always prefers the
+        # detail-page <h1>, which here is the site's own alternate title.
+        if pinned:
+            series.title = pinned
+        return series
+
+    @staticmethod
+    def _info_panel_value(soup, label: str) -> str:
+        """Value of the sidebar info row whose label matches `label`.
+
+        The panel is a flat list of div.y6x11p blocks, each an icon plus a bare
+        text label plus a span.dt value.  Nothing ties label to value but
+        position, and the label has no element of its own, so isolate it by
+        trimming the value off the end of the block's text.
+        """
+        for block in soup.select('div.y6x11p'):
+            value_elem = block.select_one('span.dt')
+            if not value_elem:
+                continue
+            block_text = block.get_text(' ', strip=True)
+            value = value_elem.get_text(' ', strip=True)
+            label_text = block_text[:len(block_text) - len(value)].strip()
+            if label_text.lower().startswith(label.lower()):
+                return value
+        return ''
+
+    def _extract_title_from_soup(self, soup) -> str:
+        """Prefer the page <h1>.
+
+        The base extractor falls back to og:title, which on ManhuaPlus is the
+        SEO string "Read <name> Fastest and highest quality updates" rather than
+        a title.  Allow-listed series get renamed to their library title by
+        get_series_details() regardless, but this keeps the interim value (and
+        the logs it appears in) sane.
+        """
+        h1 = soup.select_one('article h1, h1.mt-0, h1')
+        if h1:
+            text = re.sub(r'\s+', ' ', h1.get_text(' ', strip=True))
+            if text:
+                return text
+        return super()._extract_title_from_soup(soup)
+
+    def _extract_status_from_soup(self, soup) -> str:
+        value = self._info_panel_value(soup, 'status').lower()
+        if 'completed' in value or 'finished' in value:
+            return 'Completed'
+        if 'ongoing' in value or 'updating' in value:
+            return 'Ongoing'
+        if 'hiatus' in value:
+            return 'Hiatus'
+        if 'dropped' in value or 'cancel' in value:
+            return 'Dropped'
+        return super()._extract_status_from_soup(soup)
+
+    def _extract_author_from_soup(self, soup) -> str:
+        author = self._info_panel_value(soup, 'author')
+        # ManhuaPlus fills unknown authors with the literal string "Updating".
+        if author.lower() in ('', 'updating', 'n/a', '-'):
+            return ''
+        return author
+
+    def _extract_artist_from_soup(self, soup) -> str:
+        artist = self._info_panel_value(soup, 'artist')
+        if artist.lower() in ('', 'updating', 'n/a', '-'):
+            return ''
+        return artist
+
+    def _extract_description_from_soup(self, soup) -> str:
+        elem = soup.select_one('#syn-target')
+        if elem:
+            text = re.sub(r'\s+', ' ', elem.get_text(' ', strip=True))
+            if len(text) > 50:
+                return text[:2000]
+        # Deliberately not falling back to the base implementation: every
+        # generic selector it tries misses here, and the page's meta
+        # description is boilerplate site copy rather than a synopsis.
+        return ''
+
+    def _extract_genres_from_soup(self, soup) -> List[str]:
+        """ManhuaPlus does not tag series with genres.
+
+        Every /genres/ link on the page belongs to the site-wide nav dropdown,
+        so returning nothing is correct — scraping them would stamp all ~79
+        genres onto the series.
+        """
+        return []
+
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        if self._slug(series.url) not in self.ALLOWED_SERIES:
+            logger.warning(
+                f"ManhuaPlus is enabled for allow-listed series only — "
+                f"refusing {series.url!r}"
+            )
+            return []
+
+        soup = self._get_soup(series.url)
+        if self._is_browser_error_page(soup) or self._is_server_error_page(soup):
+            logger.warning(
+                f"Error page for {series.url!r} — returning 0 chapters "
+                f"for {series.title!r}"
+            )
+            return []
+
+        chapters = []
+        seen = set()
+        for link in soup.select('ul#myUL li.chapter a[href]'):
+            href = (link.get('href') or '').strip()
+            if not href:
+                continue
+            full_url = href if href.startswith('http') else self.BASE_URL + href
+            if not full_url.startswith(self.BASE_URL) or full_url in seen:
+                continue
+
+            text = link.get_text(' ', strip=True)
+            # The link text carries the display number ("Chapter 7.1"); the slug
+            # spells the same value with a dash ("chapter-7-1"), so prefer the
+            # text and fall back to rewriting the slug.
+            match = re.search(r'chapter\s*([0-9]+(?:\.[0-9]+)?)', text, re.I)
+            if match:
+                num = match.group(1)
+            else:
+                match = re.search(r'chapter-([0-9]+)(?:-([0-9]+))?', full_url, re.I)
+                if not match:
+                    continue
+                num = match.group(1)
+                if match.group(2):
+                    num = f"{num}.{match.group(2)}"
+
+            seen.add(full_url)
+            chapters.append(Chapter(
+                number=num,
+                title=text or f"Chapter {num}",
+                url=full_url,
+            ))
+
+        chapters.sort(key=lambda c: float(c.number))
+        logger.info(f"ManhuaPlus: {len(chapters)} chapter(s) for {series.title!r}")
+        return chapters
+
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        # _get_soup already retries transient connection drops on its own.
+        try:
+            soup = self._get_soup(chapter.url)
+        except Exception as e:
+            logger.warning(
+                f"ManhuaPlus: could not load {chapter.url} "
+                f"({type(e).__name__}): {e}"
+            )
+            return []
+
+        match = self._CHAPTER_ID_RE.search(str(soup))
+        if not match:
+            logger.warning(f"ManhuaPlus: no CHAPTER_ID on {chapter.url}")
+            return []
+
+        def _fetch_image_list():
+            self._delay()
+            resp = self.session.get(
+                self.AJAX_IMAGES.format(chap_id=match.group(1)),
+                headers={'X-Requested-With': 'XMLHttpRequest', 'Referer': chapter.url},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        try:
+            payload = self._retry(f"image list for {chapter.url}", _fetch_image_list)
+        except Exception as e:
+            logger.warning(
+                f"ManhuaPlus: image list failed for {chapter.url} "
+                f"({type(e).__name__}): {e}"
+            )
+            return []
+
+        if not payload.get('status') or not payload.get('html'):
+            logger.warning(f"ManhuaPlus: empty image list for {chapter.url}")
+            return []
+
+        # The endpoint returns the separators out of order, so sort on
+        # data-index rather than trusting document order.
+        indexed = []
+        for sep in BeautifulSoup(payload['html'], 'html.parser').select('div.separator'):
+            img = sep.select_one('img[src]')
+            src = (img.get('src') or '').strip() if img else ''
+            if not src or 'loading.gif' in src:
+                # Lazy-loaded rows keep the real URL on the wrapping anchor.
+                anchor = sep.select_one('a.readImg[href]')
+                src = (anchor.get('href') or '').strip() if anchor else ''
+            if not src.startswith('http'):
+                continue
+            try:
+                index = int(sep.get('data-index'))
+            except (TypeError, ValueError):
+                index = len(indexed)
+            indexed.append((index, src))
+
+        indexed.sort(key=lambda pair: pair[0])
+
+        pages = []
+        for _, src in indexed:
+            if src not in pages:
+                pages.append(src)
+        return pages
+
+
+
 # ---------------------------------------------------------------------------
 # MangaDot — alias-aware series matching
 #
@@ -6806,6 +7111,10 @@ SCRAPERS = {
     'reset-scans.org': ResetScansScraper,
     'mangadot': MangaDotScraper,
     'mangadot.net': MangaDotScraper,
+    # Series-scoped: see ManhuaPlusScraper.ALLOWED_SERIES.  Intentionally
+    # absent from PRIMARY_SITES so --site all never crawls the whole catalog.
+    'manhuaplus': ManhuaPlusScraper,
+    'manhuaplus.org': ManhuaPlusScraper,
 }
 
 # Primary sites (canonical names only, no aliases) - used for --site all
