@@ -7469,7 +7469,7 @@ Examples:
         """
     )
     
-    parser.add_argument('--site', '-s', help='Site to scrape (asura, flame, drake, manhuato, webtoon, manhuafast, resetscans, or "all" for all sites)')
+    parser.add_argument('--site', '-s', help='Site to scrape (asura, flame, drake, manhuato, webtoon, manhuafast, resetscans, mangadot, manhuaplus, or "all" for all sites). Note: manhuaplus is limited to its allow-listed series and is excluded from "all"')
     parser.add_argument('--list-all', action='store_true', help='List all series and export to YAML')
     parser.add_argument('--download-all', action='store_true', help='Download all series from site')
     parser.add_argument('--download-url', help='Download a specific series by URL')
