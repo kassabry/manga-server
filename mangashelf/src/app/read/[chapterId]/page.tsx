@@ -4,6 +4,13 @@ import { useEffect, useState, useCallback, useRef, use, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import Link from "next/link";
+import { DownloadButton } from "@/components/offline/DownloadControls";
+import { useOffline } from "@/components/offline/OfflineProvider";
+import {
+  saveProgressOnUnload,
+  saveProgressResilient,
+  wasSignedIn,
+} from "@/lib/offline/progress";
 
 interface PageInfo {
   index: number;
@@ -128,12 +135,19 @@ function getEffectiveNext(
 
 function ReaderContent({ chapterId }: { chapterId: string }) {
   const { data: session } = useSession();
+  const { online } = useOffline();
   const searchParams = useSearchParams();
   const router = useRouter();
   const initialPage = parseInt(searchParams.get("page") || "0");
   // Fractional position within initialPage's image (0..1), for exact long-strip resume
   // from links that carry it (e.g. Continue Reading, series page).
   const initialOffset = parseFloat(searchParams.get("offset") || "0");
+
+  // Offline, useSession reports no user because /api/auth/session is
+  // unreachable. Fall back to the remembered sign-in so progress is still
+  // recorded and replayed once the server is back.
+  const [signedInHere, setSignedInHere] = useState(false);
+  const hasUser = Boolean(session?.user) || signedInHere;
 
   const [chapter, setChapter] = useState<ChapterData | null>(null);
   const [chapterError, setChapterError] = useState<{ status: number; message: string } | null>(null);
@@ -221,6 +235,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     setTimeout(tryScroll, 150);
   }, []);
 
+  useEffect(() => {
+    setSignedInHere(wasSignedIn());
+  }, []);
+
   // Load settings from localStorage first, then override from server
   useEffect(() => {
     const local = loadReaderSettings();
@@ -304,6 +322,14 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
             readyForNavRef.current = true;
           }, 1000);
         }, 2000);
+      })
+      .catch(() => {
+        setChapterError({
+          status: 0,
+          message: navigator.onLine
+            ? "Could not reach the server."
+            : "You're offline and this chapter hasn't been downloaded.",
+        });
       });
   }, [chapterId, initialPage, reloadKey]);
 
@@ -393,14 +419,12 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   // Save reading progress
   const saveProgress = useCallback(
     async (page: number, completed: boolean, pageOffset = 0) => {
-      if (!session?.user || !chapter) return;
-      fetch("/api/user/progress", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chapterId: chapter.id, page, completed, pageOffset }),
-      });
+      if (!hasUser || !chapter) return;
+      // Queued locally and replayed later when the write can't reach the
+      // server, so a chapter read offline doesn't come back marked unread.
+      void saveProgressResilient({ chapterId: chapter.id, page, completed, pageOffset });
     },
-    [session, chapter]
+    [hasUser, chapter]
   );
 
   useEffect(() => {
@@ -434,7 +458,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
   // visibilitychange hidden → PWA backgrounded (app-switch, screen lock) on iOS & Android
   // pagehide      → iOS Safari PWA when the page is actually terminated
   useEffect(() => {
-    if (!chapter || !session?.user) return;
+    if (!chapter || !hasUser) return;
     const handleUnload = () => {
       // Guard against empty page list (pages.length=0 → last=-1, always "complete")
       const safeLastPage = Math.max(chapter.pages.length - 1, 1);
@@ -456,13 +480,12 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         page = currentPage;
         isLast = page >= safeLastPage;
       }
-      navigator.sendBeacon(
-        "/api/user/progress",
-        new Blob(
-          [JSON.stringify({ chapterId: chapter.id, page, completed: isLast, pageOffset: isLast ? 0 : offset })],
-          { type: "application/json" }
-        )
-      );
+      saveProgressOnUnload({
+        chapterId: chapter.id,
+        page,
+        completed: isLast,
+        pageOffset: isLast ? 0 : offset,
+      });
     };
 
     const handleVisibility = () => { if (document.hidden) handleUnload(); };
@@ -475,7 +498,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       window.removeEventListener("pagehide", handleUnload);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [chapter, session, settings.layout, currentPage, getLongstripPosition]);
+  }, [chapter, hasUser, settings.layout, currentPage, getLongstripPosition]);
 
   // Auto-hide toolbar
   useEffect(() => {
@@ -968,6 +991,22 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               {currentPage + 1}/{totalPages}
             </span>
           )}
+          {!online && (
+            <span
+              className="rounded-full border border-yellow-600/50 bg-yellow-900/40 px-2 py-0.5 text-[10px] font-medium text-yellow-300"
+              title="No connection — you're reading the downloaded copy"
+            >
+              Offline
+            </span>
+          )}
+          {/* Save this chapter to the device for reading with no connection */}
+          <DownloadButton
+            chapter={{ id: chapter.id, number: chapter.number }}
+            seriesId={chapter.series.id}
+            seriesTitle={chapter.series.title}
+            tone="reader"
+            className="p-1.5"
+          />
           {/* Reload button — clears browser error-cached images */}
           <button
             onClick={(e) => { e.stopPropagation(); reloadChapter(); }}

@@ -7,6 +7,15 @@
   "background_color": "#0f0f0f",
   "theme_color": "#0f0f0f",
   "orientation": "any",
+  "shortcuts": [
+    {
+      "name": "Downloads",
+      "short_name": "Downloads",
+      "description": "Chapters saved on this device for offline reading",
+      "url": "/downloads",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+    }
+  ],
   "icons": [
     {
       "src": "/icon-192.png",

@@ -4,6 +4,7 @@ import { useEffect, useState, useMemo, use, useRef } from "react";
 import { useSession } from "next-auth/react";
 import Link from "next/link";
 import { LIST_STATUS_LABELS, type ListStatus } from "@/lib/types";
+import { DownloadButton, SeriesDownloadMenu } from "@/components/offline/DownloadControls";
 
 const ALT_TITLE_PREVIEW = 4;
 
@@ -387,6 +388,13 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
 
   const chapters = isGrouped ? [] : (sortDesc ? [...filteredChapters].reverse() : filteredChapters);
 
+  // What "download everything" operates on. In grouped mode the same chapter
+  // number exists once per source, so take one copy — otherwise a two-source
+  // series would download twice the bytes for the same reading experience.
+  const downloadableChapters = isGrouped
+    ? groupedChapters.map((g) => g.sources[0])
+    : filteredChapters;
+
   // Show the highest chapter number (e.g. "Chapters (137)"), not a record count.
   // Counting rows/groups inflates the figure for multi-source series and series with
   // decimal/bonus chapters; the highest number always matches the newest chapter shown.
@@ -552,6 +560,14 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
               >
                 {following ? "Following" : "Follow"}
               </button>
+
+              <SeriesDownloadMenu
+                seriesId={series.id}
+                seriesTitle={series.title}
+                coverPath={series.coverPath}
+                chapters={downloadableChapters}
+                isRead={(chapterId) => Boolean(progress[chapterId]?.completed)}
+              />
 
               <select
                 value={listStatus}
@@ -754,7 +770,15 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                     </div>
                     <div className="flex items-center gap-4 text-xs text-text-secondary shrink-0">
                       <span>{group.pageCount} pages</span>
-                      <span>{new Date(group.createdAt).toLocaleDateString()}</span>
+                      <span className="hidden sm:inline">
+                        {new Date(group.createdAt).toLocaleDateString()}
+                      </span>
+                      <DownloadButton
+                        chapter={defaultChapter}
+                        seriesId={series.id}
+                        seriesTitle={series.title}
+                        coverPath={series.coverPath}
+                      />
                     </div>
                   </div>
                 );
@@ -798,7 +822,15 @@ export default function SeriesPage({ params }: { params: Promise<{ id: string }>
                     </div>
                     <div className="flex items-center gap-4 text-xs text-text-secondary shrink-0">
                       <span>{chapter.pageCount} pages</span>
-                      <span>{new Date(chapter.createdAt).toLocaleDateString()}</span>
+                      <span className="hidden sm:inline">
+                        {new Date(chapter.createdAt).toLocaleDateString()}
+                      </span>
+                      <DownloadButton
+                        chapter={chapter}
+                        seriesId={series.id}
+                        seriesTitle={series.title}
+                        coverPath={series.coverPath}
+                      />
                     </div>
                   </div>
                 );

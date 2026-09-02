@@ -12,6 +12,8 @@ const publicPaths = [
   "/manifest.json",
   "/robots.txt",
   "/icon-",        // PWA icons
+  "/sw.js",        // Service worker — must be reachable to register at all
+  "/offline",      // Offline fallback; a redirect here can't be replayed from cache
 ];
 
 export default auth((req) => {

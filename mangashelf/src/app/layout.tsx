@@ -2,6 +2,8 @@ import type { Metadata, Viewport } from "next";
 import { SessionProvider } from "next-auth/react";
 import { Navbar, BottomNav } from "@/components/layout/Navbar";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
+import { OfflineProvider } from "@/components/offline/OfflineProvider";
+import { DownloadQueueBanner } from "@/components/offline/DownloadControls";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -37,11 +39,14 @@ export default function RootLayout({
       <body className="bg-bg-primary text-text-primary flex h-dvh flex-col overflow-hidden">
         <SessionProvider>
           <ThemeProvider>
-            <Navbar />
-            <main className="mx-auto w-full max-w-7xl flex-1 overflow-y-auto px-4 py-6">
-              {children}
-            </main>
-            <BottomNav />
+            <OfflineProvider>
+              <Navbar />
+              <main className="mx-auto w-full max-w-7xl flex-1 overflow-y-auto px-4 py-6">
+                {children}
+              </main>
+              <DownloadQueueBanner />
+              <BottomNav />
+            </OfflineProvider>
           </ThemeProvider>
         </SessionProvider>
       </body>

@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useSession, signOut } from "next-auth/react";
 import { useState, useEffect, useRef } from "react";
 import { SearchBar } from "@/components/ui/SearchBar";
+import { useOffline } from "@/components/offline/OfflineProvider";
 
 const CATEGORIES = [
   { label: "Manga", href: "/browse?type=Manga" },
@@ -134,6 +135,16 @@ export function Navbar() {
                   >
                     My List
                   </Link>
+                  <Link
+                    href="/downloads"
+                    className={`rounded-lg px-3 py-1.5 text-sm ${
+                      pathname === "/downloads"
+                        ? "bg-accent/10 text-accent"
+                        : "text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+                    }`}
+                  >
+                    Downloads
+                  </Link>
                 </>
               )}
             </div>
@@ -144,6 +155,7 @@ export function Navbar() {
           </div>
 
           <div className="flex items-center gap-3">
+            <OfflinePill />
             {session?.user ? (
               <div className="relative">
                 <button
@@ -162,6 +174,9 @@ export function Navbar() {
                     </Link>
                     <Link href="/updates" className="block px-4 py-2 text-sm hover:bg-bg-hover">
                       Updates
+                    </Link>
+                    <Link href="/downloads" className="block px-4 py-2 text-sm hover:bg-bg-hover">
+                      Downloads
                     </Link>
                     <Link href="/settings" className="block px-4 py-2 text-sm hover:bg-bg-hover">
                       Settings
@@ -228,6 +243,12 @@ export function BottomNav() {
           <>
             <MobileNavItem href="/updates" icon="updates" label="Updates" active={pathname === "/updates"} />
             <MobileNavItem href="/my-list" icon="list" label="My List" active={pathname === "/my-list"} />
+            <MobileNavItem
+              href="/downloads"
+              icon="download"
+              label="Offline"
+              active={pathname === "/downloads"}
+            />
           </>
         )}
         <MobileNavItem
@@ -257,13 +278,14 @@ function MobileNavItem({
     browse: "M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z",
     updates: "M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9",
     list: "M4 6h16M4 10h16M4 14h16M4 18h16",
+    download: "M12 4v11m0 0l-4-4m4 4l4-4M4 19h16",
     settings: "M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4",
   };
 
   return (
     <Link
       href={href}
-      className={`flex flex-col items-center gap-0.5 px-3 py-1.5 ${
+      className={`flex flex-col items-center gap-0.5 px-2 py-1.5 ${
         active ? "text-accent" : "text-text-secondary"
       }`}
     >
@@ -271,6 +293,26 @@ function MobileNavItem({
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d={iconPaths[icon]} />
       </svg>
       <span className="text-[10px]">{label}</span>
+    </Link>
+  );
+}
+
+/**
+ * Connection indicator. Only visible when the network is actually gone —
+ * a permanent "online" badge would just be noise.
+ */
+function OfflinePill() {
+  const { online, supported } = useOffline();
+  if (!supported || online) return null;
+
+  return (
+    <Link
+      href="/downloads"
+      className="flex items-center gap-1.5 rounded-full border border-yellow-600/50 bg-yellow-900/30 px-2.5 py-1 text-[11px] font-medium text-yellow-300"
+      title="No connection — only downloaded chapters can be opened"
+    >
+      <span className="h-1.5 w-1.5 rounded-full bg-yellow-400" />
+      Offline
     </Link>
   );
 }
