@@ -142,6 +142,17 @@
 - Series page chapter count uses `displayChapterCount` — shows `max(chapters per source)` when "All Sources" is active, not the sum, to avoid inflated counts for multi-source series
 - Python type hints `list[X]` / `X | Y` require Python 3.10+; Pi may run older — use `List[X]` from `typing` and avoid union shorthand in scripts
 
+## Offline Downloads (`mangashelf/public/sw.js` + `src/lib/offline/`)
+- **The whole feature is dead on a plain `http://` origin.** Browsers only register service workers on a secure context (https, or `http://localhost`). `docker-compose.yml` still has `NEXTAUTH_URL=http://manga.dirtyhousereading.com` — if the tunnel is served over http, the Downloads page will say so rather than failing silently
+- Three caches. `orvault-offline-v1` holds user downloads and is **never version-bumped and never cleared in `activate`** — it is the library someone took on a plane, not a perf cache. `orvault-shell-vN` / `orvault-static-vN` are disposable runtime caches
+- RSC payload requests (`RSC` header or `?_rsc=`) are deliberately **not** intercepted. Letting one fail makes Next's router fall back to a full browser navigation, which the navigation handler answers from the cached document. Serving a guessed RSC payload hydrates the wrong tree
+- A download pins the `/read/:id` **document and every `/_next/static/` URL it references** into the download cache. Without that, a cold start from the home screen in airplane mode has no HTML to serve and no chunks to boot from. The SW re-pins that document on the next online visit so the offline copy doesn't drift behind the deployed build
+- Never cache a `redirected` response for a navigation — the browser refuses to replay it, and a redirect here is the login wall. `/sw.js` and `/offline` are in `middleware.ts` `publicPaths` for that reason
+- `bytes += await cacheUrl(...)` is a **race** with the four-worker fetch pool: `+=` reads the left operand before awaiting, so every worker reads the same stale total and the last write wins (measured: 1000 instead of 3000). Assign the awaited value to a local first
+- next-auth reports "no session" whenever `/api/auth/session` is unreachable, which offline is always. Progress saving keys off a remembered `orvault-signed-in` flag, not the live session, or every chapter read on a plane comes back marked unread
+- The progress replay queue drops entries the server answers with a 4xx (signed out, chapter deleted) — otherwise one bad row wedges the queue forever
+- The `/series/:id` page is deliberately **not** pinned: offline it renders a permanent "Loading..." because its data comes from the API. Let it fall through to `/offline` instead
+
 ## Git Workflow
 - **Commit and push after every change, without asking.** Finish the edit, verify it (compile/build), then `git add` the touched files, commit, and `git push origin main` in the same turn. Do not leave work sitting uncommitted or committed-but-unpushed, and do not ask for permission first — this is standing authorization
 - Stage only the files the change actually touched. Never `git add -A` / `git add .` — the working tree collects scraper logs and other untracked junk that must not land in the repo
