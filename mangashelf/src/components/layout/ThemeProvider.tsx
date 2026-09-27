@@ -10,6 +10,7 @@ import {
   getSavedCustomColors,
   saveCustomColors,
 } from "@/lib/themes";
+import { loadPreferences } from "@/lib/prefs";
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const { data: session } = useSession();
@@ -29,8 +30,8 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   // Sync with server preferences when logged in
   useEffect(() => {
     if (!session?.user) return;
-    fetch("/api/user/preferences")
-      .then((r) => r.json())
+    // Shared with the dashboard, so the two of them make one request.
+    loadPreferences()
       .then((prefs) => {
         if (!prefs?.theme) return;
         const localTheme = getSavedTheme();

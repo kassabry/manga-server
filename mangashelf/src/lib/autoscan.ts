@@ -5,16 +5,33 @@ import { prisma } from "./db";
 let scanInterval: ReturnType<typeof setInterval> | null = null;
 let lastScanTime: Date | null = null;
 let isScanning = false;
-let currentIntervalMs = 1800000; // 30 min default
+let currentIntervalMs = 1800000; // 30 min default (see DEFAULT_INTERVAL_MS)
+
+const DEFAULT_INTERVAL_MS = 1800000;
+
+/**
+ * Parse a configured interval, treating 0 as the disable switch it is.
+ *
+ * `parseInt(value) || DEFAULT` reads a stored 0 as falsy and hands back the
+ * 30-minute default, so turning auto-scan off in the admin UI only held until
+ * the next restart — after which scans silently resumed, competing with page
+ * loads for the same SQLite file.
+ */
+function parseInterval(raw: string | undefined | null): number | null {
+  if (raw == null || raw === "") return null;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 async function getConfiguredInterval(): Promise<number> {
   try {
     const config = await prisma.siteConfig.findUnique({ where: { key: "scanIntervalMs" } });
-    if (config) return parseInt(config.value) || 1800000;
+    const stored = parseInterval(config?.value);
+    if (stored !== null) return stored;
   } catch {
     // DB might not be ready yet
   }
-  return parseInt(process.env.SCAN_INTERVAL_MS || "1800000");
+  return parseInterval(process.env.SCAN_INTERVAL_MS) ?? DEFAULT_INTERVAL_MS;
 }
 
 async function runScan() {
@@ -89,7 +106,8 @@ export async function getAutoScanStatus() {
   let intervalMs = currentIntervalMs;
   try {
     const config = await prisma.siteConfig.findUnique({ where: { key: "scanIntervalMs" } });
-    if (config) intervalMs = parseInt(config.value) || 1800000;
+    const stored = parseInterval(config?.value);
+    if (stored !== null) intervalMs = stored;
   } catch {
     // DB might not be ready
   }

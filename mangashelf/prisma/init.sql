@@ -152,3 +152,24 @@ CREATE TABLE IF NOT EXISTS "Recommendation" (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS "Recommendation_seriesId_targetSeriesId_key" ON "Recommendation"("seriesId", "targetSeriesId");
 CREATE INDEX IF NOT EXISTS "Recommendation_seriesId_rating_idx" ON "Recommendation"("seriesId", "rating");
+
+-- Indexes for the list/sort paths the UI actually uses.
+--
+-- These were missing, so every home-page and /browse request scanned and sorted
+-- the whole Series table, then did it again with a larger OFFSET for the next
+-- infinite-scroll page. The cost scales with the size of the library, which is
+-- what made start-up slower as it grew — nothing to do with the connection.
+--
+-- `CREATE INDEX IF NOT EXISTS` is safe to re-run, and building them on an
+-- existing database takes a moment once, at the next container start.
+CREATE INDEX IF NOT EXISTS "Series_lastChapterAt_idx" ON "Series"("lastChapterAt");
+CREATE INDEX IF NOT EXISTS "Series_title_idx" ON "Series"("title");
+CREATE INDEX IF NOT EXISTS "Series_createdAt_idx" ON "Series"("createdAt");
+CREATE INDEX IF NOT EXISTS "Series_rating_idx" ON "Series"("rating");
+CREATE INDEX IF NOT EXISTS "Series_chapterCount_idx" ON "Series"("chapterCount");
+-- The home page's "everything except light novels, newest chapter first".
+CREATE INDEX IF NOT EXISTS "Series_type_lastChapterAt_idx" ON "Series"("type", "lastChapterAt");
+-- Continue Reading: "my unfinished chapters, most recent first".
+CREATE INDEX IF NOT EXISTS "ReadProgress_userId_completed_readAt_idx" ON "ReadProgress"("userId", "completed", "readAt");
+-- My List, filtered by status.
+CREATE INDEX IF NOT EXISTS "ListEntry_userId_status_updatedAt_idx" ON "ListEntry"("userId", "status", "updatedAt");

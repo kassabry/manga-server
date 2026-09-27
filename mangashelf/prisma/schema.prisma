@@ -84,6 +84,18 @@ model Series {
   customListEntries CustomListEntry[]
   recommendations   Recommendation[] @relation("RecommendationSource")
   recommendedBy     Recommendation[] @relation("RecommendationTarget")
+
+  // Every sort the home page and /browse offer, and nothing indexed them: each
+  // request scanned and sorted the whole table, then did it again with a larger
+  // OFFSET for the next infinite-scroll page. That cost rises with the size of
+  // the library, which is why start-up kept getting slower as it grew.
+  @@index([lastChapterAt])
+  @@index([title])
+  @@index([createdAt])
+  @@index([rating])
+  @@index([chapterCount])
+  // The home page's "everything except light novels, newest chapter first".
+  @@index([type, lastChapterAt])
 }
 
 /// A precomputed "readers also liked" edge between two series already in the
@@ -154,6 +166,8 @@ model ListEntry {
   series    Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
 
   @@unique([userId, seriesId])
+  // "My list, filtered by status, newest first" — every My List tab.
+  @@index([userId, status, updatedAt])
 }
 
 model ReadProgress {
@@ -170,6 +184,8 @@ model ReadProgress {
   chapter   Chapter  @relation(fields: [chapterId], references: [id], onDelete: Cascade)
 
   @@unique([userId, chapterId])
+  // Continue Reading asks for "my unfinished chapters, most recent first".
+  @@index([userId, completed, readAt])
 }
 
 model CustomList {

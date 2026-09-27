@@ -6,6 +6,8 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ContinueReading } from "@/components/dashboard/ContinueReading";
 import { UpdatesFeed } from "@/components/dashboard/UpdatesFeed";
+import { useRestorableList } from "@/lib/useRestorableList";
+import { cachedColumns, loadPreferences } from "@/lib/prefs";
 
 const PAGE_SIZE = 30;
 
@@ -22,49 +24,56 @@ interface SeriesData {
 }
 
 export default function HomePage() {
-  const { data: session, status } = useSession();
+  const { data: session } = useSession();
   const router = useRouter();
   const [needsSetup, setNeedsSetup] = useState(false);
-  const [columns, setColumns] = useState(6);
+  // Start from the cached value so the grid is laid out at its real width on the
+  // first paint — a 6-to-5 reflow after the fetch would invalidate a restored
+  // scroll offset.
+  const [columns, setColumns] = useState(() => cachedColumns());
 
-  // Infinite scroll state
-  const [series, setSeries] = useState<SeriesData[]>([]);
-  const [page, setPage] = useState(1);
-  const [hasMore, setHasMore] = useState(true);
+  // Pages already fetched, plus where the reader was in them, survive a trip to
+  // a series page and back.
+  const {
+    items: series,
+    setItems: setSeries,
+    page,
+    setPage,
+    hasMore,
+    setHasMore,
+    restored,
+  } = useRestorableList<SeriesData>("home:recent");
+
   const [loadingMore, setLoadingMore] = useState(false);
   const sentinelRef = useRef<HTMLDivElement>(null);
-  const initialLoadDone = useRef(false);
+  const initialLoadDone = useRef(restored);
 
-  // Initial setup + prefs fetch
+  // Setup check — cheap, and it gates nothing else, so it runs on its own.
   useEffect(() => {
-    const fetchAll = async () => {
-      const setupPromise = fetch("/api/setup").then((r) => r.json());
-      const prefsPromise = session?.user
-        ? fetch("/api/user/preferences").then((r) => r.json()).catch(() => null)
-        : Promise.resolve(null);
+    fetch("/api/setup")
+      .then((r) => r.json())
+      .then((setupData) => {
+        if (setupData?.needsSetup) {
+          setNeedsSetup(true);
+          router.replace("/setup");
+        }
+      })
+      .catch(() => {});
+  }, [router]);
 
-      const [setupData, prefs] = await Promise.all([setupPromise, prefsPromise]);
-
-      if (setupData.needsSetup) {
-        setNeedsSetup(true);
-        router.replace("/setup");
-        return;
-      }
-
-      if (prefs?.carouselColumns) {
-        setColumns(prefs.carouselColumns);
-      }
-    };
-
-    fetchAll();
-  }, [router, session]);
+  useEffect(() => {
+    if (!session?.user) return;
+    loadPreferences().then((prefs) => {
+      if (prefs?.carouselColumns) setColumns(prefs.carouselColumns);
+    });
+  }, [session]);
 
   // Fetch one page of recently-updated series
   const fetchPage = useCallback(async (pageNum: number) => {
     setLoadingMore(true);
     try {
       const res = await fetch(
-        `/api/series?sort=recent&limit=${PAGE_SIZE}&page=${pageNum}&excludeType=LightNovels`
+        `/api/series?sort=recent&limit=${PAGE_SIZE}&page=${pageNum}&excludeType=LightNovels&count=0`
       );
       const data = await res.json();
       const incoming: SeriesData[] = data.series || [];
@@ -75,15 +84,16 @@ export default function HomePage() {
     } finally {
       setLoadingMore(false);
     }
-  }, []);
+  }, [setSeries, setHasMore]);
 
-  // Load first page once setup check is done
+  // Fire immediately rather than waiting on the session to resolve: the cookie
+  // rides along on this request either way, so gating on useSession only added a
+  // round trip in front of the one that fetches the content.
   useEffect(() => {
-    if (needsSetup || status === "loading") return;
     if (initialLoadDone.current) return;
     initialLoadDone.current = true;
     fetchPage(1);
-  }, [needsSetup, status, fetchPage]);
+  }, [fetchPage]);
 
   // IntersectionObserver — triggers when sentinel scrolls into view
   useEffect(() => {
@@ -105,9 +115,9 @@ export default function HomePage() {
 
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [hasMore, loadingMore, fetchPage]);
+  }, [hasMore, loadingMore, fetchPage, setPage]);
 
-  if (needsSetup || status === "loading") return null;
+  if (needsSetup) return null;
 
   return (
     <div className="space-y-8">

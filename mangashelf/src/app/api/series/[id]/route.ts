@@ -3,7 +3,11 @@ import { prisma } from "@/lib/db";
 import { auth } from "@/lib/auth";
 import { access } from "fs/promises";
 import { join } from "path";
-import { getCoversDir, normalizeSourceForFilename } from "@/lib/covers";
+import {
+  forgetPreferredCoverSource,
+  getCoversDir,
+  normalizeSourceForFilename,
+} from "@/lib/covers";
 
 export async function GET(
   _request: NextRequest,
@@ -97,10 +101,15 @@ export async function PATCH(
   // Only allow updating preferredCoverSource via this route
   const { preferredCoverSource } = body as { preferredCoverSource: string | null };
 
-  await prisma.series.update({
+  const updated = await prisma.series.update({
     where: { id },
     data: { preferredCoverSource: preferredCoverSource ?? null },
+    select: { slug: true },
   });
+
+  // The cover route memoizes this lookup; without this the old cover keeps
+  // being served until that entry ages out.
+  forgetPreferredCoverSource(updated.slug);
 
   return NextResponse.json({ ok: true });
 }

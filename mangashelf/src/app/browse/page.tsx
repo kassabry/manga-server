@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback, useRef, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { SeriesGrid } from "@/components/series/SeriesGrid";
+import { useRestorableList } from "@/lib/useRestorableList";
 
 interface SeriesData {
   id: string;
@@ -26,13 +27,10 @@ const PAGE_SIZE = 24;
 function BrowseContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
-  const [series, setSeries] = useState<SeriesData[]>([]);
   const [total, setTotal] = useState(0);
-  const [hasMore, setHasMore] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [filterMeta, setFilterMeta] = useState<FilterMeta | null>(null);
   const [showFilters, setShowFilters] = useState(false);
-  const [page, setPage] = useState(1);
   const sentinelRef = useRef<HTMLDivElement>(null);
 
   const search = searchParams.get("search") || "";
@@ -44,6 +42,22 @@ function BrowseContent() {
   const minChapters = searchParams.get("minChapters") || "";
   const maxChapters = searchParams.get("maxChapters") || "";
   const minRating = searchParams.get("minRating") || "";
+
+  // One snapshot per filter combination, so both back-navigation and flipping
+  // back to a previous filter land where the reader left off.
+  const filterKey = JSON.stringify([
+    search, type, genre, status, publisher, sort, minChapters, maxChapters, minRating,
+  ]);
+
+  const {
+    items: series,
+    setItems: setSeries,
+    page,
+    setPage,
+    hasMore,
+    setHasMore,
+    restored,
+  } = useRestorableList<SeriesData>(`browse:${filterKey}`);
 
   // Local draft state for free-form inputs — only committed to URL on blur/Enter
   const [draftMinChapters, setDraftMinChapters] = useState(minChapters);
@@ -87,15 +101,18 @@ function BrowseContent() {
     } finally {
       setLoadingMore(false);
     }
-  }, [search, type, genre, status, publisher, sort, minChapters, maxChapters, minRating]);
+  }, [search, type, genre, status, publisher, sort, minChapters, maxChapters, minRating, setSeries, setHasMore]);
 
-  // When filters change (fetchPage gets a new reference), reset and load page 1
+  // Load page 1 for a filter combination we don't already hold rows for. The
+  // hook has already swapped in the cached rows (and the offset) for one we do,
+  // so refetching would only throw that away.
+  const loadedKey = useRef<string | null>(null);
   useEffect(() => {
-    setSeries([]);
-    setPage(1);
-    setHasMore(true);
+    if (loadedKey.current === filterKey) return;
+    loadedKey.current = filterKey;
+    if (restored) return;
     fetchPage(1);
-  }, [fetchPage]);
+  }, [filterKey, restored, fetchPage]);
 
   // IntersectionObserver — load next page when sentinel scrolls into view
   useEffect(() => {
@@ -117,7 +134,7 @@ function BrowseContent() {
 
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [hasMore, loadingMore, fetchPage]);
+  }, [hasMore, loadingMore, fetchPage, setPage]);
 
   function updateParam(key: string, value: string) {
     const params = new URLSearchParams(searchParams.toString());

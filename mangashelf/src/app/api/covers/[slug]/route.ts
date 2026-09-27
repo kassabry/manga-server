@@ -1,10 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readFile, stat } from "fs/promises";
 import { join } from "path";
-import { getCoversDir, normalizeSourceForFilename } from "@/lib/covers";
-import { prisma } from "@/lib/db";
+import {
+  getCoversDir,
+  getPreferredCoverSource,
+  normalizeSourceForFilename,
+} from "@/lib/covers";
 
-export const dynamic = "force-dynamic";
+// Covers are the bulk of every page's requests — 30+ per screen of the grid.
+// Each one is an authenticated round trip that runs the auth middleware, a DB
+// lookup and a file read, so the only way to make the grid cheap is for the
+// browser to stop asking.
+//
+// `stale-while-revalidate` is the part that matters for a cold start: the grid
+// paints from cache immediately for up to a week and the revalidation happens
+// off the critical path, instead of 30 blocking conditional requests before
+// anything appears. `max-age` stays short so switching a series' cover in the
+// UI shows up on the next load rather than an hour later.
+const CACHE_CONTROL = "private, max-age=300, stale-while-revalidate=604800";
 
 async function serveCoverFile(
   filePath: string,
@@ -15,7 +28,12 @@ async function serveCoverFile(
     const etag = `"${fileStat.mtimeMs.toString(16)}"`;
 
     if (request.headers.get("if-none-match") === etag) {
-      return new NextResponse(null, { status: 304 });
+      // The 304 has to repeat the caching headers, or the browser revalidates
+      // again on the very next load.
+      return new NextResponse(null, {
+        status: 304,
+        headers: { "Cache-Control": CACHE_CONTROL, ETag: etag },
+      });
     }
 
     const data = await readFile(filePath);
@@ -36,7 +54,7 @@ async function serveCoverFile(
     return new NextResponse(new Uint8Array(data), {
       headers: {
         "Content-Type": contentType,
-        "Cache-Control": "no-cache",
+        "Cache-Control": CACHE_CONTROL,
         "ETag": etag,
       },
     });
@@ -74,12 +92,9 @@ export async function GET(
   // Check DB for preferred cover source (only when no explicit source param)
   if (!sourceParam) {
     try {
-      const series = await prisma.series.findUnique({
-        where: { slug: safeSlug },
-        select: { preferredCoverSource: true },
-      });
-      if (series?.preferredCoverSource) {
-        const safeSource = normalizeSourceForFilename(series.preferredCoverSource);
+      const preferred = await getPreferredCoverSource(safeSlug);
+      if (preferred) {
+        const safeSource = normalizeSourceForFilename(preferred);
         const sourcePath = join(coversDir, `${safeSlug}-${safeSource}.dat`);
         const res = await serveCoverFile(sourcePath, request);
         if (res) return res;

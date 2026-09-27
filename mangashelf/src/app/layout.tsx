@@ -4,6 +4,7 @@ import { Navbar, BottomNav } from "@/components/layout/Navbar";
 import { ThemeProvider } from "@/components/layout/ThemeProvider";
 import { OfflineProvider } from "@/components/offline/OfflineProvider";
 import { DownloadQueueBanner } from "@/components/offline/DownloadControls";
+import { SCROLL_ROOT_ID } from "@/lib/useRestorableList";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -41,7 +42,10 @@ export default function RootLayout({
           <ThemeProvider>
             <OfflineProvider>
               <Navbar />
-              <main className="mx-auto w-full max-w-7xl flex-1 overflow-y-auto px-4 py-6">
+              <main
+                id={SCROLL_ROOT_ID}
+                className="mx-auto w-full max-w-7xl flex-1 overflow-y-auto px-4 py-6"
+              >
                 {children}
               </main>
               <DownloadQueueBanner />

@@ -1,6 +1,7 @@
 import { readFile, writeFile, access, mkdir, stat } from "fs/promises";
 import { join } from "path";
 import JSZip from "jszip";
+import { prisma } from "./db";
 
 // Store covers in the data directory (writable, volume-mounted)
 // rather than public/ which has permission issues with standalone mode
@@ -160,4 +161,36 @@ export async function extractCoverFromBuffer(
 
 export function getCoverUrl(seriesSlug: string): string {
   return `/api/covers/${seriesSlug}`;
+}
+
+/**
+ * Which source's cover a series prefers, memoized briefly.
+ *
+ * A cold grid asks for every visible cover at once, and each ask was its own
+ * SELECT queued behind whatever the auto-scan is doing to SQLite. The answer
+ * only changes when someone picks a different cover, so a short TTL costs
+ * nothing and collapses a screenful of queries into one.
+ */
+const PREFERRED_TTL_MS = 60_000;
+const preferredCache = new Map<string, { value: string | null; at: number }>();
+
+export async function getPreferredCoverSource(slug: string): Promise<string | null> {
+  const hit = preferredCache.get(slug);
+  if (hit && Date.now() - hit.at < PREFERRED_TTL_MS) return hit.value;
+
+  const series = await prisma.series.findUnique({
+    where: { slug },
+    select: { preferredCoverSource: true },
+  });
+  const value = series?.preferredCoverSource ?? null;
+
+  // Bounded so a large library can't pin every slug in memory.
+  if (preferredCache.size > 2000) preferredCache.clear();
+  preferredCache.set(slug, { value, at: Date.now() });
+  return value;
+}
+
+/** Drop a slug's memoized answer after its preferred cover changes. */
+export function forgetPreferredCoverSource(slug: string) {
+  preferredCache.delete(slug);
 }

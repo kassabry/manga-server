@@ -100,6 +100,11 @@ export async function GET(request: NextRequest) {
       orderBy.title = "asc";
   }
 
+  // The infinite-scroll grids never show a total, and on SQLite this COUNT is a
+  // full scan of the filtered set on every page — so callers that don't need it
+  // pass count=0.
+  const wantsCount = searchParams.get("count") !== "0";
+
   const [series, total] = await Promise.all([
     prisma.series.findMany({
       where,
@@ -121,7 +126,7 @@ export async function GET(request: NextRequest) {
         lastChapterAt: true,
       },
     }),
-    prisma.series.count({ where }),
+    wantsCount ? prisma.series.count({ where }) : Promise.resolve(0),
   ]);
 
   // Display the highest chapter number per series (e.g. "Ch. 137"), NOT a count of
@@ -148,7 +153,7 @@ export async function GET(request: NextRequest) {
       series: seriesWithDisplay,
       total,
       page,
-      totalPages: Math.ceil(total / limit),
+      totalPages: wantsCount ? Math.ceil(total / limit) : null,
     },
     {
       headers: { "Cache-Control": "private, max-age=30" },

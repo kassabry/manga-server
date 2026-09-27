@@ -11,6 +11,7 @@ import {
   saveCustomColors,
   type ThemeColors,
 } from "@/lib/themes";
+import { cacheColumns, invalidatePreferences } from "@/lib/prefs";
 
 type LayoutMode = "single" | "double" | "double-manga" | "longstrip";
 type FitMode = "width" | "height" | "original";
@@ -78,6 +79,9 @@ export default function SettingsPage() {
 
   function updatePref(updates: Partial<UserPrefs>) {
     setPrefs((prev) => prev ? { ...prev, ...updates } : null);
+    // The per-load cache would otherwise hand the old values to the next page.
+    invalidatePreferences();
+    if (updates.carouselColumns) cacheColumns(updates.carouselColumns);
     // Debounced save to server
     fetch("/api/user/preferences", {
       method: "PUT",
