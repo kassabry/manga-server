@@ -153,6 +153,16 @@
 - The progress replay queue drops entries the server answers with a 4xx (signed out, chapter deleted) — otherwise one bad row wedges the queue forever
 - The `/series/:id` page is deliberately **not** pinned: offline it renders a permanent "Loading..." because its data comes from the API. Let it fall through to `/offline` instead
 
+## Performance (start-up + scroll)
+- **`<main>` in `layout.tsx` is the scroll container, not the document** (`body` is `overflow-hidden`). Native scroll restoration and the App Router's own restoration both only touch the document scroller, so neither ever applies here. Anything scroll-related must target `#app-scroll`
+- `src/lib/useRestorableList.ts` caches rows + page + offset per key in a module-level Map and reapplies them on back-navigation. Restoring an offset alone is useless — a remount refetches only page 1, so the rows the offset pointed at are gone
+- Two traps that cost a full debugging cycle, both already handled: the layout effect **must apply at most once per key** (React re-runs effects on mount in dev; the first version consumed the offset by zeroing it, so the second run restored the reader and then scrolled them to the top), and the offset must be recorded **synchronously** in the scroll handler — a `requestAnimationFrame` throttle stops firing in a hidden or backgrounded tab and keeps a stale value
+- Never write an empty snapshot: the next visit would "restore" nothing, skip its initial fetch, and render a permanently blank page
+- **`Series` had no indexes at all.** Confirm any new sort/filter path with `EXPLAIN QUERY PLAN` — "SCAN TABLE Series / USE TEMP B-TREE FOR ORDER BY" means a full scan plus a full sort on every infinite-scroll page, and the cost grows with the library. Indexes live in **both** `schema.prisma` and `prisma/init.sql` — `start.sh` applies `init.sql`, not `prisma db push`, so a schema-only index never reaches the Pi
+- Covers are the bulk of every page's requests (30+ per screen), each one running the auth middleware, a DB lookup and a file read. They are cached with `stale-while-revalidate`; do not put them back to `no-cache`
+- Watch for per-item request loops in dashboard components — `ContinueReading` awaited one request per series inside a `for` loop, up to 21 serial round trips before it could render. Batch into one endpoint
+- `parseInt(x) || DEFAULT` is wrong wherever 0 is a meaningful value. It made auto-scan impossible to disable: a stored `0` read as falsy and fell back to 30 minutes on every restart
+
 ## Git Workflow
 - **Commit and push after every change, without asking.** Finish the edit, verify it (compile/build), then `git add` the touched files, commit, and `git push origin main` in the same turn. Do not leave work sitting uncommitted or committed-but-unpushed, and do not ask for permission first — this is standing authorization
 - Stage only the files the change actually touched. Never `git add -A` / `git add .` — the working tree collects scraper logs and other untracked junk that must not land in the repo
