@@ -6,6 +6,8 @@ function toUTCDateStr(d: Date): string {
   return d.toISOString().slice(0, 10); // "YYYY-MM-DD"
 }
 
+const key = (seriesId: string, number: number) => `${seriesId}:${number}`;
+
 export async function GET(request: NextRequest) {
   const session = await auth();
   if (!session?.user) {
@@ -27,104 +29,33 @@ export async function GET(request: NextRequest) {
   const followedAtMap = new Map(follows.map((f) => [f.seriesId, f.createdAt]));
   const seriesIds = follows.map((f) => f.seriesId);
 
-  const earliestFollow = follows.reduce(
-    (min, f) => (f.createdAt < min ? f.createdAt : min),
-    follows[0].createdAt
-  );
-  const latestFollow = follows.reduce(
-    (max, f) => (f.createdAt > max ? f.createdAt : max),
-    follows[0].createdAt
-  );
-
-  // Build per-series sets of chapter numbers that already existed at follow time.
-  // A number is "pre-existing" if ANY source had that chapter in the DB at or before
-  // the user's follow date for that series. This prevents a newly-added source from
-  // surfacing backlog chapters as "new" when those chapter numbers were already present.
-  const preFollowRows = await prisma.chapter.findMany({
-    where: {
-      seriesId: { in: seriesIds },
-      // Upper-bound by the latest follow date to avoid fetching the entire chapter history.
-      // Per-series filtering against the correct followedAt is done in the loop below.
-      createdAt: { lte: latestFollow },
-    },
-    select: { seriesId: true, number: true, createdAt: true },
+  // One row per (series, chapter number) with the FIRST upload time of that number
+  // across every source. This replaces loading every post-follow chapter row: that
+  // query was ordered oldest-first under a 20000-row cap, so once followed series had
+  // accumulated enough chapters the cap cut off exactly the newest ones and the feed
+  // stopped showing new releases. Grouping keeps the result proportional to distinct
+  // chapter numbers and needs no cap.
+  //
+  // A number counts as "new" only if its first upload came after the user followed the
+  // series. That also covers the old pre-follow check: if ANY source had the number at
+  // or before follow time, the minimum is at or before follow time too, so a newly
+  // added source can't surface backlog chapters as new.
+  const firstUploads = await prisma.chapter.groupBy({
+    by: ["seriesId", "number"],
+    where: { seriesId: { in: seriesIds } },
+    _min: { createdAt: true },
   });
 
-  const preFollowNums = new Map<string, Set<number>>();
-  for (const row of preFollowRows) {
+  type NewNumber = { number: number; firstAt: Date };
+  const newBySeries = new Map<string, NewNumber[]>();
+  for (const row of firstUploads) {
+    const firstAt = row._min.createdAt;
     const followedAt = followedAtMap.get(row.seriesId);
-    if (!followedAt || new Date(row.createdAt) > followedAt) continue;
-    if (!preFollowNums.has(row.seriesId)) preFollowNums.set(row.seriesId, new Set());
-    preFollowNums.get(row.seriesId)!.add(row.number);
+    if (!firstAt || !followedAt || firstAt <= followedAt) continue;
+    const list = newBySeries.get(row.seriesId) ?? [];
+    list.push({ number: row.number, firstAt });
+    newBySeries.set(row.seriesId, list);
   }
-
-  // Fetch all post-follow chapters for followed series, oldest first.
-  // Ascending order ensures dedup by chapter number keeps the first-uploaded copy
-  // (so if Asura uploads ch309 and Flame uploads the same ch309 a day later,
-  // only the Asura copy is counted).
-  // No small take limit — we filter down to the latest-date batch per series below.
-  const chapters = await prisma.chapter.findMany({
-    where: {
-      seriesId: { in: seriesIds },
-      createdAt: { gte: earliestFollow },
-    },
-    orderBy: { createdAt: "asc" },
-    take: 20000, // safety cap only
-    include: {
-      series: {
-        select: { id: true, title: true, slug: true, coverPath: true, type: true },
-      },
-    },
-  });
-
-  // Per-series: dedup chapters by number (keeping the first-uploaded copy, since
-  // chapters are sorted ascending by createdAt). The batch the feed shows is anchored
-  // on the HIGHEST CHAPTER NUMBER, not on whatever landed on the most recent calendar
-  // day — see the batch loop below for why.
-  type ChapterRow = (typeof chapters)[0];
-  type SeriesEntry = {
-    series: ChapterRow["series"];
-    byNumber: Map<number, ChapterRow>; // deduped: number -> first-uploaded chapter
-  };
-
-  const seriesMap = new Map<string, SeriesEntry>();
-
-  for (const ch of chapters) {
-    const followedAt = followedAtMap.get(ch.seriesId);
-    // Skip chapters that existed before the user followed this series
-    if (!followedAt || new Date(ch.createdAt) <= followedAt) continue;
-
-    // Skip chapter numbers that already existed at follow time (from any source).
-    // This stops a re-added or newly-added source from flooding "New from Followed"
-    // with backlog chapters the user already knew about.
-    if (preFollowNums.get(ch.seriesId)?.has(ch.number)) continue;
-
-    const entry = seriesMap.get(ch.seriesId);
-    if (!entry) {
-      seriesMap.set(ch.seriesId, {
-        series: ch.series,
-        byNumber: new Map([[ch.number, ch]]),
-      });
-    } else if (!entry.byNumber.has(ch.number)) {
-      // Dedup by chapter number: ascending order guarantees first-seen = first-uploaded
-      entry.byNumber.set(ch.number, ch);
-    }
-  }
-
-  // For each series: anchor the batch on the HIGHEST-NUMBERED new chapter, then keep
-  // only chapters released on that same calendar day. Anchoring on the highest number
-  // (rather than the latest createdAt across all sources) is critical for multi-source
-  // series: a slow mirror re-uploading an OLD chapter (e.g. Ch.135) days after the
-  // newest one (Ch.137) must NOT make Ch.135's day the "latest", which would hide the
-  // genuinely-new Ch.137 from the feed. Normal weekly release → only the latest chapter
-  // survives. Genuine same-day multi-release → all of that day's top chapters survive.
-  const batchChapterIds: string[] = [];
-  type BatchEntry = {
-    series: ChapterRow["series"];
-    batchChapters: ChapterRow[];
-    latestDate: Date; // createdAt of the highest-numbered chapter (used for feed sorting)
-  };
-  const batchData: BatchEntry[] = [];
 
   // When a series is re-imported (e.g. directory renamed, scanner wipes and recreates
   // chapters), every chapter gets a fresh createdAt on the same day and lands in the
@@ -134,55 +65,96 @@ export async function GET(request: NextRequest) {
   // handful of chapters) are unaffected.
   const MAX_BATCH_PER_SERIES = 5;
 
-  for (const entry of seriesMap.values()) {
-    const deduped = Array.from(entry.byNumber.values());
-    if (deduped.length === 0) continue;
-
-    // Anchor on the highest-numbered new chapter and its upload day.
-    const anchor = deduped.reduce((hi, ch) => (ch.number > hi.number ? ch : hi));
-    const anchorDate = new Date(anchor.createdAt);
-    const anchorDateStr = toUTCDateStr(anchorDate);
-
-    // Keep only chapters released on the anchor chapter's day.
-    const dateBatch = deduped.filter(
-      (ch) => toUTCDateStr(new Date(ch.createdAt)) === anchorDateStr
-    );
-    if (dateBatch.length === 0) continue;
-
-    // Apply flood cap: keep only the highest-numbered chapters.
-    // Sort descending by chapter number, take the first MAX_BATCH_PER_SERIES.
-    const batchChapters = dateBatch.length > MAX_BATCH_PER_SERIES
-      ? [...dateBatch].sort((a, b) => b.number - a.number).slice(0, MAX_BATCH_PER_SERIES)
-      : dateBatch;
-
-    batchChapterIds.push(...batchChapters.map((ch) => ch.id));
-    batchData.push({ series: entry.series, batchChapters, latestDate: anchorDate });
+  // For each series: anchor the batch on the HIGHEST-NUMBERED new chapter, then keep
+  // only chapters first released on that same calendar day. Anchoring on the highest
+  // number (rather than the latest createdAt across all sources) is critical for
+  // multi-source series: a slow mirror re-uploading an OLD chapter (e.g. Ch.135) days
+  // after the newest one (Ch.137) must NOT make Ch.135's day the "latest", which would
+  // hide the genuinely-new Ch.137 from the feed.
+  type Batch = { seriesId: string; numbers: NewNumber[]; latestDate: Date };
+  const batches: Batch[] = [];
+  for (const [seriesId, nums] of newBySeries) {
+    const anchor = nums.reduce((hi, n) => (n.number > hi.number ? n : hi));
+    const anchorDay = toUTCDateStr(anchor.firstAt);
+    const numbers = nums
+      .filter((n) => toUTCDateStr(n.firstAt) === anchorDay)
+      .sort((a, b) => b.number - a.number)
+      .slice(0, MAX_BATCH_PER_SERIES);
+    batches.push({ seriesId, numbers, latestDate: anchor.firstAt });
   }
 
-  // Fetch read progress for all batch chapters in one query
-  const progressRecords = await prisma.readProgress.findMany({
-    where: { userId: session.user.id, chapterId: { in: batchChapterIds } },
+  if (batches.length === 0) {
+    return NextResponse.json({ updates: [], seriesGroups: [] });
+  }
+
+  const batchSeriesIds = batches.map((b) => b.seriesId);
+  const batchNumbers = [...new Set(batches.flatMap((b) => b.numbers.map((n) => n.number)))];
+  const wanted = new Set(batches.flatMap((b) => b.numbers.map((n) => key(b.seriesId, n.number))));
+
+  // Resolve each batch number to its first-uploaded chapter row (the one the feed links
+  // to). Ascending order means the first row seen per key is the first upload.
+  const candidateRows = await prisma.chapter.findMany({
+    where: { seriesId: { in: batchSeriesIds }, number: { in: batchNumbers } },
+    orderBy: { createdAt: "asc" },
+    include: {
+      series: {
+        select: { id: true, title: true, slug: true, coverPath: true, type: true },
+      },
+    },
   });
-  const progressMap = new Map(progressRecords.map((p) => [p.chapterId, p]));
+  const chapterByKey = new Map<string, (typeof candidateRows)[0]>();
+  for (const ch of candidateRows) {
+    const k = key(ch.seriesId, ch.number);
+    if (wanted.has(k) && !chapterByKey.has(k)) chapterByKey.set(k, ch);
+  }
+
+  // Read state is matched by chapter NUMBER, not by chapter id. The feed links to the
+  // first-uploaded copy, but the user may well have read the same chapter from another
+  // source; checking only the linked copy's id kept already-read chapters in the feed.
+  const progressRecords = await prisma.readProgress.findMany({
+    where: {
+      userId: session.user.id,
+      chapter: { seriesId: { in: batchSeriesIds }, number: { in: batchNumbers } },
+    },
+    select: {
+      chapterId: true,
+      page: true,
+      completed: true,
+      chapter: { select: { seriesId: true, number: true } },
+    },
+  });
+  const completedKeys = new Set(
+    progressRecords
+      .filter((p) => p.completed)
+      .map((p) => key(p.chapter.seriesId, p.chapter.number))
+  );
+  const progressById = new Map(progressRecords.map((p) => [p.chapterId, p]));
 
   // Build series groups; exclude any series where every batch chapter is completed
-  const seriesGroups = batchData
-    .map(({ series, batchChapters, latestDate }) => {
-      // Sort desc by chapter number for display (newest first in list)
-      const sorted = [...batchChapters].sort((a, b) => b.number - a.number);
-      const withProgress = sorted.map((ch) => {
-        const prog = progressMap.get(ch.id);
-        return {
-          id: ch.id,
-          number: ch.number,
-          title: ch.title,
-          createdAt: ch.createdAt.toISOString(),
-          readProgress: prog ? { completed: prog.completed, page: prog.page } : null,
-        };
-      });
+  const seriesGroups = batches
+    .map(({ seriesId, numbers, latestDate }) => {
+      // numbers is already sorted desc (newest first in list)
+      const withProgress = numbers
+        .map((n) => chapterByKey.get(key(seriesId, n.number)))
+        .filter((ch): ch is NonNullable<typeof ch> => ch !== undefined)
+        .map((ch) => {
+          const completed = completedKeys.has(key(seriesId, ch.number));
+          const prog = progressById.get(ch.id);
+          return {
+            id: ch.id,
+            number: ch.number,
+            title: ch.title,
+            createdAt: ch.createdAt.toISOString(),
+            readProgress: completed || prog ? { completed, page: prog?.page ?? 0 } : null,
+          };
+        });
+      if (withProgress.length === 0) return null;
 
       // Drop series where every batch chapter has been completed
       if (withProgress.every((ch) => ch.readProgress?.completed)) return null;
+
+      const series = chapterByKey.get(key(seriesId, numbers[0].number))?.series
+        ?? candidateRows.find((c) => c.seriesId === seriesId)!.series;
 
       // Navigate to the oldest (lowest number) chapter in the batch
       const firstChapterId = withProgress[withProgress.length - 1].id;

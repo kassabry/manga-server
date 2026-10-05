@@ -20,6 +20,11 @@ async function upsertProgress(request: NextRequest) {
     ? 0
     : Math.min(1, Math.max(0, typeof pageOffset === "number" ? pageOffset : 0));
 
+  // `completed` is sticky here. The reader saves its position 2s after opening any
+  // chapter and again on unload/backgrounding, so merely re-opening a finished chapter
+  // (or a stale write replayed from the offline queue) would send completed:false and
+  // silently un-read it. Un-marking is an explicit action and goes through
+  // /api/user/progress/[seriesId]/mark-read instead.
   const progress = await prisma.readProgress.upsert({
     where: {
       userId_chapterId: { userId: session.user.id, chapterId },
@@ -27,7 +32,7 @@ async function upsertProgress(request: NextRequest) {
     update: {
       page: page ?? 0,
       pageOffset: safeOffset,
-      completed: completed ?? false,
+      ...(completed ? { completed: true } : {}),
       readAt: new Date(),
     },
     create: {

@@ -140,6 +140,8 @@
 
 ## Front-end Patterns (`mangashelf/src/`)
 - Series page chapter count uses `displayChapterCount` — shows `max(chapters per source)` when "All Sources" is active, not the sum, to avoid inflated counts for multi-source series
+- **`PUT /api/user/progress` never sets `completed` back to false.** The reader saves position 2s after opening any chapter and on unload, so re-opening a finished chapter used to un-read it. Un-marking goes only through `mark-read`
+- **New from Followed (`/api/user/updates`) groups by `(seriesId, number)` with `_min(createdAt)`; do not go back to loading chapter rows under a `take` cap.** The old oldest-first `take: 20000` cut off exactly the newest chapters once followed series grew. Read state there is matched by chapter number across sources, not by the linked copy's id
 - Python type hints `list[X]` / `X | Y` require Python 3.10+; Pi may run older — use `List[X]` from `typing` and avoid union shorthand in scripts
 
 ## Offline Downloads (`mangashelf/public/sw.js` + `src/lib/offline/`)
