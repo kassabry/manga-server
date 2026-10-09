@@ -4642,7 +4642,11 @@ class DrakeFullScraper(BaseSiteScraper):
                 logger.debug(f"Chapter {chapter.number} is locked (redacted pages) — skipping")
                 return []
             if page.get('isEncrypted') or page.get('tiles') or page.get('hasStrips') or page.get('hasFragments'):
-                logger.warning(f"Chapter {chapter.number} uses protected page images — skipping")
+                # Free chapter, but Drake serves the images as encrypted tiles
+                # that only its in-browser reader decrypts.  Not a paywall, and
+                # deliberately not worked around — skip it.
+                logger.warning(f"Chapter {chapter.number}: Drake serves these page images encrypted "
+                               f"(not a paywall) — not downloadable, skipping")
                 return []
             src = self._rsc_str(page.get('imageUrl'))
             if src:
