@@ -53,8 +53,8 @@
 - **The series page embeds only the first 100 chapters** (`"chapters":[...]`) even when `chapterCount` is higher. Any chapter page has the full list as `"allChapters"`, so `get_chapters` fetches the first chapter when the counts disagree
 - Page images: `"chapter":{"pages":[{"imageUrl": ...}]}` on the chapter page, plain `/uploads/...` URLs, no hotlink protection
 - **Never anchor RSC lookups on ID prefixes.** Older rows are `drake-c-123` / `drake-s-slug`; newer ones are opaque cuids. Match on shape (`_is_chapter_list`, a dict with `pages`, series `slug` == canonical slug)
-- Coin-locked chapters: `isLocked` + `hasAccess:false` in the list, and every page `isRedacted` with an empty `imageUrl`. They are filtered out in `get_chapters`, not downloaded. Pages flagged `isEncrypted`/tiles/strips/fragments are skipped too
-- Encrypted chapters are **free, not paywalled** — the browser opens them fine, which looks like a scraper bug. Each page is split into tiles, each AES-encrypted with its own `iv`, and decrypted client-side. Seen on Maxed Strength Necromancer ch.142+. Deliberately not circumvented; get those chapters from another source
+- Coin-locked chapters: `isLocked` + `hasAccess:false` in the list, and every page `isRedacted` with an empty `imageUrl`. They are filtered out in `get_chapters`, not downloaded
+- **Do not skip on `isEncrypted` / `tiles` / `hasStrips`.** Those flags look like the images are scrambled, but `imageUrl` still serves the full plain image to an ordinary request. The first version bailed on the flag and skipped every chapter of Maxed Strength Necromancer from ch.142 on; all 21 pages of ch.142 decode and match the declared `width`/`height`. Only an empty `imageUrl` (redacted/locked) is a real gap
 
 ### Image downloads (`_download_image` / `_download_pages`)
 - `cdn.asurascans.com` throttles **bursts, not requests**: it answers `429` with `Retry-After: 10`. Measured from a residential IP, 8 workers over one 102-page chapter already drew one 429; behind the container's shared VPN exit it escalates to whole chapters refused, and stays refused for the chapters after

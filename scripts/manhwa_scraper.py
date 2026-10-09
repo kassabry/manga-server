@@ -4641,16 +4641,17 @@ class DrakeFullScraper(BaseSiteScraper):
             if page.get('isRedacted'):
                 logger.debug(f"Chapter {chapter.number} is locked (redacted pages) — skipping")
                 return []
-            if page.get('isEncrypted') or page.get('tiles') or page.get('hasStrips') or page.get('hasFragments'):
-                # Free chapter, but Drake serves the images as encrypted tiles
-                # that only its in-browser reader decrypts.  Not a paywall, and
-                # deliberately not worked around — skip it.
-                logger.warning(f"Chapter {chapter.number}: Drake serves these page images encrypted "
-                               f"(not a paywall) — not downloadable, skipping")
-                return []
+            # Pages flagged isEncrypted (with tiles/strips) still carry a plain
+            # imageUrl that serves the full, unscrambled image — verified on
+            # Maxed Strength Necromancer ch.142: all 21 decode and match the
+            # declared width/height.  Only a missing URL is a real gap; the
+            # magic-byte check in _download_image catches anything that is not
+            # an image, and _MIN_PAGE_RATIO keeps a partial CBZ from being written.
             src = self._rsc_str(page.get('imageUrl'))
-            if src:
-                urls.append(self._absolute(src))
+            if not src:
+                logger.warning(f"Chapter {chapter.number}: page {page.get('pageNumber')} has no image URL — skipping chapter")
+                return []
+            urls.append(self._absolute(src))
         return urls
 
 
