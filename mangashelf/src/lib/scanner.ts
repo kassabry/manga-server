@@ -853,6 +853,7 @@ async function scanSeries(
           "asurascans.com": "AsuraScans",
           "flamecomics.xyz": "FlameComics",
           "drakecomic.org": "DrakeComic",
+          "drakecomic.net": "DrakeComic",
           "mangadex.org": "MangaDex",
           "lightnovelpub.com": "LightNovelPub",
           "novelbin.com": "NovelBin",

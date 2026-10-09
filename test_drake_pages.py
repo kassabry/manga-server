@@ -49,7 +49,7 @@ def check(label, cond):
 
 # ── Test 1: _extract_drake_pages with .reading-content .page-break img ───────
 print("\nTest 1: _extract_drake_pages — .reading-content .page-break img")
-scraper = ms.DrakeFullScraper.__new__(ms.DrakeFullScraper)
+scraper = ms.MadaraBaseScraper.__new__(ms.MadaraBaseScraper)
 
 html = """
 <div class="reading-content">
@@ -112,7 +112,7 @@ good_html = """
 </div>
 """
 
-scraper2 = ms.DrakeFullScraper.__new__(ms.DrakeFullScraper)
+scraper2 = ms.MadaraBaseScraper.__new__(ms.MadaraBaseScraper)
 scraper2._use_flaresolverr = True
 scraper2._fs_cookies_applied = True  # simulate already having cached cookies
 
@@ -131,7 +131,7 @@ check("_fs_cookies_applied still True after success", scraper2._fs_cookies_appli
 # ── Test 6: get_pages FlareSolverr path — FlareSolverr failure → [] ──────────
 print("\nTest 6: get_pages() in FlareSolverr mode — FlareSolverr failure returns []")
 
-scraper3 = ms.DrakeFullScraper.__new__(ms.DrakeFullScraper)
+scraper3 = ms.MadaraBaseScraper.__new__(ms.MadaraBaseScraper)
 scraper3._use_flaresolverr = True
 scraper3._fs_cookies_applied = False
 
@@ -160,7 +160,7 @@ check("no AttributeError crash when driver is None", True)  # survived to here
 # ── Test 8: get_chapters — {{number}} template links are filtered ─────────────
 print("\nTest 8: get_chapters() — JS template placeholder {{number}} links excluded")
 
-scraper8 = ms.DrakeFullScraper.__new__(ms.DrakeFullScraper)
+scraper8 = ms.MadaraBaseScraper.__new__(ms.MadaraBaseScraper)
 scraper8._use_flaresolverr = True
 scraper8._fs_cookies_applied = True
 scraper8.BASE_URL = "https://drakecomic.org"

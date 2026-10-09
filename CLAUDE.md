@@ -43,8 +43,17 @@
 - `get_scraper(site, headless, canvas, limit, max_pages)` — always pass all relevant params
 - `max_pages` is fully wired through the codebase — new sites just need `if page > (self.max_pages or 200):` in their loop
 - BeautifulSoup: always use `get_text(separator=' ', strip=True)` — without separator, `Chapter 1<span>3 years ago</span>` becomes `"Chapter 13 years ago"` and regex captures the wrong number
-- Drake debug: if 0 series returned, check page title and body classes logged at DEBUG level (`--debug` flag)
+- `MadaraBaseScraper` is the old Drake class, kept as the shared WordPress/Madara base for ManhuaFast and Reset Scans. Drake itself no longer uses it
 - ManhuaTo uses FlareSolverr on ARM; `_fs_cookies_applied` caches session cookies after first solve
+
+### Drake (`DrakeFullScraper`)
+- **Moved to `drakecomic.net` in Oct 2026 and off WordPress entirely** — now a Next.js app. Every Madara selector is gone. Old `drakecomic.org/manga/{slug}/` URLs 301 to `/series/comic/{slug}`; slugs carried over, and `_normalize_url` rewrites legacy URLs so tracked series keep working
+- No browser and no FlareSolverr needed: pages are server-rendered and the data sits in the inlined RSC payload (`self.__next_f.push([1,"..."])` chunks). `_rsc_text` decodes and joins them; `_fetch_html` only falls back to FlareSolverr if a Cloudflare challenge appears
+- Catalog: `/sitemap.xml` -> `series-sitemap-N.xml` (title + cover per series). `/series?page=N` is the fallback; its cards carry a type badge link ("MANHUA") that is not the title — take the cover `img alt`
+- **The series page embeds only the first 100 chapters** (`"chapters":[...]`) even when `chapterCount` is higher. Any chapter page has the full list as `"allChapters"`, so `get_chapters` fetches the first chapter when the counts disagree
+- Page images: `"chapter":{"pages":[{"imageUrl": ...}]}` on the chapter page, plain `/uploads/...` URLs, no hotlink protection
+- **Never anchor RSC lookups on ID prefixes.** Older rows are `drake-c-123` / `drake-s-slug`; newer ones are opaque cuids. Match on shape (`_is_chapter_list`, a dict with `pages`, series `slug` == canonical slug)
+- Coin-locked chapters: `isLocked` + `hasAccess:false` in the list, and every page `isRedacted` with an empty `imageUrl`. They are filtered out in `get_chapters`, not downloaded. Pages flagged `isEncrypted`/tiles/strips/fragments are skipped too
 
 ### Image downloads (`_download_image` / `_download_pages`)
 - `cdn.asurascans.com` throttles **bursts, not requests**: it answers `429` with `Retry-After: 10`. Measured from a residential IP, 8 workers over one 102-page chapter already drew one 429; behind the container's shared VPN exit it escalates to whole chapters refused, and stays refused for the chapters after

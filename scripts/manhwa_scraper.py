@@ -12,7 +12,7 @@ Features:
 Supports:
 - asuracomic.net
 - flamecomics.xyz
-- drakecomic.org
+- drakecomic.net
 - manhuafast.net
 - reset-scans.org
 
@@ -757,7 +757,7 @@ class BaseSiteScraper:
                 logger.warning(f"FlareSolverr failed for {url}: {e}")
                 # Fall through to Selenium if available — but only if a driver
                 # can actually be created.  Sites that run in pure-FlareSolverr
-                # mode (e.g. DrakeFullScraper on ARM) never init self.driver, so
+                # mode (e.g. MadaraBaseScraper on ARM) never init self.driver, so
                 # attempting driver.get() here would raise AttributeError.
                 if not self.driver:
                     return BeautifulSoup("", 'html.parser')
@@ -3680,11 +3680,14 @@ class ManhuaToScraper(BaseSiteScraper):
         }
 
 
-class DrakeFullScraper(BaseSiteScraper):
-    """Full site scraper for drakecomic.org"""
+class MadaraBaseScraper(BaseSiteScraper):
+    """Shared base for Madara / WP-manga WordPress theme sites.
 
-    BASE_URL = "https://drakecomic.org"
-    SITE_NAME = "drake"
+    Originally the Drake Comics scraper; Drake has since moved off WordPress
+    (see DrakeFullScraper), but ManhuaFast and Reset Scans still run this
+    theme and inherit everything here.  Subclasses set BASE_URL / SITE_NAME.
+    """
+
     CLOUDFLARE_SITE = True
 
     # ManhuaFast/Drake CDNs 504 under heavy parallel load — use fewer workers
@@ -3696,7 +3699,7 @@ class DrakeFullScraper(BaseSiteScraper):
         if not self._is_arm() and not self._use_flaresolverr:
             # On x86, force non-headless for UC Cloudflare bypass
             if headless:
-                logger.info("Drake Comics requires non-headless mode (Cloudflare protection). Overriding to visible browser.")
+                logger.info(f"{self.SITE_NAME} requires non-headless mode (Cloudflare protection). Overriding to visible browser.")
             self.headless = False
 
     def _init_driver(self):
@@ -3713,7 +3716,7 @@ class DrakeFullScraper(BaseSiteScraper):
             return
 
         if UC_AVAILABLE:
-            logger.info("Using undetected-chromedriver (Drake/Cloudflare mode)")
+            logger.info("Using undetected-chromedriver (Madara/Cloudflare mode)")
             options = uc.ChromeOptions()
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
@@ -4294,6 +4297,359 @@ class DrakeFullScraper(BaseSiteScraper):
         return False
 
 
+class DrakeFullScraper(BaseSiteScraper):
+    """Full site scraper for drakecomic.net (formerly drakecomic.org).
+
+    Drake moved off WordPress/Madara to a custom Next.js app in Oct 2026.  None
+    of the old selectors exist any more; everything now comes from the React
+    Server Components payload the server inlines into every page as
+    ``self.__next_f.push([1, "..."])`` script chunks:
+
+    - Catalog:  /series-sitemap-N.xml (from /sitemap.xml) lists every series
+                with title and cover.  /series?page=N is the fallback.
+    - Series:   /series/comic/{slug} -> ``"series":{...}`` holds description,
+                genres, status, cover; ``"chapters":[...]`` holds only the
+                first 100 chapters.
+    - Chapter:  /series/comic/{slug}/chapter/{number} -> ``"allChapters"`` is
+                the full list with ``isLocked``/``hasAccess``, and
+                ``"chapter":{"pages":[...]}`` carries each page's ``imageUrl``.
+
+    No browser is needed: the payload is server-rendered, so a plain request
+    returns the image URLs directly.  Coin-locked chapters ship with every page
+    ``isRedacted`` and an empty ``imageUrl``; those are skipped, not counted as
+    failures.  Pages flagged encrypted/tiled/fragmented are likewise skipped
+    rather than downloaded as scrambled images.
+
+    Old ``drakecomic.org/manga/{slug}/`` URLs are rewritten to the new form —
+    slugs carried over unchanged.
+    """
+
+    BASE_URL = "https://drakecomic.net"
+    SITE_NAME = "drake"
+    # Served without a challenge as of the migration.  If Cloudflare comes
+    # back, _fetch_html falls through to FlareSolverr on its own.
+    CLOUDFLARE_SITE = False
+    MIN_DELAY = 1
+    MAX_DELAY = 2
+    _DOWNLOAD_WORKERS = 4
+
+    _RSC_CHUNK = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)')
+
+    # ---- fetching -------------------------------------------------------
+
+    def _fetch_html(self, url: str) -> str:
+        """GET a page, retrying 429/5xx; route through FlareSolverr on a challenge."""
+        self._delay()
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = self.session.get(url, timeout=30)
+                resp.encoding = 'utf-8'
+                if resp.status_code in (403, 503) and self._is_cloudflare_challenge(resp.text):
+                    if not self._flaresolverr_available():
+                        raise RuntimeError(f"Cloudflare challenge on {url} and FlareSolverr is unavailable")
+                    logger.info(f"Cloudflare challenge on {url} — using FlareSolverr")
+                    html, cookies, user_agent = self._flaresolverr_get(url)
+                    self._apply_flaresolverr_cookies(cookies, user_agent)
+                    return html
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise RuntimeError(f"HTTP {resp.status_code}")
+                resp.raise_for_status()
+                return resp.text
+            except requests.HTTPError:
+                raise  # 404 etc. are not transient
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    wait = 15 * (attempt + 1)
+                    logger.warning(f"Fetch failed for {url} ({e}) — retrying in {wait}s")
+                    time.sleep(wait)
+        raise RuntimeError(f"Fetch failed for {url}: {last_err}")
+
+    def _get_soup(self, url: str, use_selenium: bool = False) -> BeautifulSoup:
+        """Plain HTTP for every page — the content is server-rendered."""
+        try:
+            return BeautifulSoup(self._fetch_html(self._normalize_url(url)), 'html.parser')
+        except Exception as e:
+            logger.warning(f"Could not fetch {url}: {e}")
+            return BeautifulSoup("", 'html.parser')
+
+    def _init_driver(self):
+        """Never needs a browser."""
+        return
+
+    @classmethod
+    def _normalize_url(cls, url: str) -> str:
+        """Rewrite legacy drakecomic.org URLs to the drakecomic.net layout."""
+        m = re.match(r'https?://(?:www\.)?drakecomic\.(?:org|net)/manga/([^/?#]+)', url)
+        if m:
+            return f"{cls.BASE_URL}/series/comic/{m.group(1)}"
+        return re.sub(r'^https?://(?:www\.)?drakecomic\.org', cls.BASE_URL, url).rstrip('/')
+
+    # ---- RSC payload ----------------------------------------------------
+
+    @classmethod
+    def _rsc_text(cls, soup: BeautifulSoup) -> str:
+        """Concatenate the decoded RSC chunks inlined in the page."""
+        parts = []
+        for script in soup.find_all('script'):
+            body = script.string or ''
+            for literal in cls._RSC_CHUNK.findall(body):
+                try:
+                    parts.append(json.loads(literal))
+                except ValueError:
+                    continue
+        return ''.join(parts)
+
+    @staticmethod
+    def _rsc_values(text: str, key: str, prefix: str = ''):
+        """Yield each JSON value that follows ``"key":<prefix>`` in text."""
+        needle = f'"{key}":{prefix}'
+        decoder = json.JSONDecoder()
+        idx = text.find(needle)
+        while idx >= 0:
+            try:
+                value, _ = decoder.raw_decode(text, idx + len(needle) - len(prefix))
+                yield value
+            except ValueError:
+                pass
+            idx = text.find(needle, idx + len(needle))
+
+    @classmethod
+    def _rsc_value(cls, text: str, key: str, prefix: str = '', accept=None):
+        """First value for ``key`` that passes ``accept`` (default: any).
+
+        IDs are not a usable anchor: older rows are ``drake-c-123`` while newer
+        ones are opaque cuids, so match on shape instead.
+        """
+        for value in cls._rsc_values(text, key, prefix):
+            if accept is None or accept(value):
+                return value
+        return None
+
+    @staticmethod
+    def _is_chapter_list(value) -> bool:
+        return (isinstance(value, list) and bool(value) and isinstance(value[0], dict)
+                and 'number' in value[0] and 'isLocked' in value[0])
+
+    @classmethod
+    def _rsc_series(cls, soup: BeautifulSoup, rsc: str = None) -> dict:
+        """The page's own series object.
+
+        Anchored on the canonical slug — pages also embed related/popular
+        series objects, and the first one in the payload is not always ours.
+        """
+        rsc = cls._rsc_text(soup) if rsc is None else rsc
+        canonical = soup.select_one('link[rel="canonical"]')
+        m = re.search(r'/series/comic/([^/?#]+)', canonical.get('href', '') if canonical else '')
+        slug = m.group(1) if m else None
+        series = cls._rsc_value(
+            rsc, 'series', '{"id":"',
+            lambda v: isinstance(v, dict) and (slug is None or v.get('slug') == slug))
+        return series or {}
+
+    @staticmethod
+    def _rsc_str(value) -> str:
+        """RSC strings starting with '$' are references to other chunks, not data."""
+        return value.strip() if isinstance(value, str) and not value.startswith('$') else ''
+
+    @staticmethod
+    def _format_number(num) -> str:
+        n = float(num)
+        return str(int(n)) if n.is_integer() else repr(n)
+
+    def _absolute(self, path: str) -> str:
+        return path if path.startswith('http') else self.BASE_URL + path
+
+    # ---- catalog --------------------------------------------------------
+
+    def get_all_series(self) -> List[Series]:
+        logger.info("Fetching all series from Drake Comics...")
+        all_series = self._series_from_sitemap() or self._series_from_catalog()
+        if self.limit:
+            all_series = all_series[:self.limit]
+        logger.info(f"Total series found: {len(all_series)}")
+        return all_series
+
+    def _series_from_sitemap(self) -> List[Series]:
+        try:
+            index = BeautifulSoup(self._fetch_html(f"{self.BASE_URL}/sitemap.xml"), 'html.parser')
+            sitemap_urls = [loc.get_text(strip=True) for loc in index.find_all('loc')
+                            if 'series-sitemap' in loc.get_text()]
+        except Exception as e:
+            logger.warning(f"Sitemap index unavailable ({e}) — falling back to catalog pages")
+            return []
+
+        found: List[Series] = []
+        seen = set()
+        for sm_url in sitemap_urls:
+            try:
+                sm = BeautifulSoup(self._fetch_html(sm_url), 'html.parser')
+            except Exception as e:
+                logger.warning(f"Could not fetch {sm_url}: {e}")
+                continue
+            for entry in sm.find_all('url'):
+                loc = entry.find('loc')
+                url = loc.get_text(strip=True) if loc else ''
+                if not re.search(r'/series/comic/[^/]+$', url) or url in seen:
+                    continue
+                seen.add(url)
+                title_tag = entry.find('image:title')
+                cover_tag = entry.find('image:loc')
+                title = html_lib.unescape(title_tag.get_text(strip=True)) if title_tag else ''
+                if not title:
+                    title = url.rsplit('/', 1)[-1].replace('-', ' ').title()
+                found.append(Series(
+                    title=title, url=url, source=self.SITE_NAME,
+                    cover_url=cover_tag.get_text(strip=True) if cover_tag else '',
+                ))
+        logger.info(f"Found {len(found)} series in sitemap")
+        return found
+
+    def _series_from_catalog(self) -> List[Series]:
+        titles: Dict[str, str] = {}
+        page = 1
+        while page <= (self.max_pages or 200):
+            soup = self._get_soup(f"{self.BASE_URL}/series?page={page}")
+            before = len(titles)
+            # Each card has several links to the same series: the cover (img
+            # alt = title), a type badge ("MANHUA") and the title text.
+            for a in soup.select('a[href^="/series/comic/"]'):
+                m = re.match(r'^/series/comic/([^/?#]+)$', a.get('href', '').split('?')[0])
+                if not m:
+                    continue
+                img = a.find('img', alt=True)
+                text = img['alt'].strip() if img else a.get_text(separator=' ', strip=True)
+                if re.fullmatch(r'MANHUA|MANHWA|MANGA|COMIC|NOVEL|WEBTOON', text, re.I) or len(text) < 2:
+                    text = ''
+                titles.setdefault(m.group(1), '')
+                if text and not titles[m.group(1)]:
+                    titles[m.group(1)] = text
+            new = len(titles) - before
+            logger.info(f"Found {new} series on catalog page {page}")
+            if not new:
+                break
+            page += 1
+        return [Series(title=title or slug.replace('-', ' ').title(),
+                       url=f"{self.BASE_URL}/series/comic/{slug}", source=self.SITE_NAME)
+                for slug, title in titles.items()]
+
+    # ---- series details -------------------------------------------------
+
+    def _extract_title_from_soup(self, soup) -> str:
+        title = self._rsc_str(self._rsc_series(soup).get('title'))
+        return title or super()._extract_title_from_soup(soup)
+
+    def _extract_description_from_soup(self, soup) -> str:
+        desc = self._rsc_str(self._rsc_series(soup).get('description'))
+        return desc[:2000] if desc else super()._extract_description_from_soup(soup)
+
+    def _extract_genres_from_soup(self, soup) -> List[str]:
+        genres = []
+        for g in self._rsc_series(soup).get('genres') or []:
+            name = g.get('name') if isinstance(g, dict) else None
+            if isinstance(name, str) and name:
+                genres.append(name)
+        return genres or super()._extract_genres_from_soup(soup)
+
+    def _extract_status_from_soup(self, soup) -> str:
+        status = self._rsc_str(self._rsc_series(soup).get('status'))
+        return {'ONGOING': 'Ongoing', 'COMPLETED': 'Completed', 'HIATUS': 'Hiatus',
+                'DROPPED': 'Dropped', 'CANCELLED': 'Dropped'}.get(status.upper(), 'Unknown') if status else 'Unknown'
+
+    def _extract_rating_from_soup(self, soup) -> float:
+        rating = self._rsc_series(soup).get('rating')
+        if isinstance(rating, (int, float)) and rating > 0:
+            return round(rating / 2 if rating > 5 else rating, 2)
+        return 0.0
+
+    def _extract_cover_from_soup(self, soup) -> str:
+        # og:image on series pages is a generated 1200x630 banner, not the cover.
+        cover = self._rsc_str(self._rsc_series(soup).get('coverImage'))
+        return self._absolute(cover) if cover else ''
+
+    def get_series_status(self, series: Series) -> str:
+        return self._extract_status_from_soup(self._get_soup(series.url))
+
+    # ---- chapters -------------------------------------------------------
+
+    def get_chapters(self, series: Series) -> List[Chapter]:
+        series_url = self._normalize_url(series.url)
+        series.url = series_url
+        soup = self._get_soup(series_url)
+        rsc = self._rsc_text(soup)
+        info = self._rsc_series(soup, rsc)
+        listed = self._rsc_value(rsc, 'chapters', '[{"id":"', self._is_chapter_list) or []
+        total = info.get('chapterCount')
+
+        # The series page only embeds the first 100 chapters.  Any chapter page
+        # carries the complete list (with lock state) as "allChapters".
+        if listed and isinstance(total, int) and total > len(listed):
+            first = self._format_number(listed[0].get('number'))
+            ch_soup = self._get_soup(f"{series_url}/chapter/{first}")
+            full = self._rsc_value(self._rsc_text(ch_soup), 'allChapters', '[', self._is_chapter_list) or []
+            if len(full) > len(listed):
+                listed = full
+
+        if not listed:
+            if not rsc:
+                logger.warning(f"No page payload for {series_url!r} — returning 0 chapters for {series.title!r}")
+            return []
+
+        chapters = []
+        seen = set()
+        locked = 0
+        for ch in listed:
+            if not isinstance(ch, dict) or ch.get('number') is None:
+                continue
+            if ch.get('isLocked') and not ch.get('hasAccess'):
+                locked += 1
+                continue
+            num = self._format_number(ch['number'])
+            if num in seen:
+                continue
+            seen.add(num)
+            title = self._rsc_str(ch.get('title'))
+            chapters.append(Chapter(
+                number=num,
+                title=title if title and not title.replace('.', '', 1).isdigit() else f"Chapter {num}",
+                url=f"{series_url}/chapter/{num}",
+            ))
+        if locked:
+            logger.info(f"{series.title}: skipping {locked} coin-locked chapter(s)")
+        chapters.sort(key=lambda c: float(c.number))
+        return chapters
+
+    # ---- pages ----------------------------------------------------------
+
+    def get_pages(self, chapter: Chapter) -> List[str]:
+        url = self._normalize_url(chapter.url)
+        soup = self._get_soup(url)
+        rsc = self._rsc_text(soup)
+        if not rsc:
+            logger.warning(f"No page payload for {url}")
+            return []
+        current = self._rsc_value(rsc, 'chapter', '{"id":"',
+                                  lambda v: isinstance(v, dict) and isinstance(v.get('pages'), list))
+        pages = current.get('pages') if isinstance(current, dict) else None
+        if not pages:
+            logger.warning(f"No page list in payload for {url}")
+            return []
+
+        urls = []
+        for page in sorted((p for p in pages if isinstance(p, dict)), key=lambda p: p.get('pageNumber') or 0):
+            if page.get('isRedacted'):
+                logger.debug(f"Chapter {chapter.number} is locked (redacted pages) — skipping")
+                return []
+            if page.get('isEncrypted') or page.get('tiles') or page.get('hasStrips') or page.get('hasFragments'):
+                logger.warning(f"Chapter {chapter.number} uses protected page images — skipping")
+                return []
+            src = self._rsc_str(page.get('imageUrl'))
+            if src:
+                urls.append(self._absolute(src))
+        return urls
+
+
 def _align_manhuafast_chapter_numbers(
     chapters: List['Chapter'], existing_cbzs: set, series_title: str
 ) -> List['Chapter']:
@@ -4371,7 +4727,7 @@ def _align_manhuafast_chapter_numbers(
     return in_range + to_renumber
 
 
-class ManhuaFastScraper(DrakeFullScraper):
+class ManhuaFastScraper(MadaraBaseScraper):
     """Full site scraper for manhuafast.net (Madara/WP-manga theme).
 
     ManhuaFast uses the standard Madara WordPress theme with WordPress-style
@@ -4738,7 +5094,7 @@ class ManhuaFastScraper(DrakeFullScraper):
         3. Scope all selectors to the chapter list container to avoid
            contamination from sidebar "related series" chapter links.
         4. Fall back to the initial HTML if AJAX fails.
-        5. Fall back to DrakeFullScraper if still nothing.
+        5. Fall back to MadaraBaseScraper if still nothing.
         """
         soup = self._get_soup(series.url, use_selenium=True)
 
@@ -4855,13 +5211,13 @@ class ManhuaFastScraper(DrakeFullScraper):
             logger.info(f"  Found {len(chapters)} chapters")
             return chapters
 
-        # Last resort: parent DrakeFullScraper (broad a[href*="chapter"] selector,
+        # Last resort: parent MadaraBaseScraper (broad a[href*="chapter"] selector,
         # no series-path filter — may include sidebar chapters from other series).
-        logger.debug("All ManhuaFast-specific strategies failed; delegating to DrakeFullScraper.get_chapters()")
+        logger.debug("All ManhuaFast-specific strategies failed; delegating to MadaraBaseScraper.get_chapters()")
         return super().get_chapters(series)
 
 
-class ResetScansScraper(DrakeFullScraper):
+class ResetScansScraper(MadaraBaseScraper):
     """Full site scraper for reset-scans.org (Madara/WP-manga theme).
 
     Reset Scans is a small scanlation group with a compact catalog (typically
@@ -4873,7 +5229,7 @@ class ResetScansScraper(DrakeFullScraper):
 
     Chapter list note: Tachiyomi's Madara class targets li.wp-manga-chapter
     elements.  This scraper adds that as the primary selector before the broader
-    a[href*="chapter"] fallback used by DrakeFullScraper.
+    a[href*="chapter"] fallback used by MadaraBaseScraper.
     """
 
     BASE_URL = "https://reset-scans.org"
@@ -5003,7 +5359,7 @@ class ResetScansScraper(DrakeFullScraper):
               <a href=".../chapter-01/">Chapter 1</a>
             </li>
           </ul>
-        The inherited DrakeFullScraper.get_chapters() tries #chapterlist first
+        The inherited MadaraBaseScraper.get_chapters() tries #chapterlist first
         which may not be present.  We try li.wp-manga-chapter directly, then
         fall back to the parent implementation if nothing is found.
         """
@@ -7098,6 +7454,7 @@ SCRAPERS = {
     'drake': DrakeFullScraper,
     'drakecomic': DrakeFullScraper,
     'drakecomic.org': DrakeFullScraper,
+    'drakecomic.net': DrakeFullScraper,
     'manhuato': ManhuaToScraper,
     'manhuato.com': ManhuaToScraper,
     'webtoon': WebtoonScraper,
