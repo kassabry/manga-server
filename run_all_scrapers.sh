@@ -35,6 +35,9 @@ python3 scripts/manhwa_scraper.py --site flame --download-all --filter "action,f
 echo "=== Drake Comics ==="
 python3 scripts/manhwa_scraper.py --site drake --download-all --filter "action,fantasy,adventure" --source-prefix -o ./library/Manhwa
 
+echo "=== Elf Toon ==="
+python3 scripts/manhwa_scraper.py --site elftoon --download-all --filter "action,fantasy,adventure" --source-prefix -o ./library/Manhwa
+
 # MangaDot filters by origin/tag/chapter-count during discovery, so it takes no
 # --filter. Run once per origin: KR lands in Manhwa, CN in Manhua.
 # --tag-mode all means a series must carry EVERY tag in --tags, not any one of

@@ -46,15 +46,17 @@
 - `MadaraBaseScraper` is the old Drake class, kept as the shared WordPress/Madara base for ManhuaFast and Reset Scans. Drake itself no longer uses it
 - ManhuaTo uses FlareSolverr on ARM; `_fs_cookies_applied` caches session cookies after first solve
 
-### Drake (`DrakeFullScraper`)
+### Drake + Elf Toon (`ScanPlatformScraper`)
+- **drakecomic.net and elftoon.net run the same Next.js platform** — identical routes, sitemap layout and payload shapes. All logic is in `ScanPlatformScraper`; `DrakeFullScraper` and `ElfToonScraper` only set `BASE_URL`/`SITE_NAME`/`DISPLAY_NAME` (Drake adds the legacy-URL rewrite). Verified on Elf Toon with the Drake parser unchanged. A third site on this platform should be a three-line subclass — check it with `get_all_series`, an encrypted-flagged chapter and a locked one before assuming
 - **Moved to `drakecomic.net` in Oct 2026 and off WordPress entirely** — now a Next.js app. Every Madara selector is gone. Old `drakecomic.org/manga/{slug}/` URLs 301 to `/series/comic/{slug}`; slugs carried over, and `_normalize_url` rewrites legacy URLs so tracked series keep working
 - No browser and no FlareSolverr needed: pages are server-rendered and the data sits in the inlined RSC payload (`self.__next_f.push([1,"..."])` chunks). `_rsc_text` decodes and joins them; `_fetch_html` only falls back to FlareSolverr if a Cloudflare challenge appears
-- Catalog: `/sitemap.xml` -> `series-sitemap-N.xml` (title + cover per series). `/series?page=N` is the fallback; its cards carry a type badge link ("MANHUA") that is not the title — take the cover `img alt`
+- Catalog: `/series?page=N` -> `"initialSeries"` rows (title, status, cover, genres; 24 per page, `initialSnapshot.totalPages`). The sitemap (`/sitemap.xml` -> `series-sitemap-N.xml`) is only the fallback
+- **The sitemap has no genres.** The first Drake rewrite listed from it, so `--filter "action,fantasy,adventure"` (as in `run_all_scrapers.sh`) matched titles only and dropped nearly every series. Catalog rows fix it: 58/59 Drake and 172/181 Elf Toon now pass that filter
 - **The series page embeds only the first 100 chapters** (`"chapters":[...]`) even when `chapterCount` is higher. Any chapter page has the full list as `"allChapters"`, so `get_chapters` fetches the first chapter when the counts disagree
 - Page images: `"chapter":{"pages":[{"imageUrl": ...}]}` on the chapter page, plain `/uploads/...` URLs, no hotlink protection
 - **Never anchor RSC lookups on ID prefixes.** Older rows are `drake-c-123` / `drake-s-slug`; newer ones are opaque cuids. Match on shape (`_is_chapter_list`, a dict with `pages`, series `slug` == canonical slug)
 - Coin-locked chapters: `isLocked` + `hasAccess:false` in the list, and every page `isRedacted` with an empty `imageUrl`. They are filtered out in `get_chapters`, not downloaded
-- **Do not skip on `isEncrypted` / `tiles` / `hasStrips`.** Those flags look like the images are scrambled, but `imageUrl` still serves the full plain image to an ordinary request. The first version bailed on the flag and skipped every chapter of Maxed Strength Necromancer from ch.142 on; all 21 pages of ch.142 decode and match the declared `width`/`height`. Only an empty `imageUrl` (redacted/locked) is a real gap
+- **Do not skip on `isEncrypted` / `tiles` / `hasStrips`.** Those flags look like the images are scrambled, but `imageUrl` still serves the full plain image to an ordinary request. The first version bailed on the flag and skipped every chapter of Maxed Strength Necromancer from ch.142 on; all 21 pages of ch.142 decode and match the declared `width`/`height`. Same on Elf Toon (22/22 pages across two encrypted-flagged chapters, and visually clean, not a tile mosaic). Only an empty `imageUrl` (redacted/locked) is a real gap
 
 ### Image downloads (`_download_image` / `_download_pages`)
 - `cdn.asurascans.com` throttles **bursts, not requests**: it answers `429` with `Retry-After: 10`. Measured from a residential IP, 8 workers over one 102-page chapter already drew one 429; behind the container's shared VPN exit it escalates to whole chapters refused, and stays refused for the chapters after

@@ -13,6 +13,7 @@ Supports:
 - asuracomic.net
 - flamecomics.xyz
 - drakecomic.net
+- elftoon.net
 - manhuafast.net
 - reset-scans.org
 
@@ -1376,6 +1377,7 @@ class BaseSiteScraper:
                 'asura': 'Asura Scans',
                 'flame': 'Flame Comics',
                 'drake': 'Drake Comics',
+                'elftoon': 'Elf Toon',
                 'manhuato': 'ManhuaTo',
                 'webtoon': 'Webtoon',
                 'manhuafast': 'ManhuaFast',
@@ -3684,7 +3686,7 @@ class MadaraBaseScraper(BaseSiteScraper):
     """Shared base for Madara / WP-manga WordPress theme sites.
 
     Originally the Drake Comics scraper; Drake has since moved off WordPress
-    (see DrakeFullScraper), but ManhuaFast and Reset Scans still run this
+    (see ScanPlatformScraper), but ManhuaFast and Reset Scans still run this
     theme and inherit everything here.  Subclasses set BASE_URL / SITE_NAME.
     """
 
@@ -4297,16 +4299,19 @@ class MadaraBaseScraper(BaseSiteScraper):
         return False
 
 
-class DrakeFullScraper(BaseSiteScraper):
-    """Full site scraper for drakecomic.net (formerly drakecomic.org).
+class ScanPlatformScraper(BaseSiteScraper):
+    """Shared base for the Next.js scanlation platform behind Drake and Elf Toon.
 
-    Drake moved off WordPress/Madara to a custom Next.js app in Oct 2026.  None
-    of the old selectors exist any more; everything now comes from the React
-    Server Components payload the server inlines into every page as
+    Both sites run the same app (same routes, same sitemap layout, same data
+    shapes), so all logic lives here and subclasses only set BASE_URL /
+    SITE_NAME / DISPLAY_NAME.  Everything comes from the React Server
+    Components payload the server inlines into every page as
     ``self.__next_f.push([1, "..."])`` script chunks:
 
-    - Catalog:  /series-sitemap-N.xml (from /sitemap.xml) lists every series
-                with title and cover.  /series?page=N is the fallback.
+    - Catalog:  /series?page=N -> ``"initialSeries":[...]`` with title, status,
+                cover and genres per series (24 per page).  The sitemap
+                (/sitemap.xml -> series-sitemap-N.xml) is the fallback, but it
+                has no genres, so --filter cannot match against it.
     - Series:   /series/comic/{slug} -> ``"series":{...}`` holds description,
                 genres, status, cover; ``"chapters":[...]`` holds only the
                 first 100 chapters.
@@ -4317,17 +4322,15 @@ class DrakeFullScraper(BaseSiteScraper):
     No browser is needed: the payload is server-rendered, so a plain request
     returns the image URLs directly.  Coin-locked chapters ship with every page
     ``isRedacted`` and an empty ``imageUrl``; those are skipped, not counted as
-    failures.  Pages flagged encrypted/tiled/fragmented are likewise skipped
-    rather than downloaded as scrambled images.
-
-    Old ``drakecomic.org/manga/{slug}/`` URLs are rewritten to the new form —
-    slugs carried over unchanged.
+    failures.  Pages flagged ``isEncrypted`` with ``tiles`` still serve the
+    full plain image at ``imageUrl`` and ARE downloaded — see get_pages.
     """
 
-    BASE_URL = "https://drakecomic.net"
-    SITE_NAME = "drake"
-    # Served without a challenge as of the migration.  If Cloudflare comes
-    # back, _fetch_html falls through to FlareSolverr on its own.
+    BASE_URL = ""
+    SITE_NAME = ""
+    DISPLAY_NAME = ""
+    # Served without a challenge as of Oct 2026.  If Cloudflare comes back,
+    # _fetch_html falls through to FlareSolverr on its own.
     CLOUDFLARE_SITE = False
     MIN_DELAY = 1
     MAX_DELAY = 2
@@ -4380,11 +4383,7 @@ class DrakeFullScraper(BaseSiteScraper):
 
     @classmethod
     def _normalize_url(cls, url: str) -> str:
-        """Rewrite legacy drakecomic.org URLs to the drakecomic.net layout."""
-        m = re.match(r'https?://(?:www\.)?drakecomic\.(?:org|net)/manga/([^/?#]+)', url)
-        if m:
-            return f"{cls.BASE_URL}/series/comic/{m.group(1)}"
-        return re.sub(r'^https?://(?:www\.)?drakecomic\.org', cls.BASE_URL, url).rstrip('/')
+        return url.rstrip('/')
 
     # ---- RSC payload ----------------------------------------------------
 
@@ -4464,8 +4463,8 @@ class DrakeFullScraper(BaseSiteScraper):
     # ---- catalog --------------------------------------------------------
 
     def get_all_series(self) -> List[Series]:
-        logger.info("Fetching all series from Drake Comics...")
-        all_series = self._series_from_sitemap() or self._series_from_catalog()
+        logger.info(f"Fetching all series from {self.DISPLAY_NAME}...")
+        all_series = self._series_from_catalog() or self._series_from_sitemap()
         if self.limit:
             all_series = all_series[:self.limit]
         logger.info(f"Total series found: {len(all_series)}")
@@ -4506,33 +4505,59 @@ class DrakeFullScraper(BaseSiteScraper):
         logger.info(f"Found {len(found)} series in sitemap")
         return found
 
+    @staticmethod
+    def _genre_names(row: dict) -> List[str]:
+        """Genres from a catalog row: ``genreNames`` when present, else slugs."""
+        names = row.get('genreNames')
+        if isinstance(names, list) and names:
+            return [n for n in names if isinstance(n, str) and n]
+        out = []
+        for g in row.get('genres') or []:
+            inner = g.get('genre', g) if isinstance(g, dict) else {}
+            name = inner.get('name') or (inner.get('slug') or '').replace('-', ' ').title()
+            if name:
+                out.append(name)
+        return out
+
     def _series_from_catalog(self) -> List[Series]:
-        titles: Dict[str, str] = {}
+        """Walk /series?page=N, reading each page's ``initialSeries`` rows."""
+        found: List[Series] = []
+        seen = set()
         page = 1
+        total_pages = None
         while page <= (self.max_pages or 200):
             soup = self._get_soup(f"{self.BASE_URL}/series?page={page}")
-            before = len(titles)
-            # Each card has several links to the same series: the cover (img
-            # alt = title), a type badge ("MANHUA") and the title text.
-            for a in soup.select('a[href^="/series/comic/"]'):
-                m = re.match(r'^/series/comic/([^/?#]+)$', a.get('href', '').split('?')[0])
-                if not m:
+            rsc = self._rsc_text(soup)
+            rows = self._rsc_value(rsc, 'initialSeries', '[',
+                                   lambda v: isinstance(v, list) and bool(v) and isinstance(v[0], dict)
+                                   and 'slug' in v[0]) or []
+            if total_pages is None:
+                snap = self._rsc_value(rsc, 'initialSnapshot', '{') or {}
+                total_pages = snap.get('totalPages') if isinstance(snap, dict) else None
+            new = 0
+            for row in rows:
+                slug = row.get('urlSlug') or row.get('slug')
+                if not isinstance(slug, str) or slug in seen:
                     continue
-                img = a.find('img', alt=True)
-                text = img['alt'].strip() if img else a.get_text(separator=' ', strip=True)
-                if re.fullmatch(r'MANHUA|MANHWA|MANGA|COMIC|NOVEL|WEBTOON', text, re.I) or len(text) < 2:
-                    text = ''
-                titles.setdefault(m.group(1), '')
-                if text and not titles[m.group(1)]:
-                    titles[m.group(1)] = text
-            new = len(titles) - before
+                seen.add(slug)
+                cover = self._rsc_str(row.get('coverImage'))
+                rating = row.get('rating')
+                found.append(Series(
+                    title=self._rsc_str(row.get('title')) or slug.replace('-', ' ').title(),
+                    url=f"{self.BASE_URL}/series/comic/{slug}",
+                    source=self.SITE_NAME,
+                    genres=self._genre_names(row),
+                    status=self._map_status(self._rsc_str(row.get('status'))),
+                    rating=round(rating / 2 if rating > 5 else rating, 2)
+                    if isinstance(rating, (int, float)) and rating > 0 else 0.0,
+                    cover_url=self._absolute(cover) if cover else '',
+                ))
+                new += 1
             logger.info(f"Found {new} series on catalog page {page}")
-            if not new:
+            if not new or (total_pages and page >= total_pages):
                 break
             page += 1
-        return [Series(title=title or slug.replace('-', ' ').title(),
-                       url=f"{self.BASE_URL}/series/comic/{slug}", source=self.SITE_NAME)
-                for slug, title in titles.items()]
+        return found
 
     # ---- series details -------------------------------------------------
 
@@ -4552,10 +4577,13 @@ class DrakeFullScraper(BaseSiteScraper):
                 genres.append(name)
         return genres or super()._extract_genres_from_soup(soup)
 
-    def _extract_status_from_soup(self, soup) -> str:
-        status = self._rsc_str(self._rsc_series(soup).get('status'))
+    @staticmethod
+    def _map_status(status: str) -> str:
         return {'ONGOING': 'Ongoing', 'COMPLETED': 'Completed', 'HIATUS': 'Hiatus',
-                'DROPPED': 'Dropped', 'CANCELLED': 'Dropped'}.get(status.upper(), 'Unknown') if status else 'Unknown'
+                'DROPPED': 'Dropped', 'CANCELLED': 'Dropped'}.get((status or '').upper(), 'Unknown')
+
+    def _extract_status_from_soup(self, soup) -> str:
+        return self._map_status(self._rsc_str(self._rsc_series(soup).get('status')))
 
     def _extract_rating_from_soup(self, soup) -> float:
         rating = self._rsc_series(soup).get('rating')
@@ -4653,6 +4681,33 @@ class DrakeFullScraper(BaseSiteScraper):
                 return []
             urls.append(self._absolute(src))
         return urls
+
+
+class DrakeFullScraper(ScanPlatformScraper):
+    """drakecomic.net (formerly drakecomic.org, WordPress/Madara until Oct 2026).
+
+    Old ``drakecomic.org/manga/{slug}/`` URLs are rewritten to the new form —
+    slugs carried over unchanged, so tracked series keep working.
+    """
+
+    BASE_URL = "https://drakecomic.net"
+    SITE_NAME = "drake"
+    DISPLAY_NAME = "Drake Comics"
+
+    @classmethod
+    def _normalize_url(cls, url: str) -> str:
+        m = re.match(r'https?://(?:www\.)?drakecomic\.(?:org|net)/manga/([^/?#]+)', url)
+        if m:
+            return f"{cls.BASE_URL}/series/comic/{m.group(1)}"
+        return re.sub(r'^https?://(?:www\.)?drakecomic\.org', cls.BASE_URL, url).rstrip('/')
+
+
+class ElfToonScraper(ScanPlatformScraper):
+    """elftoon.net — same platform as Drake; nothing site-specific needed."""
+
+    BASE_URL = "https://elftoon.net"
+    SITE_NAME = "elftoon"
+    DISPLAY_NAME = "Elf Toon"
 
 
 def _align_manhuafast_chapter_numbers(
@@ -7460,6 +7515,8 @@ SCRAPERS = {
     'drakecomic': DrakeFullScraper,
     'drakecomic.org': DrakeFullScraper,
     'drakecomic.net': DrakeFullScraper,
+    'elftoon': ElfToonScraper,
+    'elftoon.net': ElfToonScraper,
     'manhuato': ManhuaToScraper,
     'manhuato.com': ManhuaToScraper,
     'webtoon': WebtoonScraper,
@@ -7831,7 +7888,7 @@ Examples:
         """
     )
     
-    parser.add_argument('--site', '-s', help='Site to scrape (asura, flame, drake, manhuato, webtoon, manhuafast, resetscans, mangadot, manhuaplus, or "all" for all sites). Note: manhuaplus is limited to its allow-listed series and is excluded from "all"')
+    parser.add_argument('--site', '-s', help='Site to scrape (asura, flame, drake, elftoon, manhuato, webtoon, manhuafast, resetscans, mangadot, manhuaplus, or "all" for all sites). Note: manhuaplus is limited to its allow-listed series and is excluded from "all"')
     parser.add_argument('--list-all', action='store_true', help='List all series and export to YAML')
     parser.add_argument('--download-all', action='store_true', help='Download all series from site')
     parser.add_argument('--download-url', help='Download a specific series by URL')
@@ -7893,6 +7950,8 @@ Examples:
                 args.site = 'webtoon'
             elif 'drake' in url_lower:
                 args.site = 'drake'
+            elif 'elftoon' in url_lower:
+                args.site = 'elftoon'
             else:
                 logger.error("Could not auto-detect site from URL. Please specify with --site")
                 return
