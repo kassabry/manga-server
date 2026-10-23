@@ -212,6 +212,30 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     return { page: parseInt(last.dataset.pageIndex || "0"), offset: 1 };
   }, []);
 
+  // Has the reader genuinely reached the end of a long-strip chapter?
+  //
+  // Raw scroll geometry ("scrollTop + clientHeight near scrollHeight") is not enough:
+  // the images reserve no height until they load, so a freshly opened chapter — notably
+  // a PWA relaunched after the OS killed it mid-chapter — is a few hundred pixels tall
+  // and reads as "at the bottom". The 2s save then marked it completed, and because
+  // completion is sticky server-side it dropped out of Continue Reading for good.
+  // Require every image to have settled (loaded or failed; lazy images not yet
+  // requested report complete=false) and the last one's bottom to be in view.
+  const isLongstripAtEnd = useCallback((): boolean => {
+    const container = containerRef.current;
+    if (!container) return false;
+    const imgs = container.querySelectorAll<HTMLImageElement>("img[data-page-index]");
+    if (imgs.length === 0) return false;
+    for (const img of imgs) {
+      if (!img.complete) return false;
+    }
+    const last = imgs[imgs.length - 1];
+    if (last.getBoundingClientRect().height <= 0) return false;
+    return (
+      last.getBoundingClientRect().bottom <= container.getBoundingClientRect().bottom + 100
+    );
+  }, []);
+
   // Scroll the long-strip container so the viewport top lands `offset` (0..1) into the
   // image at `page`. Retries while lazy-loaded images settle their heights.
   const restoreLongstripScroll = useCallback((page: number, offset: number) => {
@@ -439,10 +463,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         // currentPage becomes pages.length-1 as soon as the last image is
         // the most-visible one — which can happen before the user is actually
         // done reading. Scroll position is the correct signal.
-        const container = containerRef.current;
-        const isLast = container
-          ? container.scrollTop + container.clientHeight >= container.scrollHeight - 100
-          : currentPage >= safeLastPage;
+        const isLast = isLongstripAtEnd();
         const pos = getLongstripPosition();
         saveProgress(pos.page, isLast, isLast ? 0 : pos.offset);
       } else {
@@ -451,7 +472,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       }
     }, 2000);
     return () => clearTimeout(timer);
-  }, [currentPage, chapter, saveProgress, settings.layout, getLongstripPosition]);
+  }, [currentPage, chapter, saveProgress, settings.layout, getLongstripPosition, isLongstripAtEnd]);
 
   // Save progress on page unload (tab close, browser back, etc.)
   // beforeunload  → desktop browsers, most Android Chrome navigation
@@ -472,10 +493,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
         const pos = getLongstripPosition();
         page = pos.page;
         offset = pos.offset;
-        const container = containerRef.current;
-        isLast = container
-          ? container.scrollTop + container.clientHeight >= container.scrollHeight - 100
-          : page >= safeLastPage;
+        isLast = isLongstripAtEnd();
       } else {
         page = currentPage;
         isLast = page >= safeLastPage;
@@ -498,7 +516,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       window.removeEventListener("pagehide", handleUnload);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [chapter, hasUser, settings.layout, currentPage, getLongstripPosition]);
+  }, [chapter, hasUser, settings.layout, currentPage, getLongstripPosition, isLongstripAtEnd]);
 
   // Auto-hide toolbar
   useEffect(() => {
@@ -554,7 +572,12 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
     if (bottomSentinel) {
       const obs = new IntersectionObserver(([entry]) => {
-        if (entry.isIntersecting && readyForNavRef.current && scrollDistanceRef.current > 500) {
+        if (
+          entry.isIntersecting &&
+          readyForNavRef.current &&
+          scrollDistanceRef.current > 500 &&
+          isLongstripAtEnd()
+        ) {
           readyForNavRef.current = false;
           saveProgress(chapter.pages.length - 1, true);
           if (effNext) router.push(`/read/${effNext.id}`);
@@ -565,7 +588,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     }
 
     return () => observers.forEach(obs => obs.disconnect());
-  }, [chapter, settings.layout, router, saveProgress, selectedSource]);
+  }, [chapter, settings.layout, router, saveProgress, selectedSource, isLongstripAtEnd]);
 
   // Long-strip backward traversal: pull up at the top of the chapter.
   //
@@ -661,20 +684,21 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       if (fired) return;
       // readyForNavRef becomes true after 2s + first scroll, preventing immediate trigger on load
       if (!readyForNavRef.current) return;
-      const { scrollTop, clientHeight, scrollHeight } = container;
-      if (scrollTop + clientHeight >= scrollHeight - 100) {
+      if (isLongstripAtEnd()) {
         fired = true;
         saveProgress(chapter.pages.length - 1, true);
       }
     };
     container.addEventListener("scroll", check, { passive: true });
     return () => container.removeEventListener("scroll", check);
-  }, [chapter, settings.layout, saveProgress]);
+  }, [chapter, settings.layout, saveProgress, isLongstripAtEnd]);
 
   // EPUB bottom completion: IntersectionObserver on the bottom nav div.
   // threshold: 0 fires as soon as any pixel of it enters the viewport.
+  // Not armed until the text has loaded: the div renders under a short loading
+  // placeholder, so observing it earlier marks every reopened chapter as read.
   useEffect(() => {
-    if (!chapter?.isEpub || !bottomCompleteRef.current) return;
+    if (!chapter?.isEpub || epubHtmlPages.length === 0 || !bottomCompleteRef.current) return;
     const el = bottomCompleteRef.current;
     let fired = false;
     const obs = new IntersectionObserver(
@@ -688,7 +712,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
     );
     obs.observe(el);
     return () => obs.disconnect();
-  }, [chapter, saveProgress]);
+  }, [chapter, saveProgress, epubHtmlPages.length]);
 
   // Page navigation helpers
   const totalPages = chapter?.pages.length || 0;
