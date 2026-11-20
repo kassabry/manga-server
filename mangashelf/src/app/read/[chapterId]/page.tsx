@@ -908,9 +908,9 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col" style={bgStyle}>
-      {/* Top toolbar */}
+      {/* Top toolbar — overlays the page so hiding it gives the reader the full screen */}
       <div
-        className={`z-40 flex items-center justify-between border-b border-white/10 bg-black/80 px-3 py-2 backdrop-blur transition-transform duration-200 ${
+        className={`absolute inset-x-0 top-0 z-40 flex items-center justify-between border-b border-white/10 bg-black/80 px-3 py-2 backdrop-blur transition-transform duration-200 ${
           showToolbar ? "translate-y-0" : "-translate-y-full"
         }`}
       >
@@ -956,10 +956,10 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
               saveProgress(page, page >= chapter.pages.length - 1);
             }}
           >
-            <div className="truncate text-sm font-medium text-white">
+            <div className="truncate text-sm font-medium text-white" title={chapter.series.title}>
               {chapter.series.title}
             </div>
-            <div className="text-xs text-white/50">
+            <div className="truncate text-xs text-white/50">
               Chapter {chapter.number}
               {chapter.title ? ` — ${chapter.title}` : ""}
             </div>
@@ -1527,7 +1527,7 @@ function ReaderContent({ chapterId }: { chapterId: string }) {
       {/* Bottom bar */}
       {settings.layout !== "longstrip" && (
         <div
-          className={`z-40 border-t border-white/10 bg-black/80 px-3 py-2 backdrop-blur transition-transform duration-200 ${
+          className={`absolute inset-x-0 bottom-0 z-40 border-t border-white/10 bg-black/80 px-3 py-2 backdrop-blur transition-transform duration-200 ${
             showToolbar ? "translate-y-0" : "translate-y-full"
           }`}
         >
